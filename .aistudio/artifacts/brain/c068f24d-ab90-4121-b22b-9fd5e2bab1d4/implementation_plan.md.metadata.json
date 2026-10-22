@@ -1,0 +1,6 @@
+{
+  "summary":  "Комплексный архитектурный план и выбор технологического стека для веб-симулятора сетей в стиле Cisco Packet Tracer (NetPulse Studio). Включает визуальный дизайн в теме NetOps Dark, математическую модель симуляции L2/L3 (ARP, ICMP, VLAN, маршрутизация), пошаговый инспектор PDU и встроенный CLI-терминал Cisco IOS.",
+  "updatedAt":  "2026-10-22T16:29:12.404735833Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

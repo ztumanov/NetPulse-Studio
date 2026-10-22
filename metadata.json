@@ -1,0 +1,6 @@
+{
+  "name": "NetPulse Studio",
+  "description": "Интерактивный веб-симулятор компьютерных сетей L2/L3 в стиле Cisco Packet Tracer с визуализацией пакетов (ARP, ICMP, VLAN), таблицами маршрутизации и терминалом Cisco IOS CLI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
