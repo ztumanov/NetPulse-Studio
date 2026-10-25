@@ -17,25 +17,25 @@ export const PduInspectorModal: React.FC<PduInspectorModalProps> = ({ step, onCl
       case 'delivered':
         return (
           <span className="inline-flex items-center gap-1.5 text-xs font-mono text-emerald-400">
-            <CheckCircle2 className="w-3.5 h-3.5" /> ● DELIVERED
+            <CheckCircle2 className="w-3.5 h-3.5" /> DELIVERED
           </span>
         );
       case 'forwarded':
         return (
           <span className="inline-flex items-center gap-1.5 text-xs font-mono text-sky-400">
-            <ArrowRight className="w-3.5 h-3.5" /> ◆ FORWARDED
+            <ArrowRight className="w-3.5 h-3.5" /> FORWARDED
           </span>
         );
       case 'broadcast':
         return (
           <span className="inline-flex items-center gap-1.5 text-xs font-mono text-amber-400">
-            <Radio className="w-3.5 h-3.5" /> ▲ BROADCAST / FLOOD
+            <Radio className="w-3.5 h-3.5" /> BROADCAST / FLOOD
           </span>
         );
       case 'dropped':
         return (
           <span className="inline-flex items-center gap-1.5 text-xs font-mono text-red-400">
-            <AlertTriangle className="w-3.5 h-3.5" /> ✕ DROPPED
+            <AlertTriangle className="w-3.5 h-3.5" /> DROPPED
           </span>
         );
     }

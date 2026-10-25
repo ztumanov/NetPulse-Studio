@@ -4,6 +4,15 @@ export type VlanMode = 'access' | 'trunk';
 
 export type CableType = 'straight' | 'crossover' | 'fiber';
 
+export interface RouterSubinterface {
+  id?: string;
+  vlanId: number;
+  ipAddress: string;
+  subnetMask: string;
+  helperAddress?: string;
+  natRole?: 'none' | 'inside' | 'outside';
+}
+
 export interface NetworkInterface {
   id: string;
   name: string; // e.g., 'Fa0/0', 'Gi0/1', 'Eth0'
@@ -15,11 +24,63 @@ export interface NetworkInterface {
   vlanMode: VlanMode;
   accessVlan: number; // default 1
   trunkAllowedVlans: number[]; // e.g., [1, 10, 20, 30]
-  subinterfaces?: {
-    vlanId: number;
-    ipAddress: string;
-    subnetMask: string;
-  }[];
+  helperAddress?: string; // ip helper-address for DHCP Relay
+  natRole?: 'none' | 'inside' | 'outside'; // ip nat inside / outside
+  subinterfaces?: RouterSubinterface[];
+}
+
+export type StpPortRole = 'root' | 'designated' | 'alternate' | 'disabled';
+export type StpPortState = 'forwarding' | 'blocking' | 'disabled';
+
+export interface StpPortStatus {
+  portId: string;
+  portShortName: string;
+  role: StpPortRole;
+  state: StpPortState;
+  pathCost: number;
+  designatedBridgeId: string;
+  peerNodeName?: string;
+  peerPortName?: string;
+}
+
+export interface StpSwitchState {
+  bridgePriority: number;
+  bridgeMac: string;
+  rootBridgeId: string;
+  rootBridgeName: string;
+  isRootBridge: boolean;
+  rootPathCost: number;
+  rootPortName: string | null;
+  ports: Record<string, StpPortStatus>;
+}
+
+export type AclAction = 'permit' | 'deny';
+export type AclProtocol = 'ANY' | 'ICMP' | 'TCP' | 'UDP' | 'HTTP' | 'DNS';
+
+export interface AclRule {
+  id: string;
+  seq: number;
+  name?: string;
+  action: AclAction;
+  protocol: AclProtocol;
+  srcIp: string; // 'any', single IP '192.168.1.10', or CIDR '192.168.1.0/24'
+  dstIp: string; // 'any', single IP, or CIDR
+  dstPort?: number;
+  enabled?: boolean;
+  hitCount?: number;
+}
+
+export interface NatTranslationEntry {
+  id: string;
+  protocol: 'icmp' | 'tcp' | 'udp';
+  insideLocal: string;
+  insideGlobal: string;
+  outsideLocal: string;
+  outsideGlobal: string;
+  insideIp: string;
+  globalIp: string;
+  outsideIp: string;
+  port: number;
 }
 
 export interface RouteEntry {
@@ -27,7 +88,7 @@ export interface RouteEntry {
   network: string; // e.g., '192.168.2.0'
   mask: string; // e.g., '255.255.255.0'
   nextHop: string; // e.g., '10.0.0.2' or 'Directly Connected'
-  interfaceName: string; // e.g., 'Fa0/1'
+  interfaceName: string; // e.g., 'Fa0/1' or 'Fa0/0.10'
   type: 'C' | 'S'; // Connected or Static
 }
 
@@ -96,6 +157,7 @@ export interface NetworkZone {
 export interface CliState {
   mode: 'user' | 'priv' | 'config' | 'config-if';
   selectedInterface?: string;
+  selectedSubinterfaceVlan?: number;
   history: string[];
   commandLog?: string[];
 }
@@ -115,6 +177,10 @@ export interface NetworkNode {
   defaultGateway: string; // used for PC / Server
   dnsServer?: string; // used for PC / Server DNS resolution
   ipAssignmentMode?: 'static' | 'dhcp';
+  stpPriority?: number; // IEEE 802.1D Bridge Priority (default 32768)
+  aclRules?: AclRule[]; // Router L3/L4 Firewall ACL rules
+  natEnabled?: boolean; // Router NAT/PAT overload toggle
+  natTranslations?: NatTranslationEntry[]; // Active NAT translation table
   services?: ServerServices;
   vlanDatabase?: SwitchVlanEntry[];
   interfaces: NetworkInterface[];
@@ -149,7 +215,8 @@ export type ProtocolType =
   | 'TCP_SYN_ACK'
   | 'TCP_ACK'
   | 'HTTP_GET'
-  | 'HTTP_200_OK';
+  | 'HTTP_200_OK'
+  | 'STP_BPDU';
 
 export type StepStatus = 'forwarded' | 'broadcast' | 'delivered' | 'dropped';
 
@@ -164,11 +231,11 @@ export interface OsiPduDetails {
     headerType: 'Ethernet II' | 'IEEE 802.1Q';
     srcMac: string;
     dstMac: string;
-    etherType: '0x0800 (IPv4)' | '0x0806 (ARP)';
+    etherType: '0x0800 (IPv4)' | '0x0806 (ARP)' | '0x010B (STP BPDU)';
     vlanTag: number | null;
   };
   l3: {
-    headerType: 'IPv4' | 'ARP Payload';
+    headerType: 'IPv4' | 'ARP Payload' | 'IEEE 802.1D BPDU';
     srcIp: string;
     dstIp: string;
     ttl: number;
@@ -182,7 +249,7 @@ export interface OsiPduDetails {
     dstPort?: number;
   };
   l7?: {
-    appProtocol: 'DHCP' | 'DNS' | 'HTTP' | 'ICMP';
+    appProtocol: 'DHCP' | 'DNS' | 'HTTP' | 'ICMP' | 'STP';
     headline: string;
     fields: Record<string, string>;
   };

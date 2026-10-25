@@ -3,12 +3,15 @@ import {
   NetworkLink,
   NetworkNode,
   SimulationStep,
+  StpPortStatus,
   SwitchVlanEntry,
 } from './types';
 import { generateMacAddress } from './ipMath';
+import { computeSpanningTreeState } from './simulator';
 
 export type PortLedState =
   | 'active-traffic'
+  | 'stp-blocking'
   | 'link-up'
   | 'link-down'
   | 'admin-down'
@@ -22,7 +25,8 @@ export interface PortHardwareDescriptor {
   peerNode: NetworkNode | null;
   peerPort: NetworkInterface | null;
   ledState: PortLedState;
-  ledLabel: 'ACT' | 'UP' | 'DOWN' | 'SHUT' | 'FREE';
+  ledLabel: 'ACT' | 'BLK' | 'UP' | 'DOWN' | 'SHUT' | 'FREE';
+  stpPortStatus?: StpPortStatus;
 }
 
 export interface AvailablePeerPortOption {
@@ -251,6 +255,9 @@ export function getDeviceChassisPorts(
   allLinks: NetworkLink[],
   activeStep: SimulationStep | null
 ): PortHardwareDescriptor[] {
+  const stpMap = node.type === 'switch' ? computeSpanningTreeState(allNodes, allLinks) : {};
+  const nodeStp = stpMap[node.id];
+
   return node.interfaces.map((port, idx) => {
     const connectedLink =
       allLinks.find(
@@ -271,6 +278,8 @@ export function getDeviceChassisPorts(
       peerPort = peerNode?.interfaces.find((p) => p.id === peerPortId) || null;
     }
 
+    const stpPortStatus = nodeStp?.ports[port.id];
+
     let ledState: PortLedState = 'unplugged';
     let ledLabel: PortHardwareDescriptor['ledLabel'] = 'FREE';
 
@@ -283,6 +292,9 @@ export function getDeviceChassisPorts(
     } else if (peerPort.adminStatus === 'down') {
       ledState = 'link-down';
       ledLabel = 'DOWN';
+    } else if (stpPortStatus?.state === 'blocking') {
+      ledState = 'stp-blocking';
+      ledLabel = 'BLK';
     } else if (activeStep && activeStep.linkId === connectedLink.id) {
       ledState = 'active-traffic';
       ledLabel = 'ACT';
@@ -304,6 +316,7 @@ export function getDeviceChassisPorts(
       peerPort,
       ledState,
       ledLabel,
+      stpPortStatus,
     };
   });
 }
@@ -459,3 +472,41 @@ export function addHardwarePortToNode(node: NetworkNode): NetworkNode {
   };
   return { ...node, interfaces: [...node.interfaces, newPort] };
 }
+
+/**
+ * Adds a device ID to the list of simultaneously open 1U hardware front-panel windows
+ * without closing or replacing already open 1U switch windows.
+ */
+export function openChassisWindow(openIds: string[], nodeId: string): string[] {
+  if (!nodeId) return openIds;
+  if (openIds.includes(nodeId)) return openIds;
+  return [...openIds, nodeId];
+}
+
+/**
+ * Closes a specific 1U hardware front-panel window while preserving other open 1U windows.
+ */
+export function closeChassisWindow(openIds: string[], nodeId: string): string[] {
+  return openIds.filter((id) => id !== nodeId);
+}
+
+/**
+ * Computes initial screen coordinates for each open 1U switch window so multiple
+ * 1U switches stack vertically like a real 19-inch equipment rack with enough
+ * clearance for the cable popover drawer between units.
+ */
+export function computeChassisInitialPosition(stackIndex: number): {
+  x: number;
+  y: number;
+} {
+  const safeIndex = Math.max(0, stackIndex);
+  const rackColumn = Math.floor(safeIndex / 4);
+  const rackRow = safeIndex % 4;
+  return {
+    x: 204 + rackColumn * 48,
+    y: 52 + rackRow * 188,
+  };
+}
+
+
+

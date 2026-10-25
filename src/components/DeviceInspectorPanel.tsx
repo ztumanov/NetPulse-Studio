@@ -1,5 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
+  AclAction,
+  AclProtocol,
+  AclRule,
   DhcpPool,
   DnsRecord,
   HttpResponseResult,
@@ -7,6 +10,7 @@ import {
   NetworkLink,
   NetworkNode,
   NetworkZone,
+  RouterSubinterface,
   SimulationStep,
   TracerouteHop,
   ZoneColor,
@@ -14,7 +18,11 @@ import {
 import { autocompleteIosCommand, executeIosCommand, getCliPrompt } from '../network/cliParser';
 import { getDeviceVlanDatabase } from '../network/hardwareChassis';
 import { isValidIpv4, isValidSubnetMask } from '../network/ipMath';
-import { syncConnectedRoutes } from '../network/simulator';
+import {
+  computeSpanningTreeState,
+  getRouterLogicalInterfaces,
+  syncConnectedRoutes,
+} from '../network/simulator';
 import { createDefaultServices } from '../network/presets';
 import {
   Terminal,
@@ -32,8 +40,8 @@ import {
   Layers,
   Pencil,
   PanelRightClose,
-  ChevronDown,
-  ChevronRight,
+  Shield,
+  Monitor,
 } from 'lucide-react';
 
 interface DeviceInspectorPanelProps {
@@ -64,6 +72,7 @@ interface DeviceInspectorPanelProps {
   onOpenFloatingCli: (nodeId: string) => void;
   onOpenChassis: (nodeId: string) => void;
   onOpenWebGui: (nodeId: string) => void;
+  onOpenPcMonitor: (nodeId: string) => void;
 }
 
 const ZONE_COLOR_OPTIONS: { id: ZoneColor; label: string; dot: string }[] = [
@@ -97,6 +106,7 @@ export const DeviceInspectorPanel: React.FC<DeviceInspectorPanelProps> = ({
   onOpenFloatingCli,
   onOpenChassis,
   onOpenWebGui,
+  onOpenPcMonitor,
 }) => {
   const [activeTab, setActiveTab] = useState<'config' | 'apps' | 'cli' | 'tables'>('config');
   const [cliInput, setCliInput] = useState('');
@@ -128,6 +138,18 @@ export const DeviceInspectorPanel: React.FC<DeviceInspectorPanelProps> = ({
   const [newPoolDns, setNewPoolDns] = useState('192.168.2.100');
   const [newPoolStart, setNewPoolStart] = useState('192.168.1.50');
   const [newPoolEnd, setNewPoolEnd] = useState('192.168.1.150');
+
+  // Router 802.1Q Subinterface & ACL Firewall form state
+  const [subifFormIfaceId, setSubifFormIfaceId] = useState<string | null>(null);
+  const [newSubifVlan, setNewSubifVlan] = useState('10');
+  const [newSubifIp, setNewSubifIp] = useState('192.168.10.1');
+  const [newSubifMask, setNewSubifMask] = useState('255.255.255.0');
+  const [newSubifHelper, setNewSubifHelper] = useState('');
+
+  const [newAclAction, setNewAclAction] = useState<AclAction>('deny');
+  const [newAclProto, setNewAclProto] = useState<AclProtocol>('ICMP');
+  const [newAclSrc, setNewAclSrc] = useState('any');
+  const [newAclDst, setNewAclDst] = useState('any');
 
   const terminalEndRef = useRef<HTMLDivElement>(null);
 
@@ -656,10 +678,105 @@ export const DeviceInspectorPanel: React.FC<DeviceInspectorPanelProps> = ({
   const otherHostIps = allNodes
     .filter((n) => n.id !== node.id)
     .flatMap((n) =>
-      n.interfaces
-        .filter((i) => i.adminStatus === 'up' && isValidIpv4(i.ipAddress))
-        .map((i) => ({ label: `${n.name} (${i.ipAddress})`, ip: i.ipAddress }))
+      getRouterLogicalInterfaces(n)
+        .filter((i) => isValidIpv4(i.ipAddress))
+        .map((i) => ({ label: `${n.name} ${i.logicalName} (${i.ipAddress})`, ip: i.ipAddress }))
     );
+
+  const handleUpdateSubinterface = (
+    parentIfaceId: string,
+    vlanId: number,
+    patch: Partial<RouterSubinterface>
+  ) => {
+    const updatedInterfaces = node.interfaces.map((iface) => {
+      if (iface.id !== parentIfaceId) return iface;
+      return {
+        ...iface,
+        subinterfaces: (iface.subinterfaces || []).map((sub) =>
+          sub.vlanId === vlanId ? { ...sub, ...patch } : sub
+        ),
+      };
+    });
+    const updated: NetworkNode = {
+      ...node,
+      interfaces: updatedInterfaces,
+    };
+    updated.routingTable = syncConnectedRoutes(updated);
+    onUpdateNode(updated);
+  };
+
+  const handleAddSubinterface = (parentIface: NetworkInterface) => {
+    const vlanId = Math.max(1, Math.min(4094, Number(newSubifVlan) || 10));
+    if (!isValidIpv4(newSubifIp) || !isValidSubnetMask(newSubifMask)) return;
+    const subif: RouterSubinterface = {
+      id: `subif-${parentIface.shortName}.${vlanId}`,
+      vlanId,
+      ipAddress: newSubifIp.trim(),
+      subnetMask: newSubifMask.trim(),
+      helperAddress: isValidIpv4(newSubifHelper.trim()) ? newSubifHelper.trim() : undefined,
+      natRole: parentIface.natRole || 'inside',
+    };
+    const nextAllowed = parentIface.trunkAllowedVlans.includes(vlanId)
+      ? parentIface.trunkAllowedVlans
+      : [...parentIface.trunkAllowedVlans, vlanId].sort((a, b) => a - b);
+
+    const updatedInterfaces = node.interfaces.map((iface) =>
+      iface.id === parentIface.id
+        ? {
+            ...iface,
+            vlanMode: 'trunk' as const,
+            trunkAllowedVlans: nextAllowed,
+            subinterfaces: [...(iface.subinterfaces || []).filter((s) => s.vlanId !== vlanId), subif].sort(
+              (a, b) => a.vlanId - b.vlanId
+            ),
+          }
+        : iface
+    );
+    const updated: NetworkNode = {
+      ...node,
+      interfaces: updatedInterfaces,
+    };
+    updated.routingTable = syncConnectedRoutes(updated);
+    onUpdateNode(updated);
+    setSubifFormIfaceId(null);
+  };
+
+  const handleDeleteSubinterface = (parentIfaceId: string, vlanId: number) => {
+    const updatedInterfaces = node.interfaces.map((iface) =>
+      iface.id === parentIfaceId
+        ? {
+            ...iface,
+            subinterfaces: (iface.subinterfaces || []).filter((s) => s.vlanId !== vlanId),
+          }
+        : iface
+    );
+    const updated: NetworkNode = {
+      ...node,
+      interfaces: updatedInterfaces,
+    };
+    updated.routingTable = syncConnectedRoutes(updated);
+    onUpdateNode(updated);
+  };
+
+  const handleAddAclRule = (e: React.FormEvent) => {
+    e.preventDefault();
+    const currentRules = node.aclRules || [];
+    const nextSeq =
+      currentRules.length > 0 ? Math.max(...currentRules.map((r) => r.seq)) + 10 : 10;
+    const newRule: AclRule = {
+      id: `acl-${Date.now()}`,
+      seq: nextSeq,
+      action: newAclAction,
+      protocol: newAclProto,
+      srcIp: newAclSrc.trim() || 'any',
+      dstIp: newAclDst.trim() || 'any',
+      enabled: true,
+    };
+    onUpdateNode({
+      ...node,
+      aclRules: [newRule, ...currentRules].sort((a, b) => a.seq - b.seq),
+    });
+  };
 
   return (
     <aside className="w-[385px] border-l border-slate-800 bg-slate-900 flex flex-col h-full shrink-0 select-none">
@@ -676,33 +793,47 @@ export const DeviceInspectorPanel: React.FC<DeviceInspectorPanelProps> = ({
           </div>
 
           <div className="flex items-center gap-1 shrink-0">
-            <button
-              type="button"
-              onClick={() => onOpenChassis(node.id)}
-              title="Открыть переднюю панель портов 1U в плавающем окне"
-              className="flex items-center gap-1 px-1.5 py-1 rounded bg-sky-950/80 hover:bg-sky-900 border border-sky-500/40 text-[10px] font-mono text-sky-300 transition-colors cursor-pointer"
-            >
-              <Cpu className="w-3 h-3" />
-              <span>1U</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onOpenWebGui(node.id)}
-              title="Открыть плавающий Веб-интерфейс коммутатора (настройка портов и базы VLAN)"
-              className="flex items-center gap-1 px-1.5 py-1 rounded bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-500/40 text-[10px] font-mono text-indigo-300 transition-colors cursor-pointer"
-            >
-              <Globe className="w-3 h-3" />
-              <span>WEB</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onOpenFloatingCli(node.id)}
-              title="Открыть консоль CLI этого устройства в плавающем окне"
-              className="flex items-center gap-1 px-1.5 py-1 rounded bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-[10px] font-mono text-emerald-300 transition-colors cursor-pointer"
-            >
-              <Terminal className="w-3 h-3" />
-              <span>CLI</span>
-            </button>
+            {node.type === 'pc' ? (
+              <button
+                type="button"
+                onClick={() => onOpenPcMonitor(node.id)}
+                title="Открыть плавающий монитор ПК (настройки сети IP/маски и консоль CMD)"
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 border border-sky-400/60 text-[11px] font-mono font-semibold text-white shadow-xs transition-colors cursor-pointer"
+              >
+                <Monitor className="w-3.5 h-3.5" />
+                <span>Монитор ПК</span>
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => onOpenChassis(node.id)}
+                  title="Открыть переднюю панель портов 1U в плавающем окне"
+                  className="flex items-center gap-1 px-1.5 py-1 rounded bg-sky-950/80 hover:bg-sky-900 border border-sky-500/40 text-[10px] font-mono text-sky-300 transition-colors cursor-pointer"
+                >
+                  <Cpu className="w-3 h-3" />
+                  <span>1U</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenWebGui(node.id)}
+                  title="Открыть плавающий Веб-интерфейс коммутатора (настройка портов и базы VLAN)"
+                  className="flex items-center gap-1 px-1.5 py-1 rounded bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-500/40 text-[10px] font-mono text-indigo-300 transition-colors cursor-pointer"
+                >
+                  <Globe className="w-3 h-3" />
+                  <span>WEB</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenFloatingCli(node.id)}
+                  title="Открыть консоль CLI этого устройства в плавающем окне"
+                  className="flex items-center gap-1 px-1.5 py-1 rounded bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-[10px] font-mono text-emerald-300 transition-colors cursor-pointer"
+                >
+                  <Terminal className="w-3 h-3" />
+                  <span>CLI</span>
+                </button>
+              </>
+            )}
             {allZones.length > 0 && (
               <button
                 type="button"
@@ -978,7 +1109,44 @@ export const DeviceInspectorPanel: React.FC<DeviceInspectorPanelProps> = ({
                 </div>
               </div>
             ) : (
-              <div className="space-y-2">
+              <div className="space-y-2.5">
+                {node.type === 'router' && (
+                  <div className="p-3 rounded-md bg-sky-950/25 border border-sky-500/40 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-sky-200 flex items-center gap-1.5">
+                        <Globe className="w-3.5 h-3.5 text-sky-400" />
+                        <span>Панель Cisco ISR GUI и шасси 1U</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-sky-300">
+                        L3 · dot1Q · NAT · ACL
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-300 leading-relaxed">
+                      Быстрый визуальный редактор статических маршрутов (Static Routes), подинтерфейсов 802.1Q (Router-on-a-Stick), трансляции NAT/PAT и правил ACL в плавающем окне.
+                    </p>
+                    <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                      <button
+                        type="button"
+                        data-testid="inspector-open-router-gui"
+                        onClick={() => onOpenWebGui(node.id)}
+                        className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white shadow-xs transition-colors cursor-pointer"
+                      >
+                        <Globe className="w-3.5 h-3.5" />
+                        <span>Редактор ISR GUI</span>
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="inspector-open-router-1u"
+                        onClick={() => onOpenChassis(node.id)}
+                        className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded bg-slate-900 hover:bg-slate-800 border border-sky-500/40 text-xs font-medium text-sky-300 transition-colors cursor-pointer"
+                      >
+                        <Cpu className="w-3.5 h-3.5" />
+                        <span>Шасси 1U (ISR)</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="text-xs font-semibold text-slate-300">
                   Интерфейсы ({node.interfaces.length})
                 </div>
@@ -1121,6 +1289,183 @@ export const DeviceInspectorPanel: React.FC<DeviceInspectorPanelProps> = ({
                               />
                             </div>
                           )}
+                        </div>
+                      )}
+
+                      {/* Router CCNA Extensions: NAT Role, DHCP Relay (ip helper-address) & 802.1Q Subinterfaces */}
+                      {node.type === 'router' && (
+                        <div className="pt-1.5 border-t border-slate-800/70 space-y-2">
+                          <div className="grid grid-cols-2 gap-1.5">
+                            <div>
+                              <label className="block text-[10px] text-slate-400 mb-0.5">
+                                DHCP Relay (helper-address)
+                              </label>
+                              <input
+                                type="text"
+                                placeholder="203.0.113.100"
+                                value={iface.helperAddress || ''}
+                                onChange={(e) =>
+                                  handleInterfaceChange(iface.id, {
+                                    helperAddress: e.target.value.trim() || undefined,
+                                  })
+                                }
+                                className="w-full px-2 py-1 text-xs font-mono bg-slate-900 border border-slate-700 rounded text-amber-200 focus:outline-none focus:border-sky-500"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] text-slate-400 mb-0.5">
+                                Роль NAT (Inside / Outside)
+                              </label>
+                              <select
+                                value={iface.natRole || 'none'}
+                                onChange={(e) => {
+                                  const role = e.target.value as 'none' | 'inside' | 'outside';
+                                  onUpdateNode({
+                                    ...node,
+                                    natEnabled:
+                                      role !== 'none' ? true : Boolean(node.natEnabled),
+                                    interfaces: node.interfaces.map((it) =>
+                                      it.id === iface.id ? { ...it, natRole: role } : it
+                                    ),
+                                  });
+                                }}
+                                className="w-full px-2 py-1 text-xs font-mono bg-slate-900 border border-slate-700 rounded text-indigo-300 focus:outline-none focus:border-sky-500"
+                              >
+                                <option value="none">Без NAT</option>
+                                <option value="inside">ip nat inside (LAN)</option>
+                                <option value="outside">ip nat outside (WAN)</option>
+                              </select>
+                            </div>
+                          </div>
+
+                          {/* 802.1Q Subinterfaces (Router-on-a-Stick) */}
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-mono text-indigo-300 font-semibold">
+                                Подинтерфейсы 802.1Q ({(iface.subinterfaces || []).length})
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setSubifFormIfaceId((prev) =>
+                                    prev === iface.id ? null : iface.id
+                                  )
+                                }
+                                className="px-1.5 py-0.5 rounded bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-500/40 text-[10px] font-mono text-indigo-200 cursor-pointer"
+                              >
+                                + {iface.shortName}.X (dot1Q)
+                              </button>
+                            </div>
+
+                            {(iface.subinterfaces || []).map((sub) => (
+                              <div
+                                key={sub.id || `${iface.id}.${sub.vlanId}`}
+                                className="p-2 rounded bg-slate-900/90 border border-indigo-500/30 space-y-1.5 text-xs font-mono"
+                              >
+                                <div className="flex items-center justify-between gap-1">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="font-bold text-indigo-300">
+                                      {iface.shortName}.{sub.vlanId}
+                                    </span>
+                                    <span className="px-1.5 py-0.2 rounded bg-indigo-500/20 text-[10px] text-indigo-200">
+                                      dot1Q VLAN {sub.vlanId}
+                                    </span>
+                                    {sub.natRole && sub.natRole !== 'none' && (
+                                      <span className="px-1 py-0.2 rounded bg-emerald-500/20 text-[9px] text-emerald-300 uppercase">
+                                        NAT {sub.natRole}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteSubinterface(iface.id, sub.vlanId)}
+                                    title={`Удалить подинтерфейс ${iface.shortName}.${sub.vlanId}`}
+                                    className="text-slate-400 hover:text-red-400 p-0.5 cursor-pointer"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-1">
+                                  <input
+                                    type="text"
+                                    value={sub.ipAddress}
+                                    onChange={(e) =>
+                                      handleUpdateSubinterface(iface.id, sub.vlanId, {
+                                        ipAddress: e.target.value,
+                                      })
+                                    }
+                                    placeholder="IP шлюза VLAN"
+                                    className="px-1.5 py-0.5 text-[11px] bg-slate-950 border border-slate-700 rounded text-sky-300"
+                                  />
+                                  <input
+                                    type="text"
+                                    value={sub.helperAddress || ''}
+                                    onChange={(e) =>
+                                      handleUpdateSubinterface(iface.id, sub.vlanId, {
+                                        helperAddress: e.target.value.trim() || undefined,
+                                      })
+                                    }
+                                    placeholder="DHCP helper IP"
+                                    className="px-1.5 py-0.5 text-[11px] bg-slate-950 border border-slate-700 rounded text-amber-200"
+                                  />
+                                </div>
+                              </div>
+                            ))}
+
+                            {subifFormIfaceId === iface.id && (
+                              <div className="p-2 rounded bg-slate-900 border border-indigo-500/50 space-y-1.5 text-xs font-mono">
+                                <div className="text-[10px] text-indigo-300">
+                                  Новый подинтерфейс Router-on-a-Stick ({iface.shortName}.VLAN):
+                                </div>
+                                <div className="grid grid-cols-2 gap-1.5">
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    max={4094}
+                                    value={newSubifVlan}
+                                    onChange={(e) => {
+                                      const v = e.target.value;
+                                      setNewSubifVlan(v);
+                                      if (Number(v) >= 1 && Number(v) <= 254) {
+                                        setNewSubifIp(`192.168.${v}.1`);
+                                      }
+                                    }}
+                                    placeholder="VLAN (10)"
+                                    className="px-2 py-1 text-xs bg-slate-950 border border-slate-700 rounded text-indigo-300"
+                                  />
+                                  <input
+                                    type="text"
+                                    value={newSubifIp}
+                                    onChange={(e) => setNewSubifIp(e.target.value)}
+                                    placeholder="192.168.10.1"
+                                    className="px-2 py-1 text-xs bg-slate-950 border border-slate-700 rounded text-slate-100"
+                                  />
+                                  <input
+                                    type="text"
+                                    value={newSubifMask}
+                                    onChange={(e) => setNewSubifMask(e.target.value)}
+                                    placeholder="255.255.255.0"
+                                    className="px-2 py-1 text-xs bg-slate-950 border border-slate-700 rounded text-slate-100"
+                                  />
+                                  <input
+                                    type="text"
+                                    value={newSubifHelper}
+                                    onChange={(e) => setNewSubifHelper(e.target.value)}
+                                    placeholder="helper IP (опц.)"
+                                    className="px-2 py-1 text-xs bg-slate-950 border border-slate-700 rounded text-amber-200"
+                                  />
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddSubinterface(iface)}
+                                  className="w-full py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-sans font-medium cursor-pointer"
+                                >
+                                  Создать {iface.shortName}.{newSubifVlan || '10'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
                         </div>
                       )}
                     </div>
@@ -1543,6 +1888,195 @@ export const DeviceInspectorPanel: React.FC<DeviceInspectorPanelProps> = ({
                 </form>
               </div>
             )}
+            {/* Section E: Router ACL Firewall & NAT/PAT Overload */}
+            {node.type === 'router' && (
+              <div className="p-3.5 rounded-md bg-slate-950 border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-rose-300">
+                    <Shield className="w-4 h-4" />
+                    <span>Межсетевой экран ACL и NAT / PAT</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onUpdateNode({
+                        ...node,
+                        natEnabled: !node.natEnabled,
+                      })
+                    }
+                    className={`px-2 py-0.5 text-[10px] font-mono rounded border cursor-pointer ${
+                      node.natEnabled
+                        ? 'bg-emerald-950/70 border-emerald-600 text-emerald-300'
+                        : 'bg-slate-900 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    {node.natEnabled ? '● NAT PAT ON' : 'NAT OFF'}
+                  </button>
+                </div>
+
+                {/* Quick ACL Presets */}
+                <div className="flex flex-wrap items-center gap-1 text-[10px] font-mono">
+                  <span className="text-slate-400">Быстрые правила:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const rules = node.aclRules || [];
+                      const rule: AclRule = {
+                        id: `acl-deny-icmp-${Date.now()}`,
+                        seq: 5,
+                        action: 'deny',
+                        protocol: 'ICMP',
+                        srcIp: 'any',
+                        dstIp: 'any',
+                        enabled: true,
+                      };
+                      onUpdateNode({
+                        ...node,
+                        aclRules: [rule, ...rules].sort((a, b) => a.seq - b.seq),
+                      });
+                    }}
+                    className="px-1.5 py-0.5 rounded bg-red-950/70 hover:bg-red-900 border border-red-700/60 text-red-200 cursor-pointer"
+                  >
+                    + Deny ICMP (Блок Ping)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const rules = node.aclRules || [];
+                      const rule: AclRule = {
+                        id: `acl-deny-http-${Date.now()}`,
+                        seq: 6,
+                        action: 'deny',
+                        protocol: 'HTTP',
+                        srcIp: 'any',
+                        dstIp: 'any',
+                        dstPort: 80,
+                        enabled: true,
+                      };
+                      onUpdateNode({
+                        ...node,
+                        aclRules: [rule, ...rules].sort((a, b) => a.seq - b.seq),
+                      });
+                    }}
+                    className="px-1.5 py-0.5 rounded bg-amber-950/70 hover:bg-amber-900 border border-amber-700/60 text-amber-200 cursor-pointer"
+                  >
+                    + Deny HTTP (TCP 80)
+                  </button>
+                </div>
+
+                {/* Active ACL Rules List */}
+                <div className="space-y-1.5">
+                  {(node.aclRules || []).length === 0 ? (
+                    <div className="text-[11px] text-slate-400 font-mono">
+                      Список ACL пуст — трафик разрешён по умолчанию (Permit Any).
+                    </div>
+                  ) : (
+                    (node.aclRules || []).map((rule) => (
+                      <div
+                        key={rule.id}
+                        data-testid={`acl-rule-${rule.seq}`}
+                        className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded bg-slate-900 border border-slate-800 text-xs font-mono"
+                      >
+                        <div className="flex items-center gap-1.5 min-w-0 truncate">
+                          <input
+                            type="checkbox"
+                            checked={rule.enabled}
+                            onChange={() =>
+                              onUpdateNode({
+                                ...node,
+                                aclRules: (node.aclRules || []).map((r) =>
+                                  r.id === rule.id ? { ...r, enabled: !r.enabled } : r
+                                ),
+                              })
+                            }
+                            className="rounded border-slate-700 bg-slate-950 text-sky-500 cursor-pointer"
+                          />
+                          <span className="text-slate-500">#{rule.seq}</span>
+                          <span
+                            className={
+                              rule.action === 'permit'
+                                ? 'text-emerald-400 font-bold uppercase'
+                                : 'text-red-400 font-bold uppercase'
+                            }
+                          >
+                            {rule.action}
+                          </span>
+                          <span className="text-sky-300">{rule.protocol}</span>
+                          <span className="text-slate-300 truncate">
+                            {rule.srcIp} → {rule.dstIp}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateNode({
+                              ...node,
+                              aclRules: (node.aclRules || []).filter((r) => r.id !== rule.id),
+                            })
+                          }
+                          aria-label={`Удалить правило ACL ${rule.seq}`}
+                          className="text-slate-400 hover:text-red-400 p-0.5 cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                {/* Add Custom ACL Rule Form */}
+                <form
+                  onSubmit={handleAddAclRule}
+                  className="pt-2 border-t border-slate-800/80 space-y-2 text-xs font-mono"
+                >
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <select
+                      aria-label="Действие правила ACL"
+                      value={newAclAction}
+                      onChange={(e) => setNewAclAction(e.target.value as AclAction)}
+                      className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-100"
+                    >
+                      <option value="deny">deny (Блокировать)</option>
+                      <option value="permit">permit (Разрешить)</option>
+                    </select>
+                    <select
+                      aria-label="Протокол правила ACL"
+                      value={newAclProto}
+                      onChange={(e) => setNewAclProto(e.target.value as AclProtocol)}
+                      className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-sky-300"
+                    >
+                      <option value="ICMP">ICMP (Ping)</option>
+                      <option value="HTTP">HTTP (TCP 80)</option>
+                      <option value="DNS">DNS (UDP 53)</option>
+                      <option value="TCP">TCP</option>
+                      <option value="UDP">UDP</option>
+                      <option value="ANY">ANY (Весь IP)</option>
+                    </select>
+                    <input
+                      type="text"
+                      value={newAclSrc}
+                      onChange={(e) => setNewAclSrc(e.target.value)}
+                      placeholder="Source (any / 192.168.10.0/24)"
+                      className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-100"
+                    />
+                    <input
+                      type="text"
+                      value={newAclDst}
+                      onChange={(e) => setNewAclDst(e.target.value)}
+                      placeholder="Dest (any / 203.0.113.100)"
+                      className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-100"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    className="w-full flex items-center justify-center gap-1 py-1.5 rounded bg-rose-600/80 hover:bg-rose-600 text-white font-sans font-medium cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Добавить правило ACL 100</span>
+                  </button>
+                </form>
+              </div>
+            )}
           </div>
         )}
 
@@ -1579,11 +2113,33 @@ export const DeviceInspectorPanel: React.FC<DeviceInspectorPanelProps> = ({
                 </>
               )}
               {node.type === 'router' && (
+                <>
+                  <button
+                    onClick={() => runQuickCliSnippet('show ip dhcp binding')}
+                    className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-slate-200 rounded transition-colors whitespace-nowrap shrink-0"
+                  >
+                    sh ip dhcp binding
+                  </button>
+                  <button
+                    onClick={() => runQuickCliSnippet('show ip nat translations')}
+                    className="px-2 py-1 text-[11px] font-mono bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-700/50 text-indigo-300 rounded transition-colors whitespace-nowrap shrink-0"
+                  >
+                    sh ip nat tr
+                  </button>
+                  <button
+                    onClick={() => runQuickCliSnippet('show access-lists')}
+                    className="px-2 py-1 text-[11px] font-mono bg-rose-950/80 hover:bg-rose-900 border border-rose-700/50 text-rose-300 rounded transition-colors whitespace-nowrap shrink-0"
+                  >
+                    sh acl
+                  </button>
+                </>
+              )}
+              {node.type === 'switch' && (
                 <button
-                  onClick={() => runQuickCliSnippet('show ip dhcp binding')}
-                  className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-slate-200 rounded transition-colors whitespace-nowrap shrink-0"
+                  onClick={() => runQuickCliSnippet('show spanning-tree')}
+                  className="px-2 py-1 text-[11px] font-mono bg-amber-950/80 hover:bg-amber-900 border border-amber-700/50 text-amber-300 rounded transition-colors whitespace-nowrap shrink-0"
                 >
-                  sh ip dhcp binding
+                  sh spanning-tree
                 </button>
               )}
               <button
@@ -1663,6 +2219,116 @@ export const DeviceInspectorPanel: React.FC<DeviceInspectorPanelProps> = ({
 
         {activeTab === 'tables' && (
           <div className="space-y-5">
+            {/* Switch Spanning Tree Protocol (STP 802.1D) Table */}
+            {node.type === 'switch' &&
+              (() => {
+                const stpState = computeSpanningTreeState(allNodes, allLinks)[node.id];
+                if (!stpState) return null;
+                return (
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className="text-xs font-semibold text-amber-300">
+                        Spanning Tree 802.1D ({stpState.isRootBridge ? 'Root Bridge' : 'Non-Root'})
+                      </h3>
+                      <span className="text-[10px] font-mono text-slate-400">
+                        Priority: {stpState.bridgePriority}
+                      </span>
+                    </div>
+                    <div className="border border-slate-800 rounded overflow-hidden">
+                      <table className="w-full text-left text-xs font-mono">
+                        <thead className="bg-slate-950 text-slate-400 border-b border-slate-800">
+                          <tr>
+                            <th className="py-1.5 px-2.5">Порт</th>
+                            <th className="py-1.5 px-2.5">Роль</th>
+                            <th className="py-1.5 px-2.5">Статус</th>
+                            <th className="py-1.5 px-2.5">Сосед</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800 bg-slate-900/50">
+                          {node.interfaces.map((iface) => {
+                            const ps = stpState.ports[iface.id];
+                            if (!ps || ps.state === 'disabled') return null;
+                            return (
+                              <tr key={iface.id}>
+                                <td className="py-1.5 px-2.5 text-slate-200">{iface.shortName}</td>
+                                <td className="py-1.5 px-2.5 text-sky-300 uppercase">{ps.role}</td>
+                                <td className="py-1.5 px-2.5">
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                      ps.state === 'blocking'
+                                        ? 'bg-orange-500/25 border border-orange-400/60 text-orange-300'
+                                        : 'bg-emerald-500/20 text-emerald-300'
+                                    }`}
+                                  >
+                                    {ps.state === 'blocking' ? 'BLK' : 'FWD'}
+                                  </span>
+                                </td>
+                                <td className="py-1.5 px-2.5 text-slate-400">
+                                  {ps.peerNodeName || 'Host'}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              })()}
+
+            {/* Router NAT / PAT Translations Table */}
+            {node.type === 'router' && (
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-xs font-semibold text-indigo-300">
+                    Таблица трансляций NAT / PAT ({(node.natTranslations || []).length})
+                  </h3>
+                  {(node.natTranslations || []).length > 0 && (
+                    <button
+                      onClick={() => onUpdateNode({ ...node, natTranslations: [] })}
+                      className="text-[11px] text-slate-400 hover:text-red-400"
+                    >
+                      Очистить NAT
+                    </button>
+                  )}
+                </div>
+                {(node.natTranslations || []).length === 0 ? (
+                  <div className="p-3 rounded bg-slate-950 border border-slate-800 text-xs text-slate-400">
+                    Таблица NAT пуста. Запустите Ping или HTTP-запрос из локальной сети (Inside) во внешнюю сеть (Outside).
+                  </div>
+                ) : (
+                  <div className="border border-slate-800 rounded overflow-hidden">
+                    <table className="w-full text-left text-[11px] font-mono">
+                      <thead className="bg-slate-950 text-slate-400 border-b border-slate-800">
+                        <tr>
+                          <th className="py-1.5 px-2">Pro</th>
+                          <th className="py-1.5 px-2">Inside Local</th>
+                          <th className="py-1.5 px-2">Inside Global</th>
+                          <th className="py-1.5 px-2">Outside</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800 bg-slate-900/50">
+                        {(node.natTranslations || []).map((tr) => (
+                          <tr key={tr.id}>
+                            <td className="py-1.5 px-2 text-sky-300 uppercase">{tr.protocol}</td>
+                            <td className="py-1.5 px-2 text-slate-200">
+                              {tr.insideLocal}
+                            </td>
+                            <td className="py-1.5 px-2 text-emerald-300">
+                              {tr.insideGlobal}
+                            </td>
+                            <td className="py-1.5 px-2 text-amber-300">
+                              {tr.outsideGlobal}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* ARP Table */}
             <div>
               <div className="flex items-center justify-between mb-2">

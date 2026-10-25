@@ -12,18 +12,30 @@ import {
 } from './network/types';
 import { TOPOLOGY_PRESETS, createDeviceNode } from './network/presets';
 import {
+  getRouterLogicalInterfaces,
   runDhcpDoraSimulation,
   runHttpBrowserSimulation,
   runPacketSimulation,
   runTracerouteSimulation,
 } from './network/simulator';
+import {
+  PacketFilterOptions,
+  ProtocolFilterCategory,
+  SimulationExecutionMode,
+  buildCanvasPacketSquares,
+  createDefaultEnabledCategories,
+  generateMultiFlowTrafficSteps,
+  getConcurrentBroadcastWaveIndices,
+} from './network/packetStreamEngine';
 import { isValidIpv4 } from './network/ipMath';
+import { closeChassisWindow, openChassisWindow } from './network/hardwareChassis';
 import { DeviceToolbar } from './components/DeviceToolbar';
 import { TopologyCanvas, WorkspaceTool } from './components/TopologyCanvas';
 import { DeviceInspectorPanel } from './components/DeviceInspectorPanel';
 import { SimulationTimelineBar } from './components/SimulationTimelineBar';
 import { PduInspectorModal } from './components/PduInspectorModal';
 import { FloatingCliWindow } from './components/FloatingCliWindow';
+import { FloatingPcMonitor } from './components/FloatingPcMonitor';
 import { Play } from 'lucide-react';
 
 const STORAGE_KEY = 'netpulse_studio_topology_v4';
@@ -89,11 +101,34 @@ export default function App() {
   const [isRightCollapsed, setIsRightCollapsed] = useState<boolean>(false);
   const [isBottomLogExpanded, setIsBottomLogExpanded] = useState<boolean>(false);
 
-  // Floating 1U Hardware Switch Window, Switch Web GUI & Multi-Tab CLI Window States
-  const [chassisNodeId, setChassisNodeId] = useState<string | null>(null);
+  // Floating 1U Hardware Switch Windows (Multi-Window Rack), Switch Web GUI, PC Monitor & Multi-Tab CLI Window States
+  const [openChassisNodeIds, setOpenChassisNodeIds] = useState<string[]>([]);
   const [webGuiNodeId, setWebGuiNodeId] = useState<string | null>(null);
   const [floatingCliNodeIds, setFloatingCliNodeIds] = useState<string[]>([]);
   const [activeFloatingCliNodeId, setActiveFloatingCliNodeId] = useState<string | null>(null);
+  const [openPcMonitorNodeIds, setOpenPcMonitorNodeIds] = useState<string[]>([]);
+  const [focusedPcMonitorId, setFocusedPcMonitorId] = useState<string | null>(null);
+
+  const handleOpenChassis = (nodeId: string) => {
+    setOpenChassisNodeIds((prev) => openChassisWindow(prev, nodeId));
+  };
+
+  const handleCloseChassis = (nodeId: string) => {
+    setOpenChassisNodeIds((prev) => closeChassisWindow(prev, nodeId));
+  };
+
+  const handleCloseAllChassis = () => {
+    setOpenChassisNodeIds([]);
+  };
+
+  const handleOpenPcMonitor = (nodeId: string) => {
+    setOpenPcMonitorNodeIds((prev) => (prev.includes(nodeId) ? prev : [...prev, nodeId]));
+    setFocusedPcMonitorId(nodeId);
+  };
+
+  const handleClosePcMonitor = (nodeId: string) => {
+    setOpenPcMonitorNodeIds((prev) => prev.filter((id) => id !== nodeId));
+  };
 
   const handleOpenFloatingCli = (nodeId: string) => {
     setFloatingCliNodeIds((prev) => (prev.includes(nodeId) ? prev : [...prev, nodeId]));
@@ -110,13 +145,24 @@ export default function App() {
     });
   };
 
-  // Simulation state
+  // Simulation & Multi-Packet Live Stream state
   const [simulationSteps, setSimulationSteps] = useState<SimulationStep[]>([]);
   const [currentStepIndex, setCurrentStepIndex] = useState<number>(0);
+  const [stepProgress, setStepProgress] = useState<number>(0.55);
+  const [liveStreamPhase, setLiveStreamPhase] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [executionMode, setExecutionMode] = useState<SimulationExecutionMode>('simulation');
+  const [liveTrafficActive, setLiveTrafficActive] = useState<boolean>(false);
+  const [liveWaveCount, setLiveWaveCount] = useState<number>(0);
   const [speedMultiplier, setSpeedMultiplier] = useState<number>(1);
+  const [filterOptions, setFilterOptions] = useState<PacketFilterOptions>(() => ({
+    enabledCategories: createDefaultEnabledCategories(),
+    onlyDropped: false,
+    deviceFilterId: 'ALL',
+    searchQuery: '',
+  }));
   const [summaryMessage, setSummaryMessage] = useState<string>(
-    'Стенд готов. Доступны протоколы L2–L7: ARP, VLAN, ICMP Ping, Traceroute (TTL), DHCP (DORA), DNS и HTTP.'
+    'Стенд готов. Доступны протоколы L2–L7: ARP, VLAN, STP, ICMP Ping, Traceroute, DHCP, DNS и HTTP.'
   );
   const [inspectedStep, setInspectedStep] = useState<SimulationStep | null>(null);
 
@@ -129,24 +175,46 @@ export default function App() {
     }
   }, [nodes, links, zones]);
 
-  // Playback timer for Simulation Mode
+  // Unified Time-Dilated Playback & Live Stream Loop (supports 0.1x Slow-Mo .. 4x Turbo)
   useEffect(() => {
     if (!isPlaying || simulationSteps.length === 0) return;
 
-    const intervalMs = Math.round(900 / speedMultiplier);
+    const tickMs = 70;
     const timer = window.setInterval(() => {
-      setCurrentStepIndex((prev) => {
-        if (prev < simulationSteps.length - 1) {
-          return prev + 1;
-        } else {
-          setIsPlaying(false);
-          return prev;
-        }
-      });
-    }, intervalMs);
+      if (executionMode === 'realtime') {
+        // Continuous multi-packet stream phase increment scaled by speedMultiplier
+        const deltaPhase = 0.018 * speedMultiplier;
+        setLiveStreamPhase((prev) => (prev + deltaPhase) % 1);
+        setCurrentStepIndex((prev) => (prev + 1) % simulationSteps.length);
+      } else {
+        // Step-by-step simulation mode with smooth intra-link interpolation
+        const deltaStep = 0.085 * speedMultiplier;
+        setStepProgress((prev) => {
+          const next = prev + deltaStep;
+          if (next < 0.92) {
+            return next;
+          }
+          // Advance past the current broadcast wave or single step
+          setCurrentStepIndex((currIdx) => {
+            const waveIndices = getConcurrentBroadcastWaveIndices(simulationSteps, currIdx);
+            const lastInWave =
+              waveIndices.length > 0 ? Math.max(...waveIndices) : currIdx;
+            if (lastInWave < simulationSteps.length - 1) {
+              return lastInWave + 1;
+            }
+            if (liveTrafficActive) {
+              return 0;
+            }
+            setIsPlaying(false);
+            return currIdx;
+          });
+          return 0.14;
+        });
+      }
+    }, tickMs);
 
     return () => window.clearInterval(timer);
-  }, [isPlaying, simulationSteps.length, speedMultiplier]);
+  }, [isPlaying, simulationSteps, speedMultiplier, executionMode, liveTrafficActive]);
 
   const handleLoadPreset = (presetId: string) => {
     const preset = TOPOLOGY_PRESETS.find((p) => p.id === presetId);
@@ -161,23 +229,33 @@ export default function App() {
     const pcNode = clonedNodes.find((n) => n.type === 'pc');
     setSelectedNodeId(pcNode?.id || clonedNodes[0]?.id || null);
     setSelectedZoneId(null);
+    setOpenChassisNodeIds([]);
+    setOpenPcMonitorNodeIds([]);
+    setWebGuiNodeId(null);
     setSimulationSteps([]);
     setCurrentStepIndex(0);
     setIsPlaying(false);
     setSummaryMessage(`Загружен стенд: «${preset.name}»`);
   };
 
-  const handleAddDevice = (type: DeviceType) => {
+  const handleAddDevice = (type: DeviceType, switchPortCount: number = 6) => {
     const countOfType = nodes.filter((n) => n.type === type).length + 1;
     const offsetX = 320 + ((nodes.length * 60) % 360);
     const offsetY = 220 + ((nodes.length * 45) % 240);
-    const newNode = createDeviceNode(type, countOfType, offsetX, offsetY);
+    const newNode = createDeviceNode(
+      type,
+      countOfType,
+      offsetX,
+      offsetY,
+      undefined,
+      switchPortCount
+    );
     setNodes((prev) => [...prev, newNode]);
     setSelectedNodeId(newNode.id);
     setSelectedZoneId(null);
     setIsRightCollapsed(false);
     setActiveTool('select');
-    setSummaryMessage(`Добавлено устройство ${newNode.name}. Настройте порты или подключите кабель.`);
+    setSummaryMessage(`Добавлено устройство ${newNode.name} (${newNode.interfaces.length} портов). Настройте порты или подключите кабель.`);
   };
 
   const handleAddZone = () => {
@@ -257,9 +335,7 @@ export default function App() {
     if (selectedNodeId === nodeId) {
       setSelectedNodeId(null);
     }
-    if (chassisNodeId === nodeId) {
-      setChassisNodeId(null);
-    }
+    setOpenChassisNodeIds((prev) => closeChassisWindow(prev, nodeId));
     if (webGuiNodeId === nodeId) {
       setWebGuiNodeId(null);
     }
@@ -274,10 +350,68 @@ export default function App() {
   const handleLoadSimulationSteps = (steps: SimulationStep[], msg: string) => {
     setSimulationSteps(steps);
     setCurrentStepIndex(0);
+    setStepProgress(0.52);
     setSummaryMessage(msg);
     if (steps.length > 0) {
       setIsPlaying(true);
     }
+  };
+
+  const handleToggleLiveTraffic = () => {
+    if (liveTrafficActive) {
+      setLiveTrafficActive(false);
+      setIsPlaying(false);
+      setSummaryMessage('Прямой эфир остановлен. Выберите любой пакет на схеме или в журнале для разбора заголовков PDU.');
+      return;
+    }
+    const nextWave = liveWaveCount + 1;
+    setLiveWaveCount(nextWave);
+    const batch = generateMultiFlowTrafficSteps(nodes, links, nextWave);
+    setNodes(batch.updatedNodes);
+    setSimulationSteps(batch.steps);
+    setCurrentStepIndex(0);
+    setStepProgress(0.45);
+    setExecutionMode('realtime');
+    setLiveTrafficActive(true);
+    setIsPlaying(true);
+    setSummaryMessage(batch.summaryMessage);
+  };
+
+  const handleChangeExecutionMode = (mode: SimulationExecutionMode) => {
+    setExecutionMode(mode);
+    if (mode === 'realtime' && simulationSteps.length === 0) {
+      const nextWave = liveWaveCount + 1;
+      setLiveWaveCount(nextWave);
+      const batch = generateMultiFlowTrafficSteps(nodes, links, nextWave);
+      setNodes(batch.updatedNodes);
+      setSimulationSteps(batch.steps);
+      setCurrentStepIndex(0);
+      setLiveTrafficActive(true);
+      setIsPlaying(true);
+      setSummaryMessage(batch.summaryMessage);
+    } else if (mode === 'realtime') {
+      setIsPlaying(true);
+    } else {
+      setStepProgress(0.58);
+    }
+  };
+
+  const handleToggleProtocolCategory = (category: ProtocolFilterCategory) => {
+    setFilterOptions((prev) => ({
+      ...prev,
+      enabledCategories: {
+        ...prev.enabledCategories,
+        [category]: !prev.enabledCategories[category],
+      },
+    }));
+  };
+
+  const handleEnableAllProtocols = () => {
+    setFilterOptions((prev) => ({
+      ...prev,
+      enabledCategories: createDefaultEnabledCategories(),
+      onlyDropped: false,
+    }));
   };
 
   const handleTriggerPingSimulation = (
@@ -323,8 +457,8 @@ export default function App() {
   const handleSendPduBetweenNodes = (sourceNodeId: string, targetNodeId: string) => {
     const targetNode = nodes.find((n) => n.id === targetNodeId);
     if (!targetNode) return;
-    const targetIp = targetNode.interfaces.find(
-      (i) => i.adminStatus === 'up' && isValidIpv4(i.ipAddress)
+    const targetIp = getRouterLogicalInterfaces(targetNode).find((i) =>
+      isValidIpv4(i.ipAddress)
     )?.ipAddress;
 
     if (!targetIp) {
@@ -360,7 +494,7 @@ export default function App() {
     setZones([]);
     setSelectedNodeId(null);
     setSelectedZoneId(null);
-    setChassisNodeId(null);
+    setOpenChassisNodeIds([]);
     setWebGuiNodeId(null);
     setSimulationSteps([]);
     setCurrentStepIndex(0);
@@ -405,6 +539,27 @@ export default function App() {
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId) || null;
   const activeStep = simulationSteps[currentStepIndex] || null;
+  const packetSquares = React.useMemo(
+    () =>
+      buildCanvasPacketSquares({
+        nodes,
+        steps: simulationSteps,
+        activeStepIndex: currentStepIndex,
+        stepProgress,
+        executionMode,
+        liveStreamPhase,
+        filterOptions,
+      }),
+    [
+      nodes,
+      simulationSteps,
+      currentStepIndex,
+      stepProgress,
+      executionMode,
+      liveStreamPhase,
+      filterOptions,
+    ]
+  );
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
@@ -460,18 +615,16 @@ export default function App() {
             Статика WAN
           </a>
           <a
-            href="#pdu-inspector"
+            href="#ccna-roas-stp-acl-nat"
             onClick={(e) => {
               e.preventDefault();
-              if (activeStep) {
-                setInspectedStep(activeStep);
-              } else {
-                handleRunDefaultDemoSimulation();
-              }
+              handleLoadPreset('ccna-roas-stp-acl-nat');
             }}
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 ${
+              activePresetId === 'ccna-roas-stp-acl-nat' ? 'text-sky-400 underline underline-offset-4' : ''
+            }`}
           >
-            Инспектор OSI PDU
+            CCNA: RoaS · STP · ACL · NAT
           </a>
         </nav>
 
@@ -516,16 +669,21 @@ export default function App() {
             activeTool={activeTool}
             selectedCableType={selectedCableType}
             activeStep={activeStep}
+            packetSquares={packetSquares}
             isRightCollapsed={isRightCollapsed}
             onExpandRightPanel={() => setIsRightCollapsed(false)}
             onSelectNode={setSelectedNodeId}
             onSelectZone={setSelectedZoneId}
             onSelectCableType={setSelectedCableType}
-            chassisNodeId={chassisNodeId}
-            onOpenChassis={setChassisNodeId}
+            openChassisNodeIds={openChassisNodeIds}
+            onOpenChassis={handleOpenChassis}
+            onCloseChassis={handleCloseChassis}
+            onCloseAllChassis={handleCloseAllChassis}
             webGuiNodeId={webGuiNodeId}
             onOpenWebGui={setWebGuiNodeId}
             onOpenFloatingCli={handleOpenFloatingCli}
+            openPcMonitorNodeIds={openPcMonitorNodeIds}
+            onOpenPcMonitor={handleOpenPcMonitor}
             onMoveNode={handleMoveNode}
             onMoveZone={handleMoveZone}
             onUpdateNode={handleUpdateNode}
@@ -538,37 +696,93 @@ export default function App() {
             onDeleteLink={handleDeleteLink}
             onSendPduBetweenNodes={handleSendPduBetweenNodes}
             onInspectActiveStep={(step) => setInspectedStep(step)}
+            onSelectAndInspectPacketSquare={(step, stepIdx) => {
+              setIsPlaying(false);
+              setLiveTrafficActive(false);
+              setCurrentStepIndex(stepIdx);
+              setStepProgress(0.58);
+              setSelectedZoneId(null);
+              setSelectedNodeId(step.toNodeId);
+              setInspectedStep(step);
+            }}
             onAddDeviceAtCenter={handleAddDevice}
             onAddZone={handleAddZone}
           />
 
           <SimulationTimelineBar
             steps={simulationSteps}
+            nodes={nodes}
             currentStepIndex={currentStepIndex}
             isPlaying={isPlaying}
+            executionMode={executionMode}
+            liveTrafficActive={liveTrafficActive}
             speedMultiplier={speedMultiplier}
+            filterOptions={filterOptions}
             summaryMessage={summaryMessage}
             isExpanded={isBottomLogExpanded}
             onToggleExpand={() => setIsBottomLogExpanded((e) => !e)}
-            onPlayPause={() => setIsPlaying((p) => !p)}
+            onPlayPause={() => {
+              if (!isPlaying && simulationSteps.length === 0) {
+                handleToggleLiveTraffic();
+              } else {
+                setIsPlaying((p) => !p);
+              }
+            }}
             onStepForward={() => {
               setIsPlaying(false);
+              setLiveTrafficActive(false);
+              setExecutionMode('simulation');
+              setStepProgress(0.58);
               setCurrentStepIndex((idx) => Math.min(simulationSteps.length - 1, idx + 1));
             }}
             onStepBack={() => {
               setIsPlaying(false);
+              setLiveTrafficActive(false);
+              setExecutionMode('simulation');
+              setStepProgress(0.58);
               setCurrentStepIndex((idx) => Math.max(0, idx - 1));
             }}
             onReset={() => {
               setIsPlaying(false);
               setCurrentStepIndex(0);
+              setStepProgress(0.52);
             }}
-            onSelectStep={(idx) => {
+            onClearBuffer={() => {
               setIsPlaying(false);
-              setCurrentStepIndex(idx);
+              setLiveTrafficActive(false);
+              setSimulationSteps([]);
+              setCurrentStepIndex(0);
+              setSummaryMessage('Буфер пакетов очищен.');
             }}
-            onInspectStep={(step) => setInspectedStep(step)}
+            onSelectStep={(idx, focusNode) => {
+              setIsPlaying(false);
+              setLiveTrafficActive(false);
+              setCurrentStepIndex(idx);
+              setStepProgress(0.58);
+              const targetStep = simulationSteps[idx];
+              if (focusNode && targetStep) {
+                setSelectedZoneId(null);
+                setSelectedNodeId(targetStep.toNodeId);
+              }
+            }}
+            onInspectStep={(step) => {
+              setIsPlaying(false);
+              setInspectedStep(step);
+            }}
             onChangeSpeed={setSpeedMultiplier}
+            onChangeExecutionMode={handleChangeExecutionMode}
+            onToggleLiveTraffic={handleToggleLiveTraffic}
+            onToggleProtocolCategory={handleToggleProtocolCategory}
+            onEnableAllProtocols={handleEnableAllProtocols}
+            onToggleOnlyDropped={() =>
+              setFilterOptions((prev) => ({ ...prev, onlyDropped: !prev.onlyDropped }))
+            }
+            onChangeDeviceFilter={(deviceId) =>
+              setFilterOptions((prev) => ({ ...prev, deviceFilterId: deviceId }))
+            }
+            onChangeSearchQuery={(query) =>
+              setFilterOptions((prev) => ({ ...prev, searchQuery: query }))
+            }
           />
         </div>
 
@@ -599,10 +813,36 @@ export default function App() {
           onTriggerHttpSimulation={handleTriggerHttpSimulation}
           onLoadSimulationSteps={handleLoadSimulationSteps}
           onOpenFloatingCli={handleOpenFloatingCli}
-          onOpenChassis={(nodeId) => setChassisNodeId(nodeId)}
+          onOpenChassis={handleOpenChassis}
           onOpenWebGui={(nodeId) => setWebGuiNodeId(nodeId)}
+          onOpenPcMonitor={handleOpenPcMonitor}
         />
       </main>
+
+      {/* Floating Workstation PC Monitor Windows */}
+      {openPcMonitorNodeIds.map((pcId, idx) => {
+        const pcNode = nodes.find((n) => n.id === pcId);
+        if (!pcNode) return null;
+        return (
+          <FloatingPcMonitor
+            key={pcNode.id}
+            node={pcNode}
+            allNodes={nodes}
+            allLinks={links}
+            stackIndex={idx}
+            zIndex={focusedPcMonitorId === pcNode.id ? 50 : 47}
+            onFocus={() => setFocusedPcMonitorId(pcNode.id)}
+            onUpdateNode={handleUpdateNode}
+            onUpdateAllNodes={setNodes}
+            onTriggerPingSimulation={handleTriggerPingSimulation}
+            onTriggerDhcpSimulation={handleTriggerDhcpSimulation}
+            onTriggerTracerouteSimulation={handleTriggerTracerouteSimulation}
+            onTriggerHttpSimulation={handleTriggerHttpSimulation}
+            onLoadSimulationSteps={handleLoadSimulationSteps}
+            onClose={() => handleClosePcMonitor(pcNode.id)}
+          />
+        );
+      })}
 
       {/* Floating Multi-Tab Cisco IOS CLI Terminal Window */}
       <FloatingCliWindow

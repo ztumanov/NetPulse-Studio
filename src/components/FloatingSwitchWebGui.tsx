@@ -15,6 +15,7 @@ import {
   getDeviceVlanDatabase,
   upsertDeviceVlan,
 } from '../network/hardwareChassis';
+import { computeSpanningTreeState } from '../network/simulator';
 import {
   CheckSquare,
   Cpu,
@@ -119,6 +120,8 @@ export const FloatingSwitchWebGui: React.FC<FloatingSwitchWebGuiProps> = ({
 
   const vlanDb = getDeviceVlanDatabase(node);
   const portDescriptors = getDeviceChassisPorts(node, allNodes, allLinks, activeStep);
+  const stpState =
+    node.type === 'switch' ? computeSpanningTreeState(allNodes, allLinks)[node.id] : undefined;
 
   const switchableNodes = [...allNodes].sort((a, b) => {
     const order = { switch: 0, router: 1, server: 2, pc: 3 };
@@ -395,6 +398,49 @@ export const FloatingSwitchWebGui: React.FC<FloatingSwitchWebGuiProps> = ({
             {/* TAB 1: SWITCH PORT CONFIGURATION & 802.1Q VLAN ASSIGNMENT */}
             {activeTab === 'ports' && (
               <>
+                {/* Spanning Tree Protocol (STP 802.1D) Summary & Priority Bar */}
+                {stpState && (
+                  <div className="p-2 rounded-md bg-slate-900/95 border border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] font-bold border shrink-0 ${
+                          stpState.isRootBridge
+                            ? 'bg-emerald-950/80 border-emerald-500/60 text-emerald-300'
+                            : 'bg-indigo-950/80 border-indigo-500/50 text-indigo-300'
+                        }`}
+                      >
+                        STP 802.1D: {stpState.isRootBridge ? 'ROOT BRIDGE' : 'NON-ROOT'}
+                      </span>
+                      <span className="text-[11px] text-slate-300 truncate">
+                        Root: <strong className="text-sky-300">{stpState.rootBridgeName}</strong>{' '}
+                        (Cost: {stpState.rootPathCost})
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] text-slate-400">Bridge Priority:</span>
+                      <select
+                        aria-label="Приоритет STP коммутатора"
+                        value={node.stpPriority ?? 32768}
+                        onChange={(e) => {
+                          const prio = Number(e.target.value) || 32768;
+                          onUpdateNode({ ...node, stpPriority: prio });
+                          setStatusToast(
+                            `STP Priority для ${node.name} изменён на ${prio} (пересчёт Root Bridge)`
+                          );
+                        }}
+                        className="px-2 py-0.5 rounded bg-slate-950 border border-slate-700 text-[11px] text-amber-300 cursor-pointer"
+                      >
+                        <option value={4096}>4096 (Primary Root)</option>
+                        <option value={8192}>8192 (Secondary Root)</option>
+                        <option value={24576}>24576</option>
+                        <option value={32768}>32768 (Default)</option>
+                        <option value={40960}>40960</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
+
                 {/* Bulk Assignment Toolbar */}
                 <div className="p-2 rounded-md bg-slate-900/90 border border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs">
                   <div className="flex items-center gap-2">
@@ -474,7 +520,7 @@ export const FloatingSwitchWebGui: React.FC<FloatingSwitchWebGuiProps> = ({
                     <thead>
                       <tr className="bg-slate-900/95 border-b border-slate-800 text-[10px] font-mono uppercase text-slate-400">
                         <th className="py-2 px-2 w-8 text-center">Выб</th>
-                        <th className="py-2 px-2 w-28">Порт</th>
+                        <th className="py-2 px-2 w-28">Порт / STP</th>
                         <th className="py-2 px-2 w-36">Питание / Линк</th>
                         <th className="py-2 px-2 w-28">Режим L2</th>
                         <th className="py-2 px-2.5">Привязка к VLAN (Access / 802.1Q)</th>
@@ -482,7 +528,7 @@ export const FloatingSwitchWebGui: React.FC<FloatingSwitchWebGuiProps> = ({
                     </thead>
                     <tbody className="divide-y divide-slate-800/70">
                       {portDescriptors.map((desc) => {
-                        const { port, peerNode, peerPort } = desc;
+                        const { port, peerNode, peerPort, stpPortStatus } = desc;
                         const isChecked = selectedPortIds.includes(port.id);
 
                         return (
@@ -503,13 +549,31 @@ export const FloatingSwitchWebGui: React.FC<FloatingSwitchWebGuiProps> = ({
                               />
                             </td>
 
-                            {/* Port Name & Speed */}
+                            {/* Port Name, Speed & STP Role/State */}
                             <td className="py-1.5 px-2 font-mono truncate">
-                              <div className="font-semibold text-slate-100 flex items-center gap-1">
+                              <div className="font-semibold text-slate-100 flex items-center gap-1 flex-wrap">
                                 <span>{port.shortName}</span>
                                 {desc.isUplink && (
                                   <span className="px-1 py-0.2 text-[9px] rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
                                     1G
+                                  </span>
+                                )}
+                                {stpPortStatus && stpPortStatus.state !== 'disabled' && (
+                                  <span
+                                    title={`STP 802.1D: ${stpPortStatus.role.toUpperCase()} (${stpPortStatus.state.toUpperCase()})`}
+                                    className={`px-1 py-0.2 text-[9px] rounded border font-bold ${
+                                      stpPortStatus.state === 'blocking'
+                                        ? 'bg-orange-500/25 border-orange-400/70 text-orange-300'
+                                        : stpPortStatus.role === 'root'
+                                        ? 'bg-sky-500/20 border-sky-400/50 text-sky-300'
+                                        : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
+                                    }`}
+                                  >
+                                    {stpPortStatus.state === 'blocking'
+                                      ? 'BLK'
+                                      : stpPortStatus.role === 'root'
+                                      ? 'RP'
+                                      : 'DP'}
                                   </span>
                                 )}
                               </div>

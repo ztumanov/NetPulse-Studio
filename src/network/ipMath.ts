@@ -70,3 +70,97 @@ export function generateMacAddress(seedIndex: number, portIndex: number): string
   const hexPort = (portIndex & 0xff).toString(16).padStart(2, '0').toUpperCase();
   return `00:1A:2B:00:${hexSeed}:${hexPort}`;
 }
+
+/**
+ * Automatically formats IPv4 / Subnet Mask input as the user types:
+ * - Converts spaces, commas, or slashes into dots '.'
+ * - Automatically inserts a dot '.' after a 3-digit octet (e.g. "192" -> "192.")
+ *   or when an octet would exceed 255 (e.g. "192168110")
+ * - Preserves normal Backspace deletion when deleting a trailing dot.
+ */
+export function formatIpv4Input(raw: string, prevValue = ''): string {
+  if (!raw) return '';
+
+  const isDeletingTrailingDot =
+    prevValue.endsWith('.') && raw === prevValue.slice(0, -1);
+
+  const normalized = raw
+    .replace(/[ ,/юбЮБ]+/g, '.')
+    .replace(/[^0-9.]/g, '')
+    .replace(/\.+/g, '.')
+    .replace(/^\./, '');
+
+  const rawParts = normalized.split('.');
+  const octets: string[] = [];
+
+  for (let i = 0; i < rawParts.length && octets.length < 4; i++) {
+    let chunk = rawParts[i];
+    if (chunk === '') {
+      if (i === rawParts.length - 1 && octets.length > 0 && octets.length < 4) {
+        return `${octets.join('.')}.`;
+      }
+      continue;
+    }
+
+    while (chunk.length > 0 && octets.length < 4) {
+      if (chunk.length <= 3) {
+        const val = Number(chunk);
+        if (val > 255) {
+          octets.push(chunk.slice(0, 2));
+          chunk = chunk.slice(2);
+        } else {
+          octets.push(chunk);
+          chunk = '';
+        }
+      } else {
+        const firstThree = Number(chunk.slice(0, 3));
+        if (firstThree <= 255) {
+          octets.push(chunk.slice(0, 3));
+          chunk = chunk.slice(3);
+        } else {
+          octets.push(chunk.slice(0, 2));
+          chunk = chunk.slice(2);
+        }
+      }
+    }
+  }
+
+  const joined = octets.slice(0, 4).join('.');
+  const isAddingChars = raw.length > prevValue.length;
+  const lastOctet = octets[octets.length - 1] || '';
+
+  if (
+    isAddingChars &&
+    !isDeletingTrailingDot &&
+    octets.length >= 1 &&
+    octets.length < 4 &&
+    lastOctet.length === 3
+  ) {
+    return `${joined}.`;
+  }
+
+  return joined;
+}
+
+/**
+ * Returns the default subnet mask for a given IPv4 address when the user clicks/focuses the mask field.
+ * - Class A (1.0.0.0 – 126.255.255.255): 255.0.0.0
+ * - Class B (128.0.0.0 – 191.255.255.255): 255.255.0.0
+ * - Class C & Default (192.0.0.0+): 255.255.255.0
+ */
+export function suggestSubnetMaskForIp(ip: string): string {
+  if (!ip || typeof ip !== 'string') return '255.255.255.0';
+  const cleaned = ip.trim();
+  const firstPart = cleaned.split('.')[0];
+  const firstOctet = Number(firstPart);
+  if (!firstPart || Number.isNaN(firstOctet)) return '255.255.255.0';
+
+  if (firstOctet >= 1 && firstOctet <= 126) {
+    return '255.0.0.0';
+  }
+  if (firstOctet >= 128 && firstOctet <= 191) {
+    return '255.255.0.0';
+  }
+  return '255.255.255.0';
+}
+

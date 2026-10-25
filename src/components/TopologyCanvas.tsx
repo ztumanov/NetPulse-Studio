@@ -10,9 +10,15 @@ import {
   ZoneColor,
 } from '../network/types';
 import { formatCidr } from '../network/ipMath';
-import { isLinkOperational } from '../network/simulator';
+import {
+  computeSpanningTreeState,
+  getRouterLogicalInterfaces,
+  isLinkOperational,
+} from '../network/simulator';
 import { HardwareFrontPanel } from './HardwareFrontPanel';
 import { FloatingSwitchWebGui } from './FloatingSwitchWebGui';
+import { FloatingRouterGui } from './FloatingRouterGui';
+import { CanvasPacketSquareDescriptor } from '../network/packetStreamEngine';
 import {
   Router,
   Network,
@@ -47,16 +53,21 @@ interface TopologyCanvasProps {
   activeTool: WorkspaceTool;
   selectedCableType: CableType;
   activeStep: SimulationStep | null;
+  packetSquares: CanvasPacketSquareDescriptor[];
   isRightCollapsed: boolean;
   onExpandRightPanel: () => void;
   onSelectNode: (nodeId: string | null) => void;
   onSelectZone: (zoneId: string | null) => void;
   onSelectCableType: (type: CableType) => void;
-  chassisNodeId: string | null;
-  onOpenChassis: (nodeId: string | null) => void;
+  openChassisNodeIds: string[];
+  onOpenChassis: (nodeId: string) => void;
+  onCloseChassis: (nodeId: string) => void;
+  onCloseAllChassis: () => void;
   webGuiNodeId: string | null;
   onOpenWebGui: (nodeId: string | null) => void;
   onOpenFloatingCli: (nodeId: string) => void;
+  openPcMonitorNodeIds: string[];
+  onOpenPcMonitor: (nodeId: string) => void;
   onMoveNode: (nodeId: string, x: number, y: number) => void;
   onMoveZone: (zoneId: string, x: number, y: number) => void;
   onUpdateNode: (updatedNode: NetworkNode) => void;
@@ -75,7 +86,8 @@ interface TopologyCanvasProps {
   onDeleteLink: (linkId: string) => void;
   onSendPduBetweenNodes: (sourceNodeId: string, targetNodeId: string) => void;
   onInspectActiveStep: (step: SimulationStep) => void;
-  onAddDeviceAtCenter: (type: DeviceType) => void;
+  onSelectAndInspectPacketSquare: (step: SimulationStep, stepIndexZeroBased: number) => void;
+  onAddDeviceAtCenter: (type: DeviceType, switchPortCount?: number) => void;
   onAddZone: () => void;
 }
 
@@ -155,16 +167,21 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   activeTool,
   selectedCableType,
   activeStep,
+  packetSquares,
   isRightCollapsed,
   onExpandRightPanel,
   onSelectNode,
   onSelectZone,
   onSelectCableType,
-  chassisNodeId,
+  openChassisNodeIds,
   onOpenChassis,
+  onCloseChassis,
+  onCloseAllChassis,
   webGuiNodeId,
   onOpenWebGui,
   onOpenFloatingCli,
+  openPcMonitorNodeIds,
+  onOpenPcMonitor,
   onMoveNode,
   onMoveZone,
   onUpdateNode,
@@ -177,6 +194,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   onDeleteLink,
   onSendPduBetweenNodes,
   onInspectActiveStep,
+  onSelectAndInspectPacketSquare,
   onAddDeviceAtCenter,
   onAddZone,
 }) => {
@@ -194,6 +212,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   const [showPortLabels, setShowPortLabels] = useState(true);
   const [showLegend, setShowLegend] = useState(false);
   const [hoveredLinkId, setHoveredLinkId] = useState<string | null>(null);
+  const [focusedChassisId, setFocusedChassisId] = useState<string | null>(null);
 
   // Right-click Context Menu state
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -427,8 +446,11 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   };
 
   const packetPos = getPacketVisualPosition();
+  const stpStateMap = computeSpanningTreeState(nodes, links);
   const selectedNode = nodes.find((n) => n.id === selectedNodeId) || null;
-  const chassisNode = nodes.find((n) => n.id === chassisNodeId) || null;
+  const openChassisNodes = openChassisNodeIds
+    .map((id) => nodes.find((n) => n.id === id))
+    .filter((n): n is NetworkNode => Boolean(n));
   const webGuiNode = nodes.find((n) => n.id === webGuiNodeId) || null;
   const activeNodeName = selectedNode?.name;
   const activeZoneName = zones.find((z) => z.id === selectedZoneId)?.title;
@@ -444,15 +466,19 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
 
   return (
     <div className="flex-1 flex flex-col min-w-0 min-h-0 bg-netops-grid">
-      {/* Realistic 1U Hardware Front Panel Floating Window */}
-      {chassisNode && (
+      {/* Realistic 1U Hardware Front Panel Floating Windows (Multi-Instance Rack Support) */}
+      {openChassisNodes.map((chassisNode, idx) => (
         <HardwareFrontPanel
+          key={chassisNode.id}
           node={chassisNode}
           allNodes={nodes}
           allLinks={links}
           activeStep={activeStep}
           selectedCableType={selectedCableType}
           pendingCableSource={cableStart}
+          stackIndex={idx}
+          zIndex={focusedChassisId === chassisNode.id ? 48 : 45}
+          onFocus={() => setFocusedChassisId(chassisNode.id)}
           onSetPendingCableSource={setCableStart}
           onSelectCableType={onSelectCableType}
           onCreateLink={onCreateLink}
@@ -463,33 +489,51 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
             onSelectZone(null);
             onSelectNode(nodeId);
             onOpenChassis(nodeId);
+            setFocusedChassisId(nodeId);
           }}
           onOpenFloatingCli={onOpenFloatingCli}
           onOpenWebGui={(nodeId) => onOpenWebGui(nodeId)}
           onHoverLink={setHoveredLinkId}
-          onClose={() => onOpenChassis(null)}
+          onClose={() => onCloseChassis(chassisNode.id)}
         />
-      )}
+      ))}
 
-      {/* Switch Web Management Interface Floating Window (Ports & VLAN Database) */}
-      {webGuiNode && (
-        <FloatingSwitchWebGui
-          node={webGuiNode}
-          allNodes={nodes}
-          allLinks={links}
-          activeStep={activeStep}
-          onSelectNode={(nodeId) => {
-            onSelectZone(null);
-            onSelectNode(nodeId);
-            onOpenWebGui(nodeId);
-          }}
-          onUpdateNode={onUpdateNode}
-          onOpenChassis={(nodeId) => onOpenChassis(nodeId)}
-          onOpenFloatingCli={onOpenFloatingCli}
-          onCreateZoneFromVlan={onCreateZone}
-          onClose={() => onOpenWebGui(null)}
-        />
-      )}
+      {/* Router GUI (Routes / 802.1Q / NAT / ACL) or Switch Web Management Interface (Ports & VLAN Database) */}
+      {webGuiNode &&
+        (webGuiNode.type === 'router' ? (
+          <FloatingRouterGui
+            node={webGuiNode}
+            allNodes={nodes}
+            allLinks={links}
+            activeStep={activeStep}
+            onSelectNode={(nodeId) => {
+              onSelectZone(null);
+              onSelectNode(nodeId);
+              onOpenWebGui(nodeId);
+            }}
+            onUpdateNode={onUpdateNode}
+            onOpenChassis={(nodeId) => onOpenChassis(nodeId)}
+            onOpenFloatingCli={onOpenFloatingCli}
+            onClose={() => onOpenWebGui(null)}
+          />
+        ) : (
+          <FloatingSwitchWebGui
+            node={webGuiNode}
+            allNodes={nodes}
+            allLinks={links}
+            activeStep={activeStep}
+            onSelectNode={(nodeId) => {
+              onSelectZone(null);
+              onSelectNode(nodeId);
+              onOpenWebGui(nodeId);
+            }}
+            onUpdateNode={onUpdateNode}
+            onOpenChassis={(nodeId) => onOpenChassis(nodeId)}
+            onOpenFloatingCli={onOpenFloatingCli}
+            onCreateZoneFromVlan={onCreateZone}
+            onClose={() => onOpenWebGui(null)}
+          />
+        ))}
 
       {/* Main Interactive Topology Canvas */}
       <div
@@ -525,48 +569,67 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                   </span>
                 </div>
 
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    onOpenFloatingCli(contextMenuNode.id);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-emerald-950/80 text-emerald-300 font-medium text-left transition-colors cursor-pointer"
-                >
-                  <Terminal className="w-3.5 h-3.5 shrink-0" />
-                  <span>Открыть терминал CLI (окно)</span>
-                </button>
+                {contextMenuNode.type === 'pc' ? (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      onSelectZone(null);
+                      onSelectNode(contextMenuNode.id);
+                      onOpenPcMonitor(contextMenuNode.id);
+                      setContextMenu(null);
+                    }}
+                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-sky-950/90 text-sky-300 font-semibold text-left transition-colors cursor-pointer"
+                  >
+                    <Monitor className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                    <span>Открыть монитор ПК (Сеть и CMD)</span>
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onOpenFloatingCli(contextMenuNode.id);
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-emerald-950/80 text-emerald-300 font-medium text-left transition-colors cursor-pointer"
+                    >
+                      <Terminal className="w-3.5 h-3.5 shrink-0" />
+                      <span>Открыть терминал CLI (окно)</span>
+                    </button>
 
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    onSelectZone(null);
-                    onSelectNode(contextMenuNode.id);
-                    onOpenChassis(contextMenuNode.id);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
-                >
-                  <Cpu className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                  <span>Передняя панель 1U (RJ-45)</span>
-                </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onSelectZone(null);
+                        onSelectNode(contextMenuNode.id);
+                        onOpenChassis(contextMenuNode.id);
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <Cpu className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                      <span>Передняя панель 1U (RJ-45)</span>
+                    </button>
 
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    onSelectZone(null);
-                    onSelectNode(contextMenuNode.id);
-                    onOpenWebGui(contextMenuNode.id);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-indigo-950/80 text-indigo-300 font-medium text-left transition-colors cursor-pointer"
-                >
-                  <Globe className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                  <span>Веб-интерфейс (Порты и VLAN)</span>
-                </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onSelectZone(null);
+                        onSelectNode(contextMenuNode.id);
+                        onOpenWebGui(contextMenuNode.id);
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-indigo-950/80 text-indigo-300 font-medium text-left transition-colors cursor-pointer"
+                    >
+                      <Globe className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                      <span>Веб-интерфейс (Порты и VLAN)</span>
+                    </button>
+                  </>
+                )}
 
                 <button
                   type="button"
@@ -685,13 +748,25 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                   type="button"
                   role="menuitem"
                   onClick={() => {
-                    onAddDeviceAtCenter('switch');
+                    onAddDeviceAtCenter('switch', 6);
                     setContextMenu(null);
                   }}
                   className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
                 >
                   <Network className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                  <span>+ Коммутатор (Switch L2)</span>
+                  <span>+ Коммутатор 6 портов (Switch L2)</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onAddDeviceAtCenter('switch', 24);
+                    setContextMenu(null);
+                  }}
+                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                >
+                  <Network className="w-3.5 h-3.5 text-indigo-300 shrink-0" />
+                  <span>+ Коммутатор 24 порта (Switch 24p L2)</span>
                 </button>
                 <button
                   type="button"
@@ -755,9 +830,9 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
         )}
 
         {/* Contextual Mode Banner at Top of Canvas */}
-        {(activeTool !== 'select' || (cableStart && !chassisNode) || pduSourceNodeId) && (
+        {(activeTool !== 'select' || (cableStart && openChassisNodes.length === 0) || pduSourceNodeId) && (
           <div className="absolute top-3 left-1/2 -translate-x-1/2 z-30 px-4 py-1.5 rounded-md bg-slate-900/95 border border-sky-500/40 shadow-lg flex items-center gap-3 text-xs text-slate-200">
-            {(activeTool === 'cable' || (cableStart && !chassisNode)) && (
+            {(activeTool === 'cable' || (cableStart && openChassisNodes.length === 0)) && (
               <>
                 <Cable className="w-4 h-4 text-sky-400" />
                 <span>
@@ -847,26 +922,34 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
             <button
               type="button"
               onClick={() => {
-                if (chassisNodeId) {
-                  onOpenChassis(null);
+                if (selectedNodeId && !openChassisNodeIds.includes(selectedNodeId)) {
+                  onOpenChassis(selectedNodeId);
+                  setFocusedChassisId(selectedNodeId);
+                } else if (openChassisNodeIds.length > 0) {
+                  onCloseAllChassis();
                 } else {
                   const targetId =
                     selectedNodeId ||
                     nodes.find((n) => n.type === 'switch')?.id ||
-                    nodes[0]?.id ||
-                    null;
-                  onOpenChassis(targetId);
+                    nodes[0]?.id;
+                  if (targetId) {
+                    onOpenChassis(targetId);
+                    setFocusedChassisId(targetId);
+                  }
                 }
               }}
               className={`flex items-center gap-1 px-2 py-0.5 rounded transition-colors cursor-pointer ${
-                chassisNodeId
+                openChassisNodeIds.length > 0
                   ? 'bg-sky-500/20 text-sky-300 font-medium'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
-              title="Показать или скрыть плавающее окно передней панели 1U (RJ-45)"
+              title="Открыть переднюю панель 1U выбранного коммутатора или закрыть открытые панели 1U"
             >
               <Cpu className="w-3 h-3" />
-              <span>1U Панель</span>
+              <span>
+                1U Панель
+                {openChassisNodeIds.length > 1 ? ` (${openChassisNodeIds.length})` : ''}
+              </span>
             </button>
 
             <button
@@ -1078,8 +1161,14 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
               const dstPort = dstNode.interfaces.find((p) => p.id === link.targetPortId);
               const isUp = isLinkOperational(link, nodes);
               const isTrunk = srcPort?.vlanMode === 'trunk' || dstPort?.vlanMode === 'trunk';
+              const srcStpState = stpStateMap[srcNode.id]?.ports[link.sourcePortId]?.state;
+              const dstStpState = stpStateMap[dstNode.id]?.ports[link.targetPortId]?.state;
+              const isStpBlocked = srcStpState === 'blocking' || dstStpState === 'blocking';
+              const hasMovingPacketOnLink = packetSquares.some((p) => p.linkId === link.id);
               const isActiveStepLink =
-                activeStep?.linkId === link.id || hoveredLinkId === link.id;
+                activeStep?.linkId === link.id ||
+                hoveredLinkId === link.id ||
+                hasMovingPacketOnLink;
 
               const dx = dstNode.x - srcNode.x;
               const dy = dstNode.y - srcNode.y;
@@ -1126,6 +1215,8 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                         ? '#ef4444'
                         : isActiveStepLink
                         ? '#38bdf8'
+                        : isStpBlocked
+                        ? '#f97316'
                         : link.cableType === 'fiber'
                         ? '#f59e0b'
                         : isTrunk
@@ -1134,7 +1225,11 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                     }
                     strokeWidth={isActiveStepLink ? 3 : 2.2}
                     strokeDasharray={
-                      link.cableType === 'crossover' || isTrunk ? '6 4' : undefined
+                      isStpBlocked
+                        ? '4 4'
+                        : link.cableType === 'crossover' || isTrunk
+                        ? '6 4'
+                        : undefined
                     }
                   />
 
@@ -1142,8 +1237,8 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                     <circle
                       cx={srcDotX}
                       cy={srcDotY}
-                      r={4}
-                      fill="#10b981"
+                      r={srcStpState === 'blocking' ? 5 : 4}
+                      fill={srcStpState === 'blocking' ? '#f97316' : '#10b981'}
                       stroke="#090d16"
                       strokeWidth={1.5}
                     />
@@ -1158,8 +1253,8 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                     <circle
                       cx={dstDotX}
                       cy={dstDotY}
-                      r={4}
-                      fill="#10b981"
+                      r={dstStpState === 'blocking' ? 5 : 4}
+                      fill={dstStpState === 'blocking' ? '#f97316' : '#10b981'}
                       stroke="#090d16"
                       strokeWidth={1.5}
                     />
@@ -1176,53 +1271,84 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                         x={srcDotX}
                         y={srcDotY - 7}
                         textAnchor="middle"
-                        className="fill-slate-400 text-[10px] font-mono select-none"
+                        className={`text-[10px] font-mono select-none ${
+                          srcStpState === 'blocking'
+                            ? 'fill-orange-400 font-bold'
+                            : 'fill-slate-400'
+                        }`}
                       >
                         {srcPort?.shortName}
+                        {srcStpState === 'blocking' ? ' (BLK)' : ''}
                       </text>
                       <text
                         x={dstDotX}
                         y={dstDotY - 7}
                         textAnchor="middle"
-                        className="fill-slate-400 text-[10px] font-mono select-none"
+                        className={`text-[10px] font-mono select-none ${
+                          dstStpState === 'blocking'
+                            ? 'fill-orange-400 font-bold'
+                            : 'fill-slate-400'
+                        }`}
                       >
                         {dstPort?.shortName}
+                        {dstStpState === 'blocking' ? ' (BLK)' : ''}
                       </text>
                     </>
                   )}
 
-                  {isTrunk && showPortLabels && (
+                  {(isTrunk || isStpBlocked) && showPortLabels && (
                     <text
                       x={(srcNode.x + dstNode.x) / 2}
                       y={(srcNode.y + dstNode.y) / 2 - 7}
                       textAnchor="middle"
-                      className="fill-indigo-300 text-[10px] font-mono font-semibold"
+                      className={`text-[10px] font-mono font-semibold ${
+                        isStpBlocked ? 'fill-orange-400' : 'fill-indigo-300'
+                      }`}
                     >
-                      802.1Q Trunk
+                      {isStpBlocked ? 'STP 802.1D BLK' : '802.1Q Trunk'}
                     </text>
                   )}
                 </g>
               );
             })}
 
-            {packetPos && activeStep && (
-              <line
-                x1={packetPos.fromNode.x}
-                y1={packetPos.fromNode.y}
-                x2={packetPos.x}
-                y2={packetPos.y}
-                stroke="#38bdf8"
-                strokeWidth={2.5}
-                markerEnd="url(#packet-arrow)"
-              />
-            )}
+            {/* Motion Trails for Multi-Packet Stream Squares */}
+            {packetSquares.map((pkt) => (
+              <g key={`trail-${pkt.id}`}>
+                <line
+                  x1={pkt.tailX}
+                  y1={pkt.tailY}
+                  x2={pkt.x}
+                  y2={pkt.y}
+                  stroke={pkt.visual.trailHex}
+                  strokeWidth={pkt.isPrimaryActive ? 5.5 : 4}
+                  strokeOpacity={0.35}
+                  strokeLinecap="round"
+                />
+                <line
+                  x1={pkt.tailX}
+                  y1={pkt.tailY}
+                  x2={pkt.x}
+                  y2={pkt.y}
+                  stroke={pkt.visual.fillHex}
+                  strokeWidth={pkt.isPrimaryActive ? 2.5 : 2}
+                  strokeOpacity={0.9}
+                  strokeLinecap="round"
+                />
+              </g>
+            ))}
           </svg>
 
           {/* Layer 3: HTML Overlay Layer for Devices */}
           {nodes.map((node) => {
             const isSelected = node.id === selectedNodeId;
+            const isChassisOpen = openChassisNodeIds.includes(node.id);
+            const isPcMonitorOpen = openPcMonitorNodeIds.includes(node.id);
             const isPduSource = node.id === pduSourceNodeId;
-            const primaryIface = node.interfaces.find((i) => i.ipAddress) || node.interfaces[0];
+            const logicalIfaces = getRouterLogicalInterfaces(node);
+            const primaryIface =
+              logicalIfaces.find((i) => i.ipAddress) || node.interfaces[0];
+            const nodeStp = stpStateMap[node.id];
 
             return (
               <div
@@ -1237,61 +1363,96 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                 onClick={(e) => handleNodeClick(e, node)}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  onOpenFloatingCli(node.id);
+                  if (node.type === 'pc') {
+                    onOpenPcMonitor(node.id);
+                  } else {
+                    onOpenFloatingCli(node.id);
+                  }
                 }}
                 onContextMenu={(e) => handleNodeContextMenu(e, node)}
                 className="absolute z-20 flex flex-col items-center group cursor-pointer"
               >
-                {/* Quick Nearby Action Buttons on Top of Device: [1U] Front Panel, [WEB] Switch GUI & [>_] CLI */}
+                {/* Quick Nearby Action Buttons on Top of Device: Single [Экран ПК] button for PCs, or [1U] [WEB] [>_] for network gear */}
                 <div
                   className={`absolute -top-3.5 -right-4 z-30 flex items-center gap-1 transition-opacity ${
-                    isSelected ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                    isSelected || isChassisOpen || isPcMonitorOpen
+                      ? 'opacity-100'
+                      : 'opacity-0 group-hover:opacity-100'
                   }`}
                 >
-                  <button
-                    type="button"
-                    aria-label={`Открыть 1U панель ${node.name}`}
-                    title="Открыть плавающее окно портов 1U (RJ-45)"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSelectZone(null);
-                      onSelectNode(node.id);
-                      onOpenChassis(node.id);
-                    }}
-                    className="px-1.5 py-0.5 rounded-full bg-sky-950 border border-sky-400/80 text-[9px] font-mono font-bold text-sky-200 hover:bg-sky-600 hover:text-white shadow-md flex items-center gap-0.5 cursor-pointer"
-                  >
-                    <Cpu className="w-2.5 h-2.5" />
-                    <span>1U</span>
-                  </button>
+                  {node.type === 'pc' ? (
+                    <button
+                      type="button"
+                      aria-label={`Открыть монитор ПК ${node.name}`}
+                      title={`Открыть монитор ПК (${node.name}): сетевые настройки IP/маски и консоль CMD`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectZone(null);
+                        onSelectNode(node.id);
+                        onOpenPcMonitor(node.id);
+                      }}
+                      className={`px-2 py-0.5 rounded-full border text-[9px] font-mono font-bold shadow-md flex items-center gap-1 cursor-pointer transition-colors ${
+                        isPcMonitorOpen
+                          ? 'bg-sky-600 border-sky-300 text-white'
+                          : 'bg-sky-950 border-sky-400/90 text-sky-200 hover:bg-sky-600 hover:text-white'
+                      }`}
+                    >
+                      <Monitor className="w-2.5 h-2.5" />
+                      <span>Экран ПК</span>
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        aria-label={`Открыть 1U панель ${node.name}`}
+                        title={`Открыть плавающее окно портов 1U (${node.name})`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectZone(null);
+                          onSelectNode(node.id);
+                          onOpenChassis(node.id);
+                          setFocusedChassisId(node.id);
+                        }}
+                        className={`px-1.5 py-0.5 rounded-full border text-[9px] font-mono font-bold shadow-md flex items-center gap-0.5 cursor-pointer transition-colors ${
+                          isChassisOpen
+                            ? 'bg-sky-600 border-sky-300 text-white'
+                            : 'bg-sky-950 border-sky-400/80 text-sky-200 hover:bg-sky-600 hover:text-white'
+                        }`}
+                      >
+                        <Cpu className="w-2.5 h-2.5" />
+                        <span>1U</span>
+                      </button>
 
-                  <button
-                    type="button"
-                    aria-label={`Открыть веб-интерфейс ${node.name}`}
-                    title="Открыть плавающий Веб-интерфейс коммутатора (настройка портов и VLAN)"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSelectZone(null);
-                      onSelectNode(node.id);
-                      onOpenWebGui(node.id);
-                    }}
-                    className="px-1.5 py-0.5 rounded-full bg-indigo-950 border border-indigo-400/80 text-[9px] font-mono font-bold text-indigo-200 hover:bg-indigo-600 hover:text-white shadow-md flex items-center gap-0.5 cursor-pointer"
-                  >
-                    <Globe className="w-2.5 h-2.5" />
-                    <span>WEB</span>
-                  </button>
+                      <button
+                        type="button"
+                        aria-label={`Открыть веб-интерфейс ${node.name}`}
+                        title="Открыть плавающий Веб-интерфейс коммутатора (настройка портов и VLAN)"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectZone(null);
+                          onSelectNode(node.id);
+                          onOpenWebGui(node.id);
+                        }}
+                        className="px-1.5 py-0.5 rounded-full bg-indigo-950 border border-indigo-400/80 text-[9px] font-mono font-bold text-indigo-200 hover:bg-indigo-600 hover:text-white shadow-md flex items-center gap-0.5 cursor-pointer"
+                      >
+                        <Globe className="w-2.5 h-2.5" />
+                        <span>WEB</span>
+                      </button>
 
-                  <button
-                    type="button"
-                    aria-label={`Открыть CLI окно ${node.name}`}
-                    title="Открыть плавающий терминал CLI (или ПКМ / двойной клик)"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onOpenFloatingCli(node.id);
-                    }}
-                    className="p-1 rounded-full bg-emerald-950 border border-emerald-500/70 text-emerald-300 hover:bg-emerald-600 hover:text-white shadow-md cursor-pointer"
-                  >
-                    <Terminal className="w-3 h-3" />
-                  </button>
+                      <button
+                        type="button"
+                        aria-label={`Открыть CLI окно ${node.name}`}
+                        title="Открыть плавающий терминал CLI (или ПКМ / двойной клик)"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpenFloatingCli(node.id);
+                        }}
+                        className="p-1 rounded-full bg-emerald-950 border border-emerald-500/70 text-emerald-300 hover:bg-emerald-600 hover:text-white shadow-md cursor-pointer"
+                      >
+                        <Terminal className="w-3 h-3" />
+                      </button>
+                    </>
+                  )}
                 </div>
 
                 {/* Device Chassis Box */}
@@ -1329,7 +1490,8 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                           isPortUsed(node.id, iface.id)
                         ).length
                       }
-                      /{node.interfaces.length} RJ-45 · 1U
+                      /{node.interfaces.length} RJ-45 ·{' '}
+                      {nodeStp?.isRootBridge ? 'STP ROOT' : '1U'}
                     </div>
                   )}
                 </div>
@@ -1338,7 +1500,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                 {portPickerNodeId === node.id && (
                   <div
                     onClick={(e) => e.stopPropagation()}
-                    className="absolute top-16 z-30 w-52 bg-slate-900 border border-slate-700 rounded-md shadow-xl p-2 space-y-1"
+                    className="absolute top-16 z-30 w-52 max-h-60 overflow-y-auto bg-slate-900 border border-slate-700 rounded-md shadow-xl p-2 space-y-1"
                   >
                     <div className="text-[11px] font-semibold text-slate-300 px-1.5 py-1 border-b border-slate-800">
                       Выберите порт на {node.name}:
@@ -1369,39 +1531,52 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
             );
           })}
 
-          {/* Animated Packet PDU Badge on the Canvas */}
-          {packetPos && activeStep && (
+          {/* Layer 4: Multi-Packet Live Stream of Clickable 10x10 Protocol Squares */}
+          {packetSquares.map((pkt) => (
             <button
+              key={pkt.id}
+              type="button"
+              data-testid={`canvas-packet-square-${pkt.stepIndexZeroBased}`}
+              data-protocol-category={pkt.visual.category}
               onClick={(e) => {
                 e.stopPropagation();
-                onInspectActiveStep(activeStep);
+                onSelectAndInspectPacketSquare(pkt.step, pkt.stepIndexZeroBased);
               }}
               style={{
-                left: `${packetPos.x}px`,
-                top: `${packetPos.y}px`,
+                left: `${pkt.x}px`,
+                top: `${pkt.y}px`,
                 transform: 'translate(-50%, -50%)',
               }}
-              aria-label={`Инспектировать пакет ${activeStep.protocol} на шаге ${activeStep.stepIndex}`}
-              className={`absolute z-30 flex items-center gap-1.5 px-2.5 py-1 rounded-md border shadow-xl transition-all cursor-pointer ${
-                activeStep.status === 'dropped'
-                  ? 'bg-red-950 border-red-400 text-red-200'
-                  : activeStep.protocol.startsWith('ARP')
-                  ? 'bg-amber-950 border-amber-400 text-amber-200'
-                  : 'bg-sky-950 border-sky-400 text-sky-100'
-              }`}
+              aria-label={`Пакет #${pkt.step.stepIndex} ${pkt.step.protocol} (${pkt.step.fromNodeName} → ${pkt.step.toNodeName})`}
+              title={`#${pkt.step.stepIndex} ${pkt.step.protocol} (${pkt.step.fromNodeName}:${pkt.step.fromPortName} → ${pkt.step.toNodeName}:${pkt.step.toPortName}) — кликните для паузы и разбора OSI PDU`}
+              className="absolute z-30 flex items-center gap-1 group cursor-pointer focus:outline-none"
             >
-              <Mail className="w-3.5 h-3.5 shrink-0" />
-              <div className="text-left font-mono leading-tight">
-                <div className="text-[10px] font-semibold whitespace-nowrap">
-                  #{activeStep.stepIndex} {activeStep.protocol}
-                </div>
-                <div className="text-[9px] opacity-85 whitespace-nowrap">
-                  {activeStep.vlanTag !== null ? `802.1Q VLAN ${activeStep.vlanTag} · ` : ''}
-                  Клик для OSI PDU
-                </div>
-              </div>
+              {/* The 10x10 px Rounded-2px Glowing Protocol Square */}
+              <span
+                className={`w-[10px] h-[10px] rounded-[2px] border flex items-center justify-center text-[8px] font-mono font-bold leading-none transition-transform group-hover:scale-150 ${
+                  pkt.visual.squareClass
+                } ${pkt.isPrimaryActive ? 'ring-2 ring-white/95 scale-125' : ''}`}
+              >
+                {pkt.visual.isDropped ? '×' : ''}
+              </span>
+
+              {/* Floating Micro-Tag (visible on primary active step, dropped packets, or on hover) */}
+              <span
+                className={`px-1.5 py-0.5 rounded-[3px] border text-[9px] font-mono font-semibold leading-none whitespace-nowrap shadow-lg transition-opacity pointer-events-none ${
+                  pkt.isPrimaryActive || pkt.visual.isDropped
+                    ? 'opacity-100'
+                    : 'opacity-0 group-hover:opacity-100'
+                } ${
+                  pkt.visual.isDropped
+                    ? 'bg-red-950/95 border-red-400 text-red-100'
+                    : 'bg-slate-950/95 border-slate-600 text-white'
+                }`}
+              >
+                <span style={{ color: pkt.visual.trailHex }}>{pkt.visual.shortLabel}</span>
+                <span className="ml-1 text-slate-300">#{pkt.step.stepIndex}</span>
+              </span>
             </button>
-          )}
+          ))}
         </div>
       </div>
     </div>

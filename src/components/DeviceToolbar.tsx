@@ -28,7 +28,7 @@ interface DeviceToolbarProps {
   onToggleCollapse: () => void;
   onSelectTool: (tool: WorkspaceTool) => void;
   onSelectCableType: (type: CableType) => void;
-  onAddDevice: (type: DeviceType) => void;
+  onAddDevice: (type: DeviceType, switchPortCount?: number) => void;
   onAddZone: () => void;
   onLoadPreset: (presetId: string) => void;
   onClearCanvas: () => void;
@@ -137,12 +137,20 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
             <Router className="w-4 h-4" />
           </button>
           <button
-            onClick={() => onAddDevice('switch')}
-            title="Добавить Switch (Catalyst L2)"
-            aria-label="Добавить Switch"
+            onClick={() => onAddDevice('switch', 6)}
+            title="Добавить Switch 6 портов (Catalyst L2)"
+            aria-label="Добавить Switch 6 портов"
             className="p-2 rounded-md text-indigo-400 hover:bg-slate-800 transition-colors"
           >
             <Network className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onAddDevice('switch', 24)}
+            title="Добавить Switch 24 порта (Catalyst 2960-24TT L2)"
+            aria-label="Добавить Switch 24 порта"
+            className="px-1.5 py-1 rounded-md text-[10px] font-mono font-bold text-indigo-300 border border-indigo-500/40 hover:bg-slate-800 transition-colors"
+          >
+            24P
           </button>
           <button
             onClick={() => onAddDevice('pc')}
@@ -301,14 +309,25 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
             </button>
 
             <button
-              onClick={() => onAddDevice('switch')}
+              onClick={() => onAddDevice('switch', 6)}
               className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md bg-slate-950/90 hover:bg-slate-800 border border-slate-800 text-xs text-slate-200 transition-colors"
             >
               <span className="flex items-center gap-2 font-medium">
                 <Network className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Switch (L2)</span>
+                <span>Switch 6p (L2)</span>
               </span>
-              <span className="text-[10px] font-mono text-slate-400">VLAN</span>
+              <span className="text-[10px] font-mono text-slate-400">6 портов</span>
+            </button>
+
+            <button
+              onClick={() => onAddDevice('switch', 24)}
+              className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md bg-slate-950/90 hover:bg-slate-800 border border-indigo-500/30 text-xs text-slate-200 transition-colors"
+            >
+              <span className="flex items-center gap-2 font-medium">
+                <Network className="w-3.5 h-3.5 text-indigo-300" />
+                <span>Switch 24p (L2)</span>
+              </span>
+              <span className="text-[10px] font-mono text-indigo-300">24 порта</span>
             </button>
 
             <button

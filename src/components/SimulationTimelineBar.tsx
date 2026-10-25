@@ -1,11 +1,23 @@
 import React from 'react';
-import { SimulationStep } from '../network/types';
+import { NetworkNode, SimulationStep } from '../network/types';
+import {
+  ALL_PROTOCOL_CATEGORIES,
+  SPEED_PRESETS,
+   PacketFilterOptions,
+  ProtocolFilterCategory,
+  SimulationExecutionMode,
+  computePduHeaderDiff,
+  countStepsByProtocolCategory,
+  filterSimulationSteps,
+  getProtocolVisualMeta,
+} from '../network/packetStreamEngine';
 import {
   Play,
   Pause,
   SkipBack,
   SkipForward,
   RotateCcw,
+  Trash2,
   Eye,
   CheckCircle2,
   AlertTriangle,
@@ -14,13 +26,22 @@ import {
   ChevronUp,
   ChevronDown,
   ListFilter,
+  Activity,
+  Clock,
+  Search,
+  Layers,
+  Crosshair,
 } from 'lucide-react';
 
 interface SimulationTimelineBarProps {
   steps: SimulationStep[];
+  nodes: NetworkNode[];
   currentStepIndex: number;
   isPlaying: boolean;
+  executionMode: SimulationExecutionMode;
+  liveTrafficActive: boolean;
   speedMultiplier: number;
+  filterOptions: PacketFilterOptions;
   summaryMessage: string;
   isExpanded: boolean;
   onToggleExpand: () => void;
@@ -28,16 +49,64 @@ interface SimulationTimelineBarProps {
   onStepForward: () => void;
   onStepBack: () => void;
   onReset: () => void;
-  onSelectStep: (index: number) => void;
+  onClearBuffer: () => void;
+  onSelectStep: (index: number, focusNodeOnCanvas?: boolean) => void;
   onInspectStep: (step: SimulationStep) => void;
   onChangeSpeed: (speed: number) => void;
+  onChangeExecutionMode: (mode: SimulationExecutionMode) => void;
+  onToggleLiveTraffic: () => void;
+  onToggleProtocolCategory: (category: ProtocolFilterCategory) => void;
+  onEnableAllProtocols: () => void;
+  onToggleOnlyDropped: () => void;
+  onChangeDeviceFilter: (nodeId: string) => void;
+  onChangeSearchQuery: (query: string) => void;
 }
+
+const PROTOCOL_CHIP_META: Record<
+  ProtocolFilterCategory,
+  { label: string; activeClass: string; dotColor: string }
+> = {
+  ARP: {
+    label: 'ARP',
+    activeClass: 'bg-amber-500/20 text-amber-200 border-amber-500/50',
+    dotColor: 'bg-amber-400',
+  },
+  ICMP: {
+    label: 'ICMP',
+    activeClass: 'bg-sky-500/20 text-sky-200 border-sky-500/50',
+    dotColor: 'bg-sky-400',
+  },
+  DHCP: {
+    label: 'DHCP',
+    activeClass: 'bg-purple-500/20 text-purple-200 border-purple-500/50',
+    dotColor: 'bg-purple-400',
+  },
+  DNS: {
+    label: 'DNS',
+    activeClass: 'bg-orange-500/20 text-orange-200 border-orange-500/50',
+    dotColor: 'bg-orange-400',
+  },
+  HTTP: {
+    label: 'HTTP/TCP',
+    activeClass: 'bg-emerald-500/20 text-emerald-200 border-emerald-500/50',
+    dotColor: 'bg-emerald-400',
+  },
+  STP: {
+    label: 'STP',
+    activeClass: 'bg-indigo-500/20 text-indigo-200 border-indigo-500/50',
+    dotColor: 'bg-indigo-400',
+  },
+};
 
 export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
   steps,
+  nodes,
   currentStepIndex,
   isPlaying,
+  executionMode,
+  liveTrafficActive,
   speedMultiplier,
+  filterOptions,
   summaryMessage,
   isExpanded,
   onToggleExpand,
@@ -45,69 +114,183 @@ export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
   onStepForward,
   onStepBack,
   onReset,
+  onClearBuffer,
   onSelectStep,
   onInspectStep,
   onChangeSpeed,
+  onChangeExecutionMode,
+  onToggleLiveTraffic,
+  onToggleProtocolCategory,
+  onEnableAllProtocols,
+  onToggleOnlyDropped,
+  onChangeDeviceFilter,
+  onChangeSearchQuery,
 }) => {
   const currentStep = steps[currentStepIndex] || null;
+  const { counts, droppedCount, total } = React.useMemo(
+    () => countStepsByProtocolCategory(steps),
+    [steps]
+  );
+
+  const filteredEntries = React.useMemo(
+    () => filterSimulationSteps(steps, filterOptions),
+    [steps, filterOptions]
+  );
+
+  const allCategoriesEnabled = ALL_PROTOCOL_CATEGORIES.every(
+    (cat) => filterOptions.enabledCategories[cat]
+  );
+
+  const currentStepDiff = React.useMemo(
+    () => (currentStep ? computePduHeaderDiff(currentStep) : null),
+    [currentStep]
+  );
 
   return (
     <section
       aria-label="Панель управления пошаговой симуляцией и журнал пакетов"
       className={`${
-        isExpanded ? 'h-52' : 'h-11'
-      } border-t border-slate-800 bg-slate-900/95 flex flex-col shrink-0 select-none transition-all`}
+        isExpanded ? 'h-80' : 'h-21'
+      } border-t border-slate-800 bg-slate-900/98 flex flex-col shrink-0 select-none transition-all z-30`}
     >
-      {/* Compact Playback & Status Strip */}
-      <div className="h-11 px-3.5 flex items-center justify-between gap-2 bg-slate-950/70 shrink-0">
+      {/* Row 1: Realtime / Simulation Mode Switch, Playback Controls, Time Dilation Slider & Presets, Actions */}
+      <div className="h-11 px-3 flex items-center justify-between gap-2 bg-slate-950/90 border-b border-slate-800/80 shrink-0">
+        {/* Left: Cisco Packet Tracer Mode Switcher (Realtime vs Simulation) + Live Stream Generator + Step Controls */}
         <div className="flex items-center gap-1.5 shrink-0">
+          {/* Realtime / Simulation Mode Segmented Switch */}
+          <div
+            role="group"
+            aria-label="Режим работы симулятора"
+            className="flex items-center p-0.5 rounded-md bg-slate-900 border border-slate-700/90"
+          >
+            <button
+              type="button"
+              data-testid="mode-switch-realtime"
+              onClick={() => onChangeExecutionMode('realtime')}
+              className={`flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                executionMode === 'realtime'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Режим прямого эфира (Realtime): непрерывное движение потока пакетов по всем активным линкам"
+            >
+              <Clock className="w-3 h-3" />
+              <span>Realtime</span>
+            </button>
+            <button
+              type="button"
+              data-testid="mode-switch-simulation"
+              onClick={() => onChangeExecutionMode('simulation')}
+              className={`flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                executionMode === 'simulation'
+                  ? 'bg-sky-600 text-white shadow-xs'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Пошаговый режим (Simulation): детальный захват каждого кадра и волны Broadcast"
+            >
+              <Layers className="w-3 h-3" />
+              <span>Simulation</span>
+            </button>
+          </div>
+
+          {/* Live Traffic Multi-Flow Generator Toggle */}
           <button
+            type="button"
+            data-testid="toggle-live-traffic-btn"
+            onClick={onToggleLiveTraffic}
+            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              liveTrafficActive
+                ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 shadow-[0_0_12px_rgba(16,185,129,0.3)]'
+                : 'bg-slate-800/90 hover:bg-slate-700 border-slate-700 text-slate-200'
+            }`}
+            title="Генератор живого трафика (Multi-Flow): непрерывно запускает STP BPDU, ARP, ICMP Ping, DNS и HTTP пакеты по сети"
+          >
+            <Activity className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Прямой эфир</span>
+          </button>
+
+          <div className="h-4 w-px bg-slate-800 mx-0.5" />
+
+          {/* Step & Playback Controls */}
+          <button
+            type="button"
             onClick={onReset}
             disabled={steps.length === 0}
             aria-label="Сбросить симуляцию в начало"
-            title="В начало"
-            className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 transition-colors shrink-0"
+            title="Перемотать в начало"
+            className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 transition-colors shrink-0 cursor-pointer"
           >
             <RotateCcw className="w-3.5 h-3.5" />
           </button>
           <button
+            type="button"
             onClick={onStepBack}
             disabled={steps.length === 0 || currentStepIndex <= 0}
             aria-label="Шаг назад"
-            className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 transition-colors whitespace-nowrap shrink-0"
+            className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <SkipBack className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Назад</span>
+            <span className="hidden xl:inline">Назад</span>
           </button>
           <button
+            type="button"
+            data-testid="sim-play-pause-btn"
             onClick={onPlayPause}
-            disabled={steps.length === 0}
+            disabled={steps.length === 0 && !liveTrafficActive}
             aria-label={isPlaying ? 'Пауза симуляции' : 'Воспроизвести пакеты'}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white transition-colors whitespace-nowrap shrink-0"
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-            <span>{isPlaying ? 'Пауза' : 'Авто-шаг'}</span>
+            <span>{isPlaying ? 'Пауза' : 'Старт'}</span>
           </button>
           <button
+            type="button"
             onClick={onStepForward}
             disabled={steps.length === 0 || currentStepIndex >= steps.length - 1}
             aria-label="Шаг вперёд"
-            className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 transition-colors whitespace-nowrap shrink-0"
+            className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            <span className="hidden sm:inline">Вперёд</span>
+            <span className="hidden xl:inline">Вперёд</span>
             <SkipForward className="w-3.5 h-3.5" />
           </button>
+          <button
+            type="button"
+            onClick={onClearBuffer}
+            disabled={steps.length === 0}
+            aria-label="Очистить буфер пакетов"
+            title="Очистить буфер перехваченных пакетов"
+            className="p-1.5 rounded bg-slate-800 hover:bg-red-950/70 hover:text-red-300 disabled:opacity-40 text-slate-400 transition-colors shrink-0 cursor-pointer"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        </div>
 
-          {/* Speed Selector */}
-          <div className="hidden lg:flex items-center gap-1 ml-1 pl-2 border-l border-slate-800 shrink-0">
-            {[0.5, 1, 2].map((spd) => (
+        {/* Center: Time Dilation Controls (0.1x Slow-Mo .. 4x Turbo + Smooth Slider) */}
+        <div className="hidden md:flex items-center gap-2 px-2.5 py-1 rounded bg-slate-900/90 border border-slate-800 shrink-0">
+          <span className="text-[11px] font-mono text-slate-400 whitespace-nowrap">
+            Время:
+          </span>
+          <input
+            type="range"
+            aria-label="Ползунок скорости времени симуляции"
+            min={0.1}
+            max={4}
+            step={0.05}
+            value={speedMultiplier}
+            onChange={(e) => onChangeSpeed(Number(parseFloat(e.target.value).toFixed(2)))}
+            className="w-20 accent-sky-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+          />
+          <div className="flex items-center gap-0.5">
+            {SPEED_PRESETS.map((spd) => (
               <button
                 key={spd}
+                type="button"
+                data-testid={`speed-preset-${spd}`}
                 onClick={() => onChangeSpeed(spd)}
-                className={`px-1.5 py-0.5 text-[11px] font-mono rounded transition-colors whitespace-nowrap shrink-0 ${
-                  speedMultiplier === spd
-                    ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
-                    : 'text-slate-400 hover:text-slate-200'
+                className={`px-1.5 py-0.5 text-[10px] font-mono rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
+                  Math.abs(speedMultiplier - spd) < 0.03
+                    ? 'bg-sky-500/25 text-sky-200 border border-sky-400/50 font-semibold'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
                 }`}
               >
                 {spd}x
@@ -116,23 +299,18 @@ export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
           </div>
         </div>
 
-        {/* Center Status Message */}
-        <div className="flex-1 min-w-0 text-xs text-slate-300 truncate font-mono text-center px-2">
-          {summaryMessage ||
-            'Нажмите «Запустить Ping» или выберите два узла инструментом «Пакет PDU»'}
-        </div>
-
-        {/* Right Inspect Current Step + Expand/Collapse Log Button */}
+        {/* Right: Step Counter + Inspect Current PDU + Expand Event List */}
         <div className="flex items-center gap-2 shrink-0">
           {steps.length > 0 && (
-            <span className="text-xs font-mono text-slate-400 tabular-nums whitespace-nowrap shrink-0">
-              Шаг {currentStepIndex + 1}/{steps.length}
+            <span className="text-xs font-mono text-slate-300 tabular-nums whitespace-nowrap shrink-0">
+              Пакет {currentStepIndex + 1}/{steps.length}
             </span>
           )}
           {currentStep && (
             <button
+              type="button"
               onClick={() => onInspectStep(currentStep)}
-              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 rounded transition-colors whitespace-nowrap shrink-0"
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Eye className="w-3.5 h-3.5 shrink-0" />
               <span>Инспектор PDU</span>
@@ -140,18 +318,21 @@ export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
           )}
           <button
             type="button"
+            data-testid="toggle-event-list-btn"
             onClick={onToggleExpand}
             aria-label={isExpanded ? 'Свернуть журнал пакетов' : 'Развернуть журнал пакетов'}
-            className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 ${
+            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
               isExpanded
-                ? 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
+                ? 'bg-sky-600 border-sky-400 text-white'
                 : steps.length > 0
                 ? 'bg-sky-500/15 border-sky-500/40 text-sky-300 hover:bg-sky-500/25'
                 : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
             }`}
           >
             <ListFilter className="w-3.5 h-3.5" />
-            <span>Журнал ({steps.length})</span>
+            <span>
+              События ({filteredEntries.length}/{total})
+            </span>
             {isExpanded ? (
               <ChevronDown className="w-3.5 h-3.5" />
             ) : (
@@ -161,110 +342,303 @@ export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
         </div>
       </div>
 
-      {/* Collapsible Event List Table */}
+      {/* Row 2: Protocol Filter Chips Bar + Live Summary Ticker */}
+      <div className="h-10 px-3 flex items-center justify-between gap-3 bg-slate-900/95 shrink-0">
+        {/* Protocol Filter Toggle Chips */}
+        <div
+          role="group"
+          aria-label="Фильтр протоколов пакетов"
+          className="flex items-center gap-1 overflow-x-auto py-0.5 shrink-0"
+        >
+          <span className="text-[11px] font-mono text-slate-400 mr-1 whitespace-nowrap">
+            Фильтр PDU:
+          </span>
+          <button
+            type="button"
+            data-testid="filter-chip-ALL"
+            onClick={onEnableAllProtocols}
+            className={`px-2 py-0.5 text-[11px] font-mono rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
+              allCategoriesEnabled && !filterOptions.onlyDropped
+                ? 'bg-slate-100 text-slate-950 border-white font-semibold'
+                : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200'
+            }`}
+          >
+            Все ({total})
+          </button>
+
+          {ALL_PROTOCOL_CATEGORIES.map((cat) => {
+            const meta = PROTOCOL_CHIP_META[cat];
+            const isEnabled = filterOptions.enabledCategories[cat];
+            const count = counts[cat] || 0;
+            return (
+              <button
+                key={cat}
+                type="button"
+                data-testid={`filter-chip-${cat}`}
+                onClick={() => onToggleProtocolCategory(cat)}
+                className={`flex items-center gap-1.5 px-2 py-0.5 text-[11px] font-mono rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
+                  isEnabled
+                    ? meta.activeClass
+                    : 'bg-slate-950/60 text-slate-500 border-slate-800/80 line-through hover:text-slate-300'
+                }`}
+                title={`Включить или скрыть пакеты протокола ${meta.label} на холсте и в журнале`}
+              >
+                <span className={`w-2 h-2 rounded-[2px] ${meta.dotColor}`} />
+                <span>{meta.label}</span>
+                <span className="opacity-80">({count})</span>
+              </button>
+            );
+          })}
+
+          <button
+            type="button"
+            data-testid="filter-chip-DROPPED"
+            onClick={onToggleOnlyDropped}
+            className={`flex items-center gap-1 px-2 py-0.5 text-[11px] font-mono rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
+              filterOptions.onlyDropped
+                ? 'bg-red-500/25 text-red-200 border-red-400 font-semibold'
+                : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-red-300'
+            }`}
+            title="Показать только отброшенные пакеты (ACL Drop / STP Loop Guard / Unreachable)"
+          >
+            <AlertTriangle className="w-3 h-3 text-red-400" />
+            <span>Только Drop ({droppedCount})</span>
+          </button>
+        </div>
+
+        {/* Right: Current Simulation Status Summary */}
+        <div className="flex-1 min-w-0 text-xs text-slate-300 truncate font-mono text-right">
+          {summaryMessage}
+        </div>
+      </div>
+
+      {/* Row 3 (Expanded): Split Simulation Event List & Inbound/Outbound PDU Diff Sniffer */}
       {isExpanded && (
-        <div className="flex-1 border-t border-slate-800 overflow-y-auto">
-          {steps.length === 0 ? (
-            <div className="h-full flex items-center justify-center text-xs text-slate-400 px-6 text-center">
-              Журнал событий симуляции пуст. Нажмите кнопку «Запустить Ping» или выберите два узла инструментом «Пакет PDU».
+        <div className="flex-1 min-h-0 border-t border-slate-800 flex flex-col lg:flex-row overflow-hidden bg-slate-950">
+          {/* Left Pane (62%): Simulation Event List Table with Search & Device Filter */}
+          <div className="flex-1 flex flex-col min-w-0 min-h-0 border-r border-slate-800">
+            {/* Search & Device Filter Subbar */}
+            <div className="px-3 py-1.5 bg-slate-900/90 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+              <div className="relative flex-1 max-w-xs">
+                <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  value={filterOptions.searchQuery}
+                  onChange={(e) => onChangeSearchQuery(e.target.value)}
+                  placeholder="Поиск по IP, MAC, узлу, VLAN..."
+                  aria-label="Поиск событий по IP, MAC или имени узла"
+                  className="w-full pl-8 pr-2.5 py-1 rounded bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-sky-500 font-mono"
+                />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <label
+                  htmlFor="event-device-filter"
+                  className="text-[11px] font-mono text-slate-400 whitespace-nowrap"
+                >
+                  Узел (At Device):
+                </label>
+                <select
+                  id="event-device-filter"
+                  value={filterOptions.deviceFilterId}
+                  onChange={(e) => onChangeDeviceFilter(e.target.value)}
+                  className="px-2 py-1 rounded bg-slate-950 border border-slate-800 text-xs font-mono text-slate-200 focus:outline-none focus:border-sky-500"
+                >
+                  <option value="ALL">Все устройства ({nodes.length})</option>
+                  {nodes.map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {n.name} ({n.type.toUpperCase()})
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
-          ) : (
-            <table className="w-full text-left text-xs font-mono border-collapse">
-              <thead className="bg-slate-950/90 text-slate-400 sticky top-0 border-b border-slate-800">
-                <tr>
-                  <th className="py-1.5 px-3 w-14 whitespace-nowrap">Шаг</th>
-                  <th className="py-1.5 px-3 w-24 whitespace-nowrap">Время</th>
-                  <th className="py-1.5 px-3 w-48 whitespace-nowrap">Откуда → Куда</th>
-                  <th className="py-1.5 px-3 w-36 whitespace-nowrap">Протокол / VLAN</th>
-                  <th className="py-1.5 px-3 w-32 whitespace-nowrap">Статус L2/L3</th>
-                  <th className="py-1.5 px-3">Решение узла и заголовки</th>
-                  <th className="py-1.5 px-3 text-right w-28 whitespace-nowrap">Детали</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/70">
-                {steps.map((st, idx) => {
-                  const isSelected = idx === currentStepIndex;
-                  return (
-                    <tr
-                      key={st.id}
-                      onClick={() => onSelectStep(idx)}
-                      className={`cursor-pointer transition-colors ${
-                        isSelected
-                          ? 'bg-sky-500/15 text-slate-100'
-                          : 'hover:bg-slate-800/50 text-slate-300'
-                      }`}
-                    >
-                      <td className="py-1.5 px-3 tabular-nums font-semibold text-slate-400 whitespace-nowrap">
-                        #{st.stepIndex}
-                      </td>
-                      <td className="py-1.5 px-3 tabular-nums text-slate-400 whitespace-nowrap">
-                        {st.timestampMs} мс
-                      </td>
-                      <td className="py-1.5 px-3 whitespace-nowrap">
-                        <span className="text-slate-200">{st.fromNodeName}</span>
-                        <span className="text-slate-500"> ({st.fromPortName}) → </span>
-                        <span className="text-sky-300">{st.toNodeName}</span>
-                        <span className="text-slate-500"> ({st.toPortName})</span>
-                      </td>
-                      <td className="py-1.5 px-3 whitespace-nowrap">
-                        <span
-                          className={
-                            st.protocol.startsWith('ARP')
-                              ? 'text-amber-300'
-                              : st.protocol.startsWith('ICMP')
-                              ? 'text-sky-300'
-                              : 'text-purple-300'
-                          }
-                        >
-                          {st.protocol}
-                        </span>
-                        {st.vlanTag !== null && (
-                          <span className="text-slate-400"> · VLAN {st.vlanTag}</span>
-                        )}
-                      </td>
-                      <td className="py-1.5 px-3 whitespace-nowrap">
-                        {st.status === 'delivered' && (
-                          <span className="inline-flex items-center gap-1 text-emerald-400">
-                            <CheckCircle2 className="w-3 h-3" /> ● DELIVERED
-                          </span>
-                        )}
-                        {st.status === 'forwarded' && (
-                          <span className="inline-flex items-center gap-1 text-sky-400">
-                            <ArrowRight className="w-3 h-3" /> ◆ FORWARDED
-                          </span>
-                        )}
-                        {st.status === 'broadcast' && (
-                          <span className="inline-flex items-center gap-1 text-amber-400">
-                            <Radio className="w-3 h-3" /> ▲ FLOOD
-                          </span>
-                        )}
-                        {st.status === 'dropped' && (
-                          <span className="inline-flex items-center gap-1 text-red-400">
-                            <AlertTriangle className="w-3 h-3" /> ✕ DROPPED
-                          </span>
-                        )}
-                      </td>
-                      <td className="py-1.5 px-3 font-sans text-slate-300 truncate max-w-md">
-                        {st.decisionTitle}
-                      </td>
-                      <td className="py-1.5 px-3 text-right">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onSelectStep(idx);
-                            onInspectStep(st);
-                          }}
-                          className="px-2 py-0.5 text-[11px] font-sans font-medium bg-slate-800 hover:bg-slate-700 text-sky-300 rounded transition-colors whitespace-nowrap shrink-0"
-                        >
-                          Открыть PDU
-                        </button>
-                      </td>
+
+            {/* Event List Table */}
+            <div className="flex-1 overflow-y-auto">
+              {filteredEntries.length === 0 ? (
+                <div className="h-full flex items-center justify-center text-xs text-slate-400 px-6 text-center">
+                  {steps.length === 0
+                    ? 'Журнал событий пуст. Нажмите «Прямой эфир» или «Запустить Ping», чтобы увидеть поток пакетов.'
+                    : 'Нет пакетов, соответствующих выбранным фильтрам протоколов или поисковому запросу.'}
+                </div>
+              ) : (
+                <table className="w-full text-left text-[11px] font-mono border-collapse">
+                  <thead className="bg-slate-950 text-slate-400 sticky top-0 z-10 border-b border-slate-800 text-[10px]">
+                    <tr>
+                      <th className="py-1.5 px-2 w-18 whitespace-nowrap"># / Время</th>
+                      <th className="py-1.5 px-1.5 w-24 whitespace-nowrap">Протокол</th>
+                      <th className="py-1.5 px-1.5 whitespace-nowrap">Узел и переход (In → Out)</th>
+                      <th className="py-1.5 px-1.5 whitespace-nowrap">Src IP → Dst IP</th>
+                      <th className="py-1.5 px-1.5 w-16 whitespace-nowrap">VLAN</th>
+                      <th className="py-1.5 px-2 w-24 whitespace-nowrap">Статус</th>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {filteredEntries.map(({ step: st, originalIndex }) => {
+                      const isSelected = originalIndex === currentStepIndex;
+                      const vis = getProtocolVisualMeta(st.protocol, st.status);
+                      return (
+                        <tr
+                          key={st.id}
+                          data-testid={`event-row-${originalIndex}`}
+                          onClick={() => onSelectStep(originalIndex, true)}
+                          className={`cursor-pointer transition-colors ${
+                            isSelected
+                              ? 'bg-sky-500/20 text-white'
+                              : 'hover:bg-slate-900/80 text-slate-300'
+                          }`}
+                        >
+                          <td className="py-1 px-2 tabular-nums whitespace-nowrap">
+                            <span className="font-semibold text-slate-200">#{st.stepIndex}</span>
+                            <span className="text-slate-500 ml-1">{st.timestampMs}ms</span>
+                          </td>
+                          <td className="py-1 px-1.5 whitespace-nowrap">
+                            <span
+                              className={`inline-flex items-center px-1.5 py-0.2 rounded text-[9.5px] font-semibold border ${vis.badgeClass}`}
+                            >
+                              {st.protocol}
+                            </span>
+                          </td>
+                          <td className="py-1 px-1.5 whitespace-nowrap">
+                            <span className="font-semibold text-sky-300">{st.toNodeName}</span>
+                            <span className="text-slate-500 ml-1">
+                              ({st.fromNodeName}:{st.fromPortName}→{st.toPortName})
+                            </span>
+                          </td>
+                          <td className="py-1 px-1.5 whitespace-nowrap text-[10.5px]">
+                            <span className="text-slate-200">{st.inboundPdu.l3.srcIp}</span>
+                            <span className="text-slate-500 mx-1">→</span>
+                            <span className="text-emerald-300">{st.outboundPdu.l3.dstIp}</span>
+                          </td>
+                          <td className="py-1 px-1.5 whitespace-nowrap tabular-nums">
+                            {st.vlanTag !== null ? (
+                              <span className="text-indigo-300">VLAN {st.vlanTag}</span>
+                            ) : (
+                              <span className="text-slate-500">—</span>
+                            )}
+                          </td>
+                          <td className="py-1 px-2 whitespace-nowrap text-[10px]">
+                            {st.status === 'delivered' && (
+                              <span className="inline-flex items-center gap-1 text-emerald-400">
+                                <CheckCircle2 className="w-3 h-3 shrink-0" /> DELIVERED
+                              </span>
+                            )}
+                            {st.status === 'forwarded' && (
+                              <span className="inline-flex items-center gap-1 text-sky-400">
+                                <ArrowRight className="w-3 h-3 shrink-0" /> FORWARDED
+                              </span>
+                            )}
+                            {st.status === 'broadcast' && (
+                              <span className="inline-flex items-center gap-1 text-amber-400">
+                                <Radio className="w-3 h-3 shrink-0" /> FLOOD
+                              </span>
+                            )}
+                            {st.status === 'dropped' && (
+                              <span className="inline-flex items-center gap-1 text-red-400 font-semibold">
+                                <AlertTriangle className="w-3 h-3 shrink-0" /> DROPPED
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+
+          {/* Right Pane: Instant Inbound PDU vs Outbound PDU Diff Comparison */}
+          <div className="w-full lg:w-[390px] xl:w-[430px] flex flex-col min-h-0 bg-slate-900/60 shrink-0">
+            {currentStep && currentStepDiff ? (
+              <>
+                <div className="px-3.5 py-2 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-slate-100">
+                      <Crosshair className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                      <span className="truncate">
+                        Сравнение PDU на узле {currentStep.toNodeName} (Шаг #{currentStep.stepIndex})
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onInspectStep(currentStep)}
+                    className="px-2 py-0.5 text-[11px] font-medium bg-sky-600 hover:bg-sky-500 text-white rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Развернуть L1–L7 OSI
+                  </button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-3 space-y-2.5 text-xs">
+                  {/* Decision & Header Modification Summary */}
+                  <div className="p-2.5 rounded bg-slate-950 border border-slate-800 space-y-1.5">
+                    <div className="text-[11px] text-slate-300 leading-snug">
+                      {currentStep.decisionTitle}
+                    </div>
+                    {currentStepDiff.changeBadges.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-0.5 font-mono text-[10px]">
+                        <span className="text-slate-400">Модификации заголовков:</span>
+                        {currentStepDiff.changeBadges.map((b) => (
+                          <span
+                            key={b}
+                            className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/40"
+                          >
+                            {b}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Inbound vs Outbound Side-by-Side Diff Table */}
+                  <div className="border border-slate-800 rounded overflow-hidden">
+                    <table className="w-full text-left font-mono text-[11px] border-collapse">
+                      <thead className="bg-slate-950 text-slate-400 border-b border-slate-800">
+                        <tr>
+                          <th className="py-1 px-2 w-28">Уровень / Поле</th>
+                          <th className="py-1 px-2">Inbound PDU (Вход)</th>
+                          <th className="py-1 px-2">Outbound PDU (Выход)</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70 bg-slate-950/60">
+                        {currentStepDiff.fields.map((f) => (
+                          <tr
+                            key={`${f.layer}-${f.field}`}
+                            className={f.changed ? 'bg-amber-500/[0.07]' : ''}
+                          >
+                            <td className="py-1 px-2 text-slate-400 whitespace-nowrap">
+                              <span className="text-sky-400 font-semibold mr-1">[{f.layer}]</span>
+                              <span>{f.field}</span>
+                            </td>
+                            <td className="py-1 px-2 text-slate-300 truncate max-w-[140px]">
+                              {f.inboundValue}
+                            </td>
+                            <td className="py-1 px-2 truncate max-w-[165px]">
+                              <span
+                                className={
+                                  f.changed
+                                    ? 'text-amber-300 font-semibold'
+                                    : 'text-slate-300'
+                                }
+                              >
+                                {f.outboundValue}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="h-full flex items-center justify-center text-xs text-slate-500 px-6 text-center">
+                Выберите любое событие в таблице слева или кликните по бегущему квадратику пакета на холсте для сравнения Inbound / Outbound заголовков PDU.
+              </div>
+            )}
+          </div>
         </div>
       )}
     </section>
