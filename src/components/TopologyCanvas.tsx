@@ -54,8 +54,6 @@ interface TopologyCanvasProps {
   selectedCableType: CableType;
   activeStep: SimulationStep | null;
   packetSquares: CanvasPacketSquareDescriptor[];
-  isRightCollapsed: boolean;
-  onExpandRightPanel: () => void;
   onSelectNode: (nodeId: string | null) => void;
   onSelectZone: (zoneId: string | null) => void;
   onSelectCableType: (type: CableType) => void;
@@ -71,6 +69,8 @@ interface TopologyCanvasProps {
   onMoveNode: (nodeId: string, x: number, y: number) => void;
   onMoveZone: (zoneId: string, x: number, y: number) => void;
   onUpdateNode: (updatedNode: NetworkNode) => void;
+  onUpdateAllNodes?: (updatedNodes: NetworkNode[]) => void;
+  onLoadSimulationSteps?: (steps: SimulationStep[], summaryMessage: string) => void;
   onUpdateLinks: (updatedLinks: NetworkLink[]) => void;
   onUpdateZone: (updatedZone: NetworkZone) => void;
   onCreateZone?: (newZone: NetworkZone) => void;
@@ -168,8 +168,6 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   selectedCableType,
   activeStep,
   packetSquares,
-  isRightCollapsed,
-  onExpandRightPanel,
   onSelectNode,
   onSelectZone,
   onSelectCableType,
@@ -185,6 +183,8 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   onMoveNode,
   onMoveZone,
   onUpdateNode,
+  onUpdateAllNodes,
+  onLoadSimulationSteps,
   onUpdateLinks,
   onUpdateZone,
   onCreateZone,
@@ -213,6 +213,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   const [showLegend, setShowLegend] = useState(false);
   const [hoveredLinkId, setHoveredLinkId] = useState<string | null>(null);
   const [focusedChassisId, setFocusedChassisId] = useState<string | null>(null);
+  const [editingZoneId, setEditingZoneId] = useState<string | null>(null);
 
   // Right-click Context Menu state
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -383,7 +384,6 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
 
     onSelectZone(null);
     onSelectNode(node.id);
-    onExpandRightPanel();
   };
 
   const handleNodeMouseDown = (e: React.MouseEvent, node: NetworkNode) => {
@@ -452,8 +452,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
     .map((id) => nodes.find((n) => n.id === id))
     .filter((n): n is NetworkNode => Boolean(n));
   const webGuiNode = nodes.find((n) => n.id === webGuiNodeId) || null;
-  const activeNodeName = selectedNode?.name;
-  const activeZoneName = zones.find((z) => z.id === selectedZoneId)?.title;
+  const editingZone = zones.find((z) => z.id === editingZoneId) || null;
 
   const contextMenuNode =
     contextMenu?.kind === 'node'
@@ -512,6 +511,8 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
               onOpenWebGui(nodeId);
             }}
             onUpdateNode={onUpdateNode}
+            onUpdateAllNodes={onUpdateAllNodes}
+            onLoadSimulationSteps={onLoadSimulationSteps}
             onOpenChassis={(nodeId) => onOpenChassis(nodeId)}
             onOpenFloatingCli={onOpenFloatingCli}
             onClose={() => onOpenWebGui(null)}
@@ -584,19 +585,21 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                     <Monitor className="w-3.5 h-3.5 text-sky-400 shrink-0" />
                     <span>Открыть монитор ПК (Сеть и CMD)</span>
                   </button>
-                ) : (
+                ) : contextMenuNode.type === 'server' ? (
                   <>
                     <button
                       type="button"
                       role="menuitem"
                       onClick={() => {
-                        onOpenFloatingCli(contextMenuNode.id);
+                        onSelectZone(null);
+                        onSelectNode(contextMenuNode.id);
+                        onOpenPcMonitor(contextMenuNode.id);
                         setContextMenu(null);
                       }}
-                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-emerald-950/80 text-emerald-300 font-medium text-left transition-colors cursor-pointer"
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-amber-950/90 text-amber-300 font-semibold text-left transition-colors cursor-pointer"
                     >
-                      <Terminal className="w-3.5 h-3.5 shrink-0" />
-                      <span>Открыть терминал CLI (окно)</span>
+                      <Server className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      <span>Панель Сервера (HTTP / DNS / DHCP)</span>
                     </button>
 
                     <button
@@ -618,33 +621,65 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                       type="button"
                       role="menuitem"
                       onClick={() => {
+                        onOpenFloatingCli(contextMenuNode.id);
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-emerald-950/80 text-emerald-300 font-medium text-left transition-colors cursor-pointer"
+                    >
+                      <Terminal className="w-3.5 h-3.5 shrink-0" />
+                      <span>Открыть терминал CLI (окно)</span>
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
                         onSelectZone(null);
                         onSelectNode(contextMenuNode.id);
                         onOpenWebGui(contextMenuNode.id);
                         setContextMenu(null);
                       }}
-                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-indigo-950/80 text-indigo-300 font-medium text-left transition-colors cursor-pointer"
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-indigo-950/80 text-indigo-300 font-semibold text-left transition-colors cursor-pointer"
                     >
                       <Globe className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                      <span>Веб-интерфейс (Порты и VLAN)</span>
+                      <span>
+                        {contextMenuNode.type === 'router'
+                          ? 'Панель роутера (Порты / OSPF / ACL / NAT)'
+                          : 'Веб-интерфейс (Порты / VLAN / STP)'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onSelectZone(null);
+                        onSelectNode(contextMenuNode.id);
+                        onOpenChassis(contextMenuNode.id);
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <Cpu className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                      <span>Передняя панель 1U (RJ-45)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onOpenFloatingCli(contextMenuNode.id);
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-emerald-950/80 text-emerald-300 font-medium text-left transition-colors cursor-pointer"
+                    >
+                      <Terminal className="w-3.5 h-3.5 shrink-0" />
+                      <span>Открыть терминал CLI (окно)</span>
                     </button>
                   </>
                 )}
-
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    onSelectZone(null);
-                    onSelectNode(contextMenuNode.id);
-                    onExpandRightPanel();
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
-                >
-                  <Settings2 className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                  <span>Настроить в инспекторе</span>
-                </button>
 
                 <div className="my-1 border-t border-slate-800" />
 
@@ -704,13 +739,13 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                   onClick={() => {
                     onSelectNode(null);
                     onSelectZone(contextMenuZone.id);
-                    onExpandRightPanel();
+                    setEditingZoneId(contextMenuZone.id);
                     setContextMenu(null);
                   }}
                   className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
                 >
                   <Pencil className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                  <span>Редактировать зону</span>
+                  <span>Редактировать зону (окно)</span>
                 </button>
                 <button
                   type="button"
@@ -810,23 +845,105 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
           </div>
         )}
 
-        {/* Floating Button to Reopen Right Inspector when Collapsed */}
-        {isRightCollapsed && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onExpandRightPanel();
-            }}
-            aria-label="Развернуть правую панель инспектора"
-            className="absolute top-3 right-3 z-30 flex items-center gap-2 px-3 py-1.5 rounded-md bg-slate-900/95 hover:bg-slate-800 border border-slate-700 shadow-lg text-xs font-medium text-slate-200 transition-colors"
+        {/* Floating Subnet Zone Editor Window */}
+        {editingZone && (
+          <div
+            data-testid="floating-zone-editor"
+            onClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="absolute top-4 right-4 z-40 w-80 rounded-xl bg-slate-900/98 border border-slate-700 shadow-2xl p-3.5 space-y-3 text-xs text-slate-200"
           >
-            <PanelRightOpen className="w-3.5 h-3.5 text-sky-400" />
-            <span>
-              Инспектор
-              {activeNodeName ? `: ${activeNodeName}` : activeZoneName ? `: ${activeZoneName}` : ''}
-            </span>
-          </button>
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+              <div className="flex items-center gap-2 font-semibold text-sky-300">
+                <Layers className="w-4 h-4" />
+                <span>Настройка зоны подсети / VLAN</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingZoneId(null)}
+                className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer"
+              >
+                Закрыть
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">
+                  Название зоны (Title)
+                </label>
+                <input
+                  type="text"
+                  aria-label="Название зоны подсети"
+                  value={editingZone.title}
+                  onChange={(e) =>
+                    onUpdateZone({ ...editingZone, title: e.target.value })
+                  }
+                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-xs text-slate-100 focus:outline-none focus:border-sky-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">
+                  Подсеть / VLAN аннотация
+                </label>
+                <input
+                  type="text"
+                  aria-label="Подсеть или аннотация зоны"
+                  value={editingZone.subnetLabel}
+                  onChange={(e) =>
+                    onUpdateZone({ ...editingZone, subnetLabel: e.target.value })
+                  }
+                  className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-sky-300 focus:outline-none focus:border-sky-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">
+                  Цвет выделения
+                </label>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(['sky', 'emerald', 'amber', 'indigo', 'purple', 'rose'] as ZoneColor[]).map(
+                    (c) => (
+                      <button
+                        key={c}
+                        type="button"
+                        onClick={() => onUpdateZone({ ...editingZone, color: c })}
+                        className={`px-2 py-1 rounded border text-[11px] capitalize cursor-pointer ${
+                          editingZone.color === c
+                            ? 'bg-sky-500/20 border-sky-400 text-white font-semibold'
+                            : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {c}
+                      </button>
+                    )
+                  )}
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-slate-800 flex items-center justify-between">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onDeleteZone(editingZone.id);
+                    setEditingZoneId(null);
+                  }}
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-red-950/70 hover:bg-red-900/80 border border-red-500/40 text-red-300 cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Удалить зону</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditingZoneId(null)}
+                  className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium cursor-pointer"
+                >
+                  Готово
+                </button>
+              </div>
+            </div>
+          </div>
         )}
 
         {/* Contextual Mode Banner at Top of Canvas */}
@@ -1070,7 +1187,6 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                     }
                     onSelectNode(null);
                     onSelectZone(zone.id);
-                    onExpandRightPanel();
                   }}
                   className={`absolute z-10 rounded-xl border border-dashed transition-all pointer-events-auto cursor-pointer group ${
                     palette.bg
@@ -1102,7 +1218,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                           e.stopPropagation();
                           onSelectNode(null);
                           onSelectZone(zone.id);
-                          onExpandRightPanel();
+                          setEditingZoneId(zone.id);
                         }}
                         className={`p-1 rounded border transition-all ${
                           isZoneSelected
@@ -1363,16 +1479,16 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                 onClick={(e) => handleNodeClick(e, node)}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  if (node.type === 'pc') {
+                  if (node.type === 'pc' || node.type === 'server') {
                     onOpenPcMonitor(node.id);
                   } else {
-                    onOpenFloatingCli(node.id);
+                    onOpenWebGui(node.id);
                   }
                 }}
                 onContextMenu={(e) => handleNodeContextMenu(e, node)}
                 className="absolute z-20 flex flex-col items-center group cursor-pointer"
               >
-                {/* Quick Nearby Action Buttons on Top of Device: Single [Экран ПК] button for PCs, or [1U] [WEB] [>_] for network gear */}
+                {/* Quick Nearby Action Buttons on Top of Device */}
                 <div
                   className={`absolute -top-3.5 -right-4 z-30 flex items-center gap-1 transition-opacity ${
                     isSelected || isChassisOpen || isPcMonitorOpen
@@ -1400,6 +1516,62 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                       <Monitor className="w-2.5 h-2.5" />
                       <span>Экран ПК</span>
                     </button>
+                  ) : node.type === 'server' ? (
+                    <>
+                      <button
+                        type="button"
+                        aria-label={`Открыть панель сервера ${node.name}`}
+                        title={`Открыть панель Сервера (${node.name}): Службы L7 HTTP / DNS / DHCP, сеть и консоль`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectZone(null);
+                          onSelectNode(node.id);
+                          onOpenPcMonitor(node.id);
+                        }}
+                        className={`px-2 py-0.5 rounded-full border text-[9px] font-mono font-bold shadow-md flex items-center gap-1 cursor-pointer transition-colors ${
+                          isPcMonitorOpen
+                            ? 'bg-amber-600 border-amber-300 text-white'
+                            : 'bg-amber-950 border-amber-400/90 text-amber-200 hover:bg-amber-600 hover:text-white'
+                        }`}
+                      >
+                        <Server className="w-2.5 h-2.5" />
+                        <span>Службы L7</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        aria-label={`Открыть 1U панель ${node.name}`}
+                        title={`Открыть плавающее окно портов 1U (${node.name})`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectZone(null);
+                          onSelectNode(node.id);
+                          onOpenChassis(node.id);
+                          setFocusedChassisId(node.id);
+                        }}
+                        className={`px-1.5 py-0.5 rounded-full border text-[9px] font-mono font-bold shadow-md flex items-center gap-0.5 cursor-pointer transition-colors ${
+                          isChassisOpen
+                            ? 'bg-sky-600 border-sky-300 text-white'
+                            : 'bg-sky-950 border-sky-400/80 text-sky-200 hover:bg-sky-600 hover:text-white'
+                        }`}
+                      >
+                        <Cpu className="w-2.5 h-2.5" />
+                        <span>1U</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        aria-label={`Открыть CLI окно ${node.name}`}
+                        title="Открыть плавающий терминал CLI"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpenFloatingCli(node.id);
+                        }}
+                        className="p-1 rounded-full bg-emerald-950 border border-emerald-500/70 text-emerald-300 hover:bg-emerald-600 hover:text-white shadow-md cursor-pointer"
+                      >
+                        <Terminal className="w-3 h-3" />
+                      </button>
+                    </>
                   ) : (
                     <>
                       <button
@@ -1426,7 +1598,11 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                       <button
                         type="button"
                         aria-label={`Открыть веб-интерфейс ${node.name}`}
-                        title="Открыть плавающий Веб-интерфейс коммутатора (настройка портов и VLAN)"
+                        title={
+                          node.type === 'router'
+                            ? 'Открыть плавающую панель роутера (Порты, 802.1Q, OSPF, NAT, ACL, DHCP)'
+                            : 'Открыть плавающий Веб-интерфейс коммутатора (Порты, VLAN, STP, MAC)'
+                        }
                         onClick={(e) => {
                           e.stopPropagation();
                           onSelectZone(null);
@@ -1436,13 +1612,13 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                         className="px-1.5 py-0.5 rounded-full bg-indigo-950 border border-indigo-400/80 text-[9px] font-mono font-bold text-indigo-200 hover:bg-indigo-600 hover:text-white shadow-md flex items-center gap-0.5 cursor-pointer"
                       >
                         <Globe className="w-2.5 h-2.5" />
-                        <span>WEB</span>
+                        <span>{node.type === 'router' ? 'GUI' : 'WEB'}</span>
                       </button>
 
                       <button
                         type="button"
                         aria-label={`Открыть CLI окно ${node.name}`}
-                        title="Открыть плавающий терминал CLI (или ПКМ / двойной клик)"
+                        title="Открыть плавающий терминал CLI"
                         onClick={(e) => {
                           e.stopPropagation();
                           onOpenFloatingCli(node.id);

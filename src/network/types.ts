@@ -26,7 +26,43 @@ export interface NetworkInterface {
   trunkAllowedVlans: number[]; // e.g., [1, 10, 20, 30]
   helperAddress?: string; // ip helper-address for DHCP Relay
   natRole?: 'none' | 'inside' | 'outside'; // ip nat inside / outside
+  bandwidthMbps?: number; // Link bandwidth in Mbps (e.g., 1000 for Gi, 100 for Fa, 10 for Serial/Backup)
+  ospfCost?: number; // Explicit OSPF interface cost override (ip ospf cost)
   subinterfaces?: RouterSubinterface[];
+}
+
+export interface OspfNetworkStatement {
+  id: string;
+  network: string; // e.g., '192.168.1.0'
+  wildcard: string; // e.g., '0.0.0.255'
+  wildcardMask?: string; // alias for wildcard
+  area: number; // default 0
+}
+
+export interface OspfConfig {
+  enabled: boolean;
+  processId: number; // default 1
+  routerId?: string; // Explicit Router-ID or auto-elected highest active IPv4
+  referenceBandwidthMbps?: number; // default 100 (Cost = 100 Mbps / Bandwidth)
+  networks: OspfNetworkStatement[];
+  passiveInterfaces: string[]; // Interface shortNames that do not send OSPF Hellos
+  ripEnabled?: boolean; // RIPv2 dynamic routing protocol (AD 120, hop count metric)
+}
+
+export interface OspfNeighborEntry {
+  neighborRouterId: string;
+  neighborNodeId: string;
+  neighborName: string;
+  neighborRouterName: string;
+  priority: number;
+  state: 'FULL/DR' | 'FULL/BDR' | 'FULL/P2P';
+  deadTime: string;
+  neighborIp: string;
+  localInterface: string;
+  area: number;
+  cost: number;
+  interfaceCost: number;
+  bandwidthMbps: number;
 }
 
 export type StpPortRole = 'root' | 'designated' | 'alternate' | 'disabled';
@@ -89,7 +125,13 @@ export interface RouteEntry {
   mask: string; // e.g., '255.255.255.0'
   nextHop: string; // e.g., '10.0.0.2' or 'Directly Connected'
   interfaceName: string; // e.g., 'Fa0/1' or 'Fa0/0.10'
-  type: 'C' | 'S'; // Connected or Static
+  type: 'C' | 'S' | 'O' | 'R'; // Connected, Static, OSPF (AD 110), or RIPv2 (AD 120)
+  administrativeDistance?: number; // C=0, S=1, O=110, R=120
+  metric?: number; // OSPF cumulative path Cost or RIP hop count
+  ospfArea?: number; // e.g., 0
+  learnedFromRouterId?: string;
+  learnedFromRouterName?: string;
+  spfPath?: string[];
 }
 
 export interface ArpEntry {
@@ -155,9 +197,11 @@ export interface NetworkZone {
 }
 
 export interface CliState {
-  mode: 'user' | 'priv' | 'config' | 'config-if';
+  mode: 'user' | 'priv' | 'config' | 'config-if' | 'config-router';
   selectedInterface?: string;
   selectedSubinterfaceVlan?: number;
+  selectedRoutingProtocol?: 'ospf' | 'rip';
+  selectedOspfProcessId?: number;
   history: string[];
   commandLog?: string[];
 }
@@ -181,6 +225,7 @@ export interface NetworkNode {
   aclRules?: AclRule[]; // Router L3/L4 Firewall ACL rules
   natEnabled?: boolean; // Router NAT/PAT overload toggle
   natTranslations?: NatTranslationEntry[]; // Active NAT translation table
+  ospfConfig?: OspfConfig; // OSPFv2 Single-Area & RIPv2 Dynamic Routing configuration
   services?: ServerServices;
   vlanDatabase?: SwitchVlanEntry[];
   interfaces: NetworkInterface[];
@@ -216,7 +261,9 @@ export type ProtocolType =
   | 'TCP_ACK'
   | 'HTTP_GET'
   | 'HTTP_200_OK'
-  | 'STP_BPDU';
+  | 'STP_BPDU'
+  | 'OSPF_HELLO'
+  | 'OSPF_LSA';
 
 export type StepStatus = 'forwarded' | 'broadcast' | 'delivered' | 'dropped';
 
@@ -235,7 +282,7 @@ export interface OsiPduDetails {
     vlanTag: number | null;
   };
   l3: {
-    headerType: 'IPv4' | 'ARP Payload' | 'IEEE 802.1D BPDU';
+    headerType: 'IPv4' | 'ARP Payload' | 'IEEE 802.1D BPDU' | 'OSPFv2 Packet (IP Proto 89)';
     srcIp: string;
     dstIp: string;
     ttl: number;
@@ -249,7 +296,7 @@ export interface OsiPduDetails {
     dstPort?: number;
   };
   l7?: {
-    appProtocol: 'DHCP' | 'DNS' | 'HTTP' | 'ICMP' | 'STP';
+    appProtocol: 'DHCP' | 'DNS' | 'HTTP' | 'ICMP' | 'STP' | 'OSPF';
     headline: string;
     fields: Record<string, string>;
   };
@@ -303,11 +350,24 @@ export interface HttpResponseResult {
   latencyMs: number;
 }
 
+export interface PresetTestScenario {
+  id: string;
+  title: string;
+  subtitle: string;
+  protocolBadge: 'ICMP' | 'OSPF' | 'RIP' | 'DHCP' | 'HTTP' | 'TRACEROUTE' | 'STP' | 'ACL';
+  expectedOutcome: 'success' | 'blocked';
+  actionType: 'ping' | 'traceroute' | 'dhcp' | 'http' | 'ospf_hello' | 'multi_flow';
+  sourceNodeId?: string;
+  targetIpOrHost?: string;
+}
+
 export interface TopologyData {
   id: string;
   name: string;
+  shortTag?: string;
   description: string;
   nodes: NetworkNode[];
   links: NetworkLink[];
   zones?: NetworkZone[];
+  testScenarios?: PresetTestScenario[];
 }

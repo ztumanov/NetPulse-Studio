@@ -27,6 +27,10 @@ import {
   isValidSubnetMask,
   maskToCidr,
 } from './ipMath';
+import {
+  computeDijkstraSpfRoutesForRouter,
+  computeRipRoutesForRouter,
+} from './ospfEngine';
 
 export const BROADCAST_MAC = 'FF:FF:FF:FF:FF:FF';
 export const BROADCAST_IP = '255.255.255.255';
@@ -120,9 +124,14 @@ export function findLogicalInterfaceByName(
 
 /**
  * Automatically builds Connected ('C') routes from active interfaces and 802.1Q subinterfaces
- * with IPv4 addresses, preserving Static ('S') routes configured by the user.
+ * with IPv4 addresses, preserving Static ('S') routes configured by the user, and computing
+ * Dynamic OSPFv2 ('O', AD 110) and RIPv2 ('R', AD 120) routes when topology context is provided.
  */
-export function syncConnectedRoutes(node: NetworkNode): RouteEntry[] {
+export function syncConnectedRoutes(
+  node: NetworkNode,
+  allNodes?: NetworkNode[],
+  allLinks?: NetworkLink[]
+): RouteEntry[] {
   const staticRoutes = node.routingTable.filter((r) => r.type === 'S');
   const connectedRoutes: RouteEntry[] = [];
 
@@ -138,6 +147,8 @@ export function syncConnectedRoutes(node: NetworkNode): RouteEntry[] {
         nextHop: 'Directly Connected',
         interfaceName: iface.shortName,
         type: 'C',
+        administrativeDistance: 0,
+        metric: 0,
       });
     }
 
@@ -157,34 +168,101 @@ export function syncConnectedRoutes(node: NetworkNode): RouteEntry[] {
             nextHop: 'Directly Connected',
             interfaceName: `${iface.shortName}.${sub.vlanId}`,
             type: 'C',
+            administrativeDistance: 0,
+            metric: 0,
           });
         }
       }
     }
   }
 
-  return [...connectedRoutes, ...staticRoutes];
+  let dynamicRoutes: RouteEntry[] = [];
+  if (node.type === 'router' && allNodes && allLinks) {
+    const ospfRoutes = computeDijkstraSpfRoutesForRouter(node, allNodes, allLinks);
+    const ripRoutes = computeRipRoutesForRouter(node, allNodes, allLinks);
+    dynamicRoutes = [...ospfRoutes];
+    for (const rip of ripRoutes) {
+      const alreadyInOspf = dynamicRoutes.some(
+        (o) => o.network === rip.network && o.mask === rip.mask
+      );
+      if (!alreadyInOspf) {
+        dynamicRoutes.push(rip);
+      }
+    }
+  } else if (node.type === 'router') {
+    // Preserve existing dynamic routes if topology context was not passed
+    dynamicRoutes = node.routingTable.filter(
+      (r) =>
+        (r.type === 'O' && node.ospfConfig?.enabled) ||
+        (r.type === 'R' && node.ospfConfig?.ripEnabled)
+    );
+  }
+
+  return [...connectedRoutes, ...staticRoutes, ...dynamicRoutes];
 }
 
 /**
- * Longest Prefix Match (LPM) lookup on a router's routing table.
+ * Synchronizes routing tables on all routers in the topology (Connected + Static + OSPF SPF + RIPv2).
  */
-export function findBestRoute(node: NetworkNode, dstIp: string): RouteEntry | null {
+export function syncAllRoutersRoutingTables(
+  nodes: NetworkNode[],
+  links: NetworkLink[]
+): NetworkNode[] {
+  return nodes.map((n) => {
+    if (n.type !== 'router') return n;
+    return {
+      ...n,
+      routingTable: syncConnectedRoutes(n, nodes, links),
+    };
+  });
+}
+
+function getRouteAdminDistance(route: RouteEntry): number {
+  if (route.administrativeDistance !== undefined) return route.administrativeDistance;
+  if (route.type === 'C') return 0;
+  if (route.type === 'S') return 1;
+  if (route.type === 'O') return 110;
+  return 120;
+}
+
+/**
+ * Longest Prefix Match (LPM) lookup on a router's routing table,
+ * breaking ties by Administrative Distance (C=0, S=1, O=110, R=120) and then Metric (Cost).
+ */
+export function findBestRoute(
+  node: NetworkNode,
+  dstIp: string,
+  allNodes?: NetworkNode[],
+  allLinks?: NetworkLink[]
+): RouteEntry | null {
   if (!isValidIpv4(dstIp)) return null;
-  const routes = syncConnectedRoutes(node);
+  const routes = syncConnectedRoutes(node, allNodes, allLinks);
   let bestRoute: RouteEntry | null = null;
   let longestPrefix = -1;
 
   for (const route of routes) {
     if (!isValidIpv4(route.network) || !isValidIpv4(route.mask)) continue;
+    const egress = findLogicalInterfaceByName(node, route.interfaceName);
+    if (!egress || egress.physicalPort.adminStatus !== 'up') continue;
+    if (allNodes && allLinks) {
+      const peer = getConnectedPeer(node.id, egress.physicalPort.id, allNodes, allLinks);
+      if (!peer || !isLinkOperational(peer.link, allNodes)) continue;
+    }
+
     if (isSameSubnet(dstIp, route.network, route.mask)) {
       const prefixLen = maskToCidr(route.mask);
-      if (
-        prefixLen > longestPrefix ||
-        (prefixLen === longestPrefix && bestRoute?.type === 'S' && route.type === 'C')
-      ) {
+      if (prefixLen > longestPrefix) {
         longestPrefix = prefixLen;
         bestRoute = route;
+      } else if (prefixLen === longestPrefix && bestRoute) {
+        const currentAd = getRouteAdminDistance(route);
+        const bestAd = getRouteAdminDistance(bestRoute);
+        if (
+          currentAd < bestAd ||
+          (currentAd === bestAd && (route.metric ?? 0) < (bestRoute.metric ?? 0))
+        ) {
+          bestRoute = route;
+        }
       }
     }
   }
@@ -677,7 +755,9 @@ function learnArp(node: NetworkNode, ip: string, mac: string, interfaceName: str
  */
 export function selectSourceInterfaceForTarget(
   originNode: NetworkNode,
-  dstIp: string
+  dstIp: string,
+  allNodes?: NetworkNode[],
+  allLinks?: NetworkLink[]
 ): {
   egressPort?: NetworkInterface;
   egressLogical?: LogicalInterfaceView;
@@ -693,7 +773,7 @@ export function selectSourceInterfaceForTarget(
       };
     }
 
-    const route = findBestRoute(originNode, dstIp);
+    const route = findBestRoute(originNode, dstIp, allNodes, allLinks);
     if (!route) {
       return {
         egressPort: undefined,
@@ -1525,7 +1605,12 @@ function transmitIpPacket(
 } {
   let currentL3Node = originNode;
   let currentDstIp = dstIp;
-  const originSelection = selectSourceInterfaceForTarget(originNode, currentDstIp);
+  const originSelection = selectSourceInterfaceForTarget(
+    originNode,
+    currentDstIp,
+    nodes,
+    links
+  );
   if (!originSelection.egressPort || !originSelection.egressLogical) {
     return {
       reachedTargetNode: null,
@@ -1625,7 +1710,7 @@ function transmitIpPacket(
     let nextHopIp = currentDstIp;
 
     if (currentL3Node.type === 'router') {
-      const route = findBestRoute(currentL3Node, currentDstIp);
+      const route = findBestRoute(currentL3Node, currentDstIp, nodes, links);
       if (!route) {
         return {
           reachedTargetNode: null,
@@ -1954,7 +2039,7 @@ export function runPacketSimulation(
   const nodes = cloneNodes(nodesInput);
   for (const n of nodes) {
     if (n.type === 'router') {
-      n.routingTable = syncConnectedRoutes(n);
+      n.routingTable = syncConnectedRoutes(n, nodes, links);
     }
   }
 
@@ -2077,7 +2162,7 @@ export function runDhcpDoraSimulation(
   const nodes = cloneNodes(nodesInput);
   for (const n of nodes) {
     if (n.type === 'router') {
-      n.routingTable = syncConnectedRoutes(n);
+      n.routingTable = syncConnectedRoutes(n, nodes, links);
     }
   }
 
@@ -2608,7 +2693,7 @@ export function runTracerouteSimulation(
   const nodes = cloneNodes(nodesInput);
   for (const n of nodes) {
     if (n.type === 'router') {
-      n.routingTable = syncConnectedRoutes(n);
+      n.routingTable = syncConnectedRoutes(n, nodes, links);
     }
   }
 
@@ -2881,7 +2966,7 @@ export function runHttpBrowserSimulation(
   const nodes = cloneNodes(nodesInput);
   for (const n of nodes) {
     if (n.type === 'router') {
-      n.routingTable = syncConnectedRoutes(n);
+      n.routingTable = syncConnectedRoutes(n, nodes, links);
     }
   }
 

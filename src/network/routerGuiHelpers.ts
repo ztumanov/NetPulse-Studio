@@ -190,7 +190,9 @@ export function getSuggestedStaticRoutes(
 
   const suggestions: SuggestedStaticRoute[] = [];
   const seenNets = new Set<string>(
-    existingRoutes.map((r) => `${r.network}/${r.mask}`)
+    existingRoutes
+      .filter((r) => r.type === 'C' || r.type === 'S')
+      .map((r) => `${r.network}/${r.mask}`)
   );
 
   const otherRouters = allNodes.filter(

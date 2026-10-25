@@ -1,6 +1,8 @@
 # NetPulse Studio — Интерактивный сетевой симулятор уровней L1–L7 (CCNA Edition)
 
-**NetPulse Studio** — браузерная инженерная среда проектирования, физической коммутации и потоковой/пошаговой симуляции компьютерных сетей уровней **L1–L7** в стиле **Cisco Packet Tracer**. Приложение объединяет интерактивный топологический холст с потоком микро-пакетов в реальном времени, реалистичные аппаратные 1U-панели коммутаторов и маршрутизаторов **Cisco ISR**, визуальные ГУИ настройки L2/L3 (**VLAN, 802.1Q Router-on-a-Stick, STP 802.1D, Static Routes, NAT/PAT, ACL Firewall**), монитор рабочей станции ПК, многовкладочный терминал **Cisco IOS CLI** и двухпанельный анализатор событий **Event List & OSI PDU Sniffer**.
+![NetPulse Studio — Интерактивный сетевой симулятор уровней L1–L7](./public/assets/aistudio/image_ca3fc3f4.png)
+
+**NetPulse Studio** — браузерная инженерная среда проектирования, физической коммутации и потоковой/пошаговой симуляции компьютерных сетей уровней **L1–L7** в стиле **Cisco Packet Tracer**. Приложение объединяет интерактивный топологический холст с потоком микро-пакетов в реальном времени, реалистичные аппаратные 1U-панели коммутаторов и маршрутизаторов **Cisco ISR**, плавающие окна настройки оборудования (**VLAN, 802.1Q Router-on-a-Stick, STP 802.1D, OSPFv2 SPF, RIPv2, Static Routes, NAT/PAT, ACL Firewall, DHCP/DNS/HTTP L7**), монитор рабочей станции и сервера, многовкладочный терминал **Cisco IOS CLI** и двухпанельный анализатор событий **Event List & OSI PDU Sniffer**.
 
 ---
 
@@ -198,26 +200,25 @@ src/
 ├── main.tsx                            # Точка входа React-приложения
 ├── index.css                           # Глобальные стили, шрифты и сетка рабочего пространства
 ├── components/
-│   ├── TopologyCanvas.tsx              # Интерактивный холст, поток 10x10 px пакетов со шлейфами, контекстное меню
+│   ├── TopologyCanvas.tsx              # Интерактивный холст, поток 10x10 px пакетов, контекстное меню и редактор зон
 │   ├── HardwareFrontPanel.tsx          # Плавающее 1U-шасси коммутаторов (+30%) и маршрутизаторов Cisco ISR
-│   ├── FloatingRouterGui.tsx           # Плавающий ГУИ маршрутизатора Cisco ISR (802.1Q, Static Routes, NAT, ACL)
+│   ├── FloatingRouterGui.tsx           # Плавающий ГУИ маршрутизатора Cisco ISR (802.1Q, Static, OSPF/RIP, NAT, ACL, DHCP/ARP)
 │   ├── FloatingSwitchWebGui.tsx        # Плавающий веб-интерфейс коммутатора (Порты, VLAN DB, STP, MAC-таблица)
-│   ├── FloatingPcMonitor.tsx           # Экран монитора ПК (Умные настройки IPv4/маски, консоль CMD и браузер L7)
+│   ├── FloatingPcMonitor.tsx           # Экран монитора ПК и Сервера (Сеть и ARP, Службы L7 HTTP/DNS/DHCP, CMD, Браузер)
 │   ├── FloatingCliWindow.tsx           # Многовкладочный терминал Cisco IOS CLI с автодополнением Tab
-│   ├── DeviceToolbar.tsx               # Сворачиваемая левая панель оборудования и лабораторных стендов
-│   ├── DeviceInspectorPanel.tsx        # Правая панель инспектора устройств, сервисов L7 и зон подсетей
+│   ├── DeviceToolbar.tsx               # Сворачиваемая левая панель оборудования, 7 стендов и автотестов ядра
 │   ├── SimulationTimelineBar.tsx       # Панель Realtime/Simulation, скорость 0.1x–4x, фильтры и Event List + Diff
 │   └── PduInspectorModal.tsx           # Модальное окно глубокого разбора заголовков пакета OSI L1–L7
 └── network/
-    ├── types.ts                        # Строгие типы данных узлов, портов, VLAN, STP, NAT, ACL и шагов симуляции
+    ├── types.ts                        # Строгие типы данных узлов, портов, VLAN, STP, OSPF/RIP, NAT, ACL и шагов симуляции
     ├── ipMath.ts                       # Расчёт подсетей IPv4, CIDR, автоформатирование IP и автоподбор масок
     ├── hardwareChassis.ts              # Логика 1U-шасси, матрицы портов RJ-45 и базы данных VLAN
-    ├── routerGuiHelpers.ts             # Чистые функции управления 802.1Q подинтерфейсами, маршрутами, NAT и ACL
-    ├── packetStreamEngine.ts           # Движок потока микро-пакетов, волн Broadcast, STP BPDU, фильтров и Diff PDU
-    ├── simulator.ts                    # Детерминированное ядро симуляции L1–L7 (RFC 826 ARP, STP, RoaS, NAT, ACL)
-    ├── cliParser.ts                    # Парсер команд Cisco IOS CLI, DNS-резолвинг в CLI и автодополнение
-    ├── presets.ts                      # 4 готовых лабораторных стенда (Dual LAN, VLAN Trunk, WAN, CCNA RoaS/STP/NAT)
-    └── simulator.test.ts               # Полный набор из 25 модульных тестов сетевого ядра, протоколов и ГУИ
+    ├── routerGuiHelpers.ts             # Чистые функции управления 802.1Q подинтерфейсами, маршрутами, OSPF, NAT и ACL
+    ├── packetStreamEngine.ts           # Движок потока микро-пакетов, волн Broadcast, STP BPDU, OSPF Hello/LSA, фильтров и Diff PDU
+    ├── simulator.ts                    # Детерминированное ядро симуляции L1–L7 (RFC 826 ARP, STP, OSPFv2 SPF, RIPv2, RoaS, NAT, ACL)
+    ├── cliParser.ts                    # Парсер команд Cisco IOS CLI (включая router ospf 1 / network), DNS в CLI и автодополнение
+    ├── presets.ts                      # 7 готовых лабораторных стендов с тестовыми сценариями в 1 клик
+    └── simulator.test.ts               # Полный набор из 27 модульных тестов сетевого ядра, протоколов и ГУИ
 ```
 
 ---
@@ -229,7 +230,7 @@ src/
 * **Стилизация:** Tailwind CSS 4
 * **Иконографика:** Lucide React
 * **Сборка и сервер разработки:** Vite 6
-* **Модульное тестирование:** встроенный тестовый раннер Node.js (`node:test` + `tsx`, 25 автотестов)
+* **Модульное тестирование:** встроенный тестовый раннер Node.js (`node:test` + `tsx`, 27 автотестов)
 
 ---
 
@@ -246,7 +247,7 @@ npm run dev
 ```
 Приложение будет доступно по адресу `http://localhost:3000`.
 
-### Запуск модульных тестов сетевого ядра (25 тестов)
+### Запуск модульных тестов сетевого ядра (27 тестов)
 ```bash
 npx tsx --test src/network/simulator.test.ts
 ```

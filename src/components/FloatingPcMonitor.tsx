@@ -34,6 +34,9 @@ import {
   Sparkles,
   Wifi,
   WifiOff,
+  Server,
+  Plus,
+  Trash2,
 } from 'lucide-react';
 
 interface FloatingPcMonitorProps {
@@ -74,7 +77,9 @@ export const FloatingPcMonitor: React.FC<FloatingPcMonitorProps> = ({
   onLoadSimulationSteps,
   onClose,
 }) => {
-  const [activeTab, setActiveTab] = useState<'network' | 'console' | 'browser'>('network');
+  const [activeTab, setActiveTab] = useState<'network' | 'services' | 'console' | 'browser'>(
+    node.type === 'server' ? 'services' : 'network'
+  );
 
   // Floating draggable monitor coordinates
   const [position, setPosition] = useState(() => ({
@@ -120,6 +125,17 @@ export const FloatingPcMonitor: React.FC<FloatingPcMonitorProps> = ({
   const [browserUrl, setBrowserUrl] = useState('http://app.corp.local/index.html');
   const [browserResponse, setBrowserResponse] = useState<HttpResponseResult | null>(null);
   const [browserError, setBrowserError] = useState<string | null>(null);
+
+  // L7 Server DNS / DHCP form state
+  const [newDnsDomain, setNewDnsDomain] = useState('intranet.corp.local');
+  const [newDnsIp, setNewDnsIp] = useState(primaryIface?.ipAddress || '192.168.2.100');
+  const [newPoolName, setNewPoolName] = useState('CORP_POOL');
+  const [newPoolNet, setNewPoolNet] = useState('192.168.1.0');
+  const [newPoolMask, setNewPoolMask] = useState('255.255.255.0');
+  const [newPoolGw, setNewPoolGw] = useState('192.168.1.1');
+  const [newPoolDns, setNewPoolDns] = useState(primaryIface?.ipAddress || '192.168.2.100');
+  const [newPoolStart, setNewPoolStart] = useState('192.168.1.50');
+  const [newPoolEnd, setNewPoolEnd] = useState('192.168.1.150');
 
   useEffect(() => {
     if (!isDragging) return;
@@ -565,7 +581,7 @@ export const FloatingPcMonitor: React.FC<FloatingPcMonitorProps> = ({
       }}
       onMouseDown={() => onFocus?.()}
       data-testid={`pc-monitor-window-${node.id}`}
-      className="fixed w-[650px] max-w-[95vw] select-none flex flex-col items-center"
+      className="fixed w-[740px] max-w-[95vw] select-none flex flex-col items-center"
     >
       {/* Outer Physical Monitor Bezel Frame */}
       <div className="w-full rounded-2xl p-2.5 bg-gradient-to-b from-slate-700 via-slate-800 to-slate-900 border-2 border-slate-600/90 shadow-[0_28px_70px_rgba(0,0,0,0.88)]">
@@ -641,8 +657,25 @@ export const FloatingPcMonitor: React.FC<FloatingPcMonitorProps> = ({
                 }`}
               >
                 <Settings2 className="w-3.5 h-3.5 shrink-0" />
-                <span>Сетевые настройки</span>
+                <span>Сеть и ARP</span>
               </button>
+
+              {node.type === 'server' && (
+                <button
+                  type="button"
+                  data-testid={`server-services-tab-${node.id}`}
+                  title="Службы L7 (HTTP · DNS · DHCP)"
+                  onClick={() => setActiveTab('services')}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                    activeTab === 'services'
+                      ? 'bg-amber-600 text-white shadow-xs'
+                      : 'text-amber-300 hover:text-slate-200 hover:bg-slate-900'
+                  }`}
+                >
+                  <Server className="w-3.5 h-3.5 shrink-0" />
+                  <span>Службы L7</span>
+                </button>
+              )}
 
               <button
                 type="button"
@@ -978,7 +1011,7 @@ export const FloatingPcMonitor: React.FC<FloatingPcMonitorProps> = ({
                         </strong>
                       </span>
                       <span className="text-slate-400">
-                        Записей ARP: <strong className="text-slate-200">{node.arpTable.length}</strong>
+                        MAC: <strong className="text-slate-300">{primaryIface?.macAddress || '—'}</strong>
                       </span>
                     </div>
 
@@ -995,6 +1028,396 @@ export const FloatingPcMonitor: React.FC<FloatingPcMonitorProps> = ({
                         </span>
                       )}
                     </div>
+                  </div>
+                </div>
+
+                {/* Section 3: Live ARP Cache Table */}
+                <div className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2">
+                  <div className="flex items-center justify-between text-xs font-mono">
+                    <span className="font-semibold text-slate-200">
+                      Таблица ARP-кэша ({node.arpTable.length} записей)
+                    </span>
+                    {node.arpTable.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => onUpdateNode({ ...node, arpTable: [] })}
+                        className="text-[11px] text-red-300 hover:text-red-200 underline cursor-pointer"
+                      >
+                        Очистить ARP (arp -d)
+                      </button>
+                    )}
+                  </div>
+                  {node.arpTable.length > 0 ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                      {node.arpTable.map((entry, i) => (
+                        <div
+                          key={`${entry.ipAddress}-${i}`}
+                          className="px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800 flex items-center justify-between text-xs font-mono"
+                        >
+                          <span className="text-sky-300 font-semibold">{entry.ipAddress}</span>
+                          <span className="text-emerald-300">{entry.macAddress}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-[11px] font-mono text-slate-500">
+                      Записи ARP отсутствуют. Отправьте Ping для разрешения MAC-адресов соседей.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 1.5: SERVER L7 SERVICES (HTTP, DNS, DHCP POOLS & LEASES) */}
+            {activeTab === 'services' && node.type === 'server' && (
+              <div className="p-3.5 space-y-3">
+                {/* 1. HTTP Web Server */}
+                <div className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-100">
+                        Веб-сервер HTTP/1.1 (TCP порт 80)
+                      </div>
+                      <p className="text-[11px] text-slate-400">
+                        Отвечает на запросы браузера HTTP GET 200 OK после 3-стороннего рукопожатия TCP SYN/SYN-ACK/ACK.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onUpdateNode({
+                          ...node,
+                          services: {
+                            httpEnabled: !(node.services?.httpEnabled ?? true),
+                            serverBanner:
+                              node.services?.serverBanner || 'nginx/1.24.0 (NetPulse Enterprise)',
+                            dnsEnabled: node.services?.dnsEnabled ?? true,
+                            dnsRecords: node.services?.dnsRecords ?? [],
+                            dhcpEnabled: node.services?.dhcpEnabled ?? false,
+                            dhcpPools: node.services?.dhcpPools ?? [],
+                          },
+                        })
+                      }
+                      className={`px-3 py-1 rounded text-xs font-mono font-bold border cursor-pointer ${
+                        node.services?.httpEnabled !== false
+                          ? 'bg-emerald-600 border-emerald-400 text-white'
+                          : 'bg-slate-950 border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      {node.services?.httpEnabled !== false ? 'HTTP 80: ON' : 'HTTP 80: OFF'}
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] font-mono text-slate-400 shrink-0">Server Banner:</span>
+                    <input
+                      type="text"
+                      aria-label="HTTP Server Banner"
+                      value={node.services?.serverBanner || 'nginx/1.24.0 (NetPulse Enterprise)'}
+                      onChange={(e) =>
+                        onUpdateNode({
+                          ...node,
+                          services: {
+                            httpEnabled: node.services?.httpEnabled ?? true,
+                            serverBanner: e.target.value,
+                            dnsEnabled: node.services?.dnsEnabled ?? true,
+                            dnsRecords: node.services?.dnsRecords ?? [],
+                            dhcpEnabled: node.services?.dhcpEnabled ?? false,
+                            dhcpPools: node.services?.dhcpPools ?? [],
+                          },
+                        })
+                      }
+                      className="flex-1 px-2.5 py-1 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-slate-100"
+                    />
+                  </div>
+                </div>
+
+                {/* 2. DNS Server (UDP 53) & A-Records */}
+                <div className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-100">
+                        Сервер имён DNS (UDP порт 53 — A-записи доменов)
+                      </div>
+                      <p className="text-[11px] text-slate-400">
+                        Разрешает доменные имена в IPv4-адреса при командах ping/nslookup и в браузере.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onUpdateNode({
+                          ...node,
+                          services: {
+                            httpEnabled: node.services?.httpEnabled ?? true,
+                            serverBanner: node.services?.serverBanner || 'nginx/1.24.0',
+                            dnsEnabled: !(node.services?.dnsEnabled ?? true),
+                            dnsRecords: node.services?.dnsRecords ?? [],
+                            dhcpEnabled: node.services?.dhcpEnabled ?? false,
+                            dhcpPools: node.services?.dhcpPools ?? [],
+                          },
+                        })
+                      }
+                      className={`px-3 py-1 rounded text-xs font-mono font-bold border cursor-pointer ${
+                        node.services?.dnsEnabled !== false
+                          ? 'bg-emerald-600 border-emerald-400 text-white'
+                          : 'bg-slate-950 border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      {node.services?.dnsEnabled !== false ? 'DNS 53: ON' : 'DNS 53: OFF'}
+                    </button>
+                  </div>
+
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (!newDnsDomain.trim() || !isValidIpv4(newDnsIp)) return;
+                      const currentRecords = node.services?.dnsRecords || [];
+                      onUpdateNode({
+                        ...node,
+                        services: {
+                          httpEnabled: node.services?.httpEnabled ?? true,
+                          serverBanner: node.services?.serverBanner || 'nginx/1.24.0',
+                          dnsEnabled: true,
+                          dnsRecords: [
+                            ...currentRecords.filter(
+                              (r) => r.domain.toLowerCase() !== newDnsDomain.trim().toLowerCase()
+                            ),
+                            {
+                              id: `dns-${Date.now()}`,
+                              domain: newDnsDomain.trim().toLowerCase(),
+                              ipAddress: newDnsIp.trim(),
+                            },
+                          ],
+                          dhcpEnabled: node.services?.dhcpEnabled ?? false,
+                          dhcpPools: node.services?.dhcpPools ?? [],
+                        },
+                      });
+                      setNewDnsDomain('');
+                    }}
+                    className="flex items-center gap-2"
+                  >
+                    <input
+                      type="text"
+                      aria-label="Доменное имя DNS"
+                      value={newDnsDomain}
+                      onChange={(e) => setNewDnsDomain(e.target.value)}
+                      placeholder="app.corp.local"
+                      className="flex-1 px-2.5 py-1 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-slate-100"
+                    />
+                    <input
+                      type="text"
+                      aria-label="IP-адрес записи DNS"
+                      value={newDnsIp}
+                      onChange={(e) => setNewDnsIp(e.target.value)}
+                      placeholder="192.168.2.100"
+                      className="w-36 px-2.5 py-1 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-slate-100"
+                    />
+                    <button
+                      type="submit"
+                      className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-xs font-semibold text-white flex items-center gap-1 cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>A-запись</span>
+                    </button>
+                  </form>
+
+                  <div className="space-y-1">
+                    {(node.services?.dnsRecords || []).map((rec) => (
+                      <div
+                        key={rec.id}
+                        className="px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800 flex items-center justify-between text-xs font-mono"
+                      >
+                        <div>
+                          <span className="text-amber-300 font-semibold">{rec.domain}</span>
+                          <span className="text-slate-500 mx-2">IN A</span>
+                          <span className="text-sky-300">{rec.ipAddress}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateNode({
+                              ...node,
+                              services: {
+                                ...node.services!,
+                                dnsRecords: (node.services?.dnsRecords || []).filter(
+                                  (r) => r.id !== rec.id
+                                ),
+                              },
+                            })
+                          }
+                          className="p-1 rounded text-slate-400 hover:text-red-400 cursor-pointer"
+                          title="Удалить запись DNS"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 3. DHCP Server (UDP 67/68) & Pools */}
+                <div className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-100">
+                        Сервер DHCP (UDP 67/68 — пулы адресов и DHCP Relay)
+                      </div>
+                      <p className="text-[11px] text-slate-400">
+                        Выдаёт IP-адреса напрямую в подсети или через маршрутизатор с ip helper-address.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onUpdateNode({
+                          ...node,
+                          services: {
+                            httpEnabled: node.services?.httpEnabled ?? true,
+                            serverBanner: node.services?.serverBanner || 'nginx/1.24.0',
+                            dnsEnabled: node.services?.dnsEnabled ?? true,
+                            dnsRecords: node.services?.dnsRecords ?? [],
+                            dhcpEnabled: !(node.services?.dhcpEnabled ?? false),
+                            dhcpPools: node.services?.dhcpPools ?? [],
+                            dhcpLeases: node.services?.dhcpLeases ?? [],
+                          },
+                        })
+                      }
+                      className={`px-3 py-1 rounded text-xs font-mono font-bold border cursor-pointer ${
+                        node.services?.dhcpEnabled
+                          ? 'bg-emerald-600 border-emerald-400 text-white'
+                          : 'bg-slate-950 border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      {node.services?.dhcpEnabled ? 'DHCP 67: ON' : 'DHCP 67: OFF'}
+                    </button>
+                  </div>
+
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (!isValidIpv4(newPoolNet) || !isValidIpv4(newPoolStart) || !isValidIpv4(newPoolEnd)) return;
+                      const currentPools = node.services?.dhcpPools || [];
+                      onUpdateNode({
+                        ...node,
+                        services: {
+                          httpEnabled: node.services?.httpEnabled ?? true,
+                          serverBanner: node.services?.serverBanner || 'nginx/1.24.0',
+                          dnsEnabled: node.services?.dnsEnabled ?? true,
+                          dnsRecords: node.services?.dnsRecords ?? [],
+                          dhcpEnabled: true,
+                          dhcpPools: [
+                            ...currentPools,
+                            {
+                              id: `srv-pool-${Date.now()}`,
+                              poolName: newPoolName.trim() || 'CORP_POOL',
+                              network: newPoolNet.trim(),
+                              mask: newPoolMask.trim() || '255.255.255.0',
+                              defaultRouter: newPoolGw.trim(),
+                              dnsServer: newPoolDns.trim(),
+                              startIp: newPoolStart.trim(),
+                              endIp: newPoolEnd.trim(),
+                            },
+                          ],
+                          dhcpLeases: node.services?.dhcpLeases ?? [],
+                        },
+                      });
+                    }}
+                    className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs"
+                  >
+                    <input
+                      type="text"
+                      value={newPoolName}
+                      onChange={(e) => setNewPoolName(e.target.value)}
+                      placeholder="Имя пула"
+                      className="px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                    />
+                    <input
+                      type="text"
+                      value={newPoolNet}
+                      onChange={(e) => setNewPoolNet(e.target.value)}
+                      placeholder="Сеть 192.168.1.0"
+                      className="px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                    />
+                    <input
+                      type="text"
+                      value={newPoolGw}
+                      onChange={(e) => setNewPoolGw(e.target.value)}
+                      placeholder="Шлюз 192.168.1.1"
+                      className="px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                    />
+                    <input
+                      type="text"
+                      value={newPoolDns}
+                      onChange={(e) => setNewPoolDns(e.target.value)}
+                      placeholder="DNS 192.168.2.100"
+                      className="px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                    />
+                    <input
+                      type="text"
+                      value={newPoolStart}
+                      onChange={(e) => setNewPoolStart(e.target.value)}
+                      placeholder="Старт .50"
+                      className="px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                    />
+                    <input
+                      type="text"
+                      value={newPoolEnd}
+                      onChange={(e) => setNewPoolEnd(e.target.value)}
+                      placeholder="Конец .150"
+                      className="px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                    />
+                    <input
+                      type="text"
+                      value={newPoolMask}
+                      onChange={(e) => setNewPoolMask(e.target.value)}
+                      placeholder="255.255.255.0"
+                      className="px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                    />
+                    <button
+                      type="submit"
+                      className="px-2.5 py-1 rounded bg-amber-600 hover:bg-amber-500 font-semibold text-white cursor-pointer"
+                    >
+                      + Пул DHCP
+                    </button>
+                  </form>
+
+                  <div className="space-y-1.5">
+                    {(node.services?.dhcpPools || []).map((pool) => {
+                      const poolLeases = (node.services?.dhcpLeases || []).filter(
+                        (l) => l.poolName === pool.poolName
+                      );
+                      return (
+                        <div
+                          key={pool.id}
+                          className="p-2 rounded bg-slate-950 border border-slate-800 flex items-center justify-between text-xs font-mono"
+                        >
+                          <div>
+                            <span className="font-bold text-amber-300">{pool.poolName}</span>
+                            <span className="text-slate-400 ml-2">
+                              {pool.network}/{maskToCidr(pool.mask || '255.255.255.0')} ({pool.startIp}–{pool.endIp}) · Аренд:{' '}
+                              <strong className="text-emerald-300">{poolLeases.length}</strong>
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateNode({
+                                ...node,
+                                services: {
+                                  ...node.services!,
+                                  dhcpPools: (node.services?.dhcpPools || []).filter(
+                                    (p) => p.id !== pool.id
+                                  ),
+                                },
+                              })
+                            }
+                            className="p-1 rounded text-slate-400 hover:text-red-400 cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>

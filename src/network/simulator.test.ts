@@ -12,11 +12,18 @@ import {
 import { createDeviceNode, TOPOLOGY_PRESETS } from './presets';
 import {
   computeSpanningTreeState,
+  findBestRoute,
   runDhcpDoraSimulation,
   runHttpBrowserSimulation,
   runPacketSimulation,
   runTracerouteSimulation,
+  syncConnectedRoutes,
 } from './simulator';
+import {
+  computeDijkstraSpfRoutesForRouter,
+  computeOspfNeighborsForRouter,
+  synthesizeOspfHelloSteps,
+} from './ospfEngine';
 import { autocompleteIosCommand, executeIosCommand } from './cliParser';
 import {
   addHardwarePortToNode,
@@ -49,6 +56,7 @@ import {
   getConcurrentBroadcastWaveIndices,
   getProtocolCategory,
 } from './packetStreamEngine';
+import { runCoreDiagnosticsSuite } from './diagnosticsSuite';
 
 test('IPv4 and subnet math validates and calculates network addresses accurately', () => {
   assert.equal(isValidIpv4('192.168.1.10'), true);
@@ -786,3 +794,142 @@ test('Multi-Packet Stream Engine: generates multi-flow traffic (STP, ARP, ICMP, 
     assert.ok(diff.changeBadges.includes('NAT / PAT IP'));
   }
 });
+
+test('Stage 1 Dynamic L3 Routing: OSPFv2 Neighbor Table, Dijkstra SPF Cost (100Mbps/BW), automatic link failover, CLI router ospf 1, and OSPF_HELLO / OSPF_LSA packets', () => {
+  const wanPreset = JSON.parse(JSON.stringify(TOPOLOGY_PRESETS[2]));
+  const rtrBranch = wanPreset.nodes.find((n: { id: string }) => n.id === 'wan-rtr-1')!;
+  const rtrHq = wanPreset.nodes.find((n: { id: string }) => n.id === 'wan-rtr-2')!;
+
+  // Remove static routes so routing relies purely on OSPFv2 Dijkstra SPF
+  rtrBranch.routingTable = rtrBranch.routingTable.filter((r: { type: string }) => r.type !== 'S');
+  rtrHq.routingTable = rtrHq.routingTable.filter((r: { type: string }) => r.type !== 'S');
+
+  // 1. Verify OSPF Neighbor adjacency table (show ip ospf neighbor)
+  const neighbors = computeOspfNeighborsForRouter(rtrBranch, wanPreset.nodes, wanPreset.links);
+  assert.equal(
+    neighbors.length,
+    2,
+    'RTR-Branch forms 2 OSPF adjacencies with RTR-HQ (primary Gi0/0 and backup Fa0/1)'
+  );
+  assert.ok(neighbors.some((nb) => nb.localInterface === 'Gi0/0' && nb.interfaceCost === 1));
+  assert.ok(neighbors.some((nb) => nb.localInterface === 'Fa0/1' && nb.interfaceCost === 10));
+
+  // 2. Verify Dijkstra SPF selects Primary Fiber Gi0/0 (Cost = 1 + 1 = 2) over Backup Fa0/1 (Cost = 10 + 1 = 11)
+  const spfRoutes = computeDijkstraSpfRoutesForRouter(rtrBranch, wanPreset.nodes, wanPreset.links);
+  const routeToHqLan = spfRoutes.find((r) => r.network === '172.16.2.0')!;
+  assert.ok(routeToHqLan, 'OSPF SPF learns remote 172.16.2.0/24 subnet');
+  assert.equal(routeToHqLan.type, 'O');
+  assert.equal(routeToHqLan.administrativeDistance, 110);
+  assert.equal(routeToHqLan.nextHop, '10.0.0.2', 'Selects primary 1Gbps fiber next-hop 10.0.0.2');
+  assert.equal(routeToHqLan.interfaceName, 'Gi0/0');
+  assert.equal(routeToHqLan.metric, 2, 'Cumulative SPF cost is 1 (Gi0/0 transit) + 1 (HQ LAN) = 2');
+
+  // 3. Simulate cable/interface failure on primary Gi0/0 -> verify automatic SPF failover to Backup Fa0/1 (10.0.1.2, Cost=11)
+  const linksWithoutPrimary = wanPreset.links.filter((l: { id: string }) => l.id !== 'wlink-wan');
+  const failoverBest = findBestRoute(rtrBranch, '172.16.2.50', wanPreset.nodes, linksWithoutPrimary);
+  assert.ok(failoverBest, 'Router immediately finds backup OSPF route after primary cable cut');
+  assert.equal(failoverBest?.type, 'O');
+  assert.equal(
+    failoverBest?.nextHop,
+    '10.0.1.2',
+    'OSPF automatically reconverges to backup link Fa0/1 (10.0.1.2)'
+  );
+  assert.equal(failoverBest?.interfaceName, 'Fa0/1');
+  assert.equal(failoverBest?.metric, 11, 'Backup cumulative SPF cost is 10 (Fa0/1 10Mbps) + 1 = 11');
+
+  // Verify end-to-end ICMP Ping from PC-Branch to SRV-HQ-DB succeeds over the backup OSPF link!
+  const pingOverBackup = runPacketSimulation(
+    wanPreset.nodes,
+    linksWithoutPrimary,
+    'wan-pc-1',
+    '172.16.2.50',
+    'ICMP'
+  );
+  assert.equal(
+    pingOverBackup.success,
+    true,
+    'ICMP Ping succeeds across backup link via OSPF reconvergence'
+  );
+
+  // 4. Verify OSPF Hello (224.0.0.5) & LSA packet stream synthesis
+  const ospfSteps = synthesizeOspfHelloSteps(wanPreset.nodes, wanPreset.links, 1, 0);
+  assert.ok(ospfSteps.some((s) => s.protocol === 'OSPF_HELLO'), 'Emits OSPF_HELLO multicast 224.0.0.5 steps');
+  assert.ok(ospfSteps.some((s) => s.protocol === 'OSPF_LSA'), 'Emits OSPF_LSA Link-State Update steps');
+  assert.equal(getProtocolCategory('OSPF_HELLO'), 'OSPF');
+  assert.equal(getProtocolCategory('OSPF_LSA'), 'OSPF');
+
+  // 5. Verify Cisco IOS CLI commands: router ospf 1, network <ip> <wildcard> area 0, show ip ospf neighbor, show ip route ospf
+  let cliRouter = createDeviceNode('router', 9, 200, 200, 'RTR-Core');
+  cliRouter.interfaces[0].ipAddress = '10.0.0.1';
+  cliRouter.interfaces[0].subnetMask = '255.255.255.252';
+  cliRouter = executeIosCommand('enable', cliRouter, [cliRouter], []).updatedNode;
+  cliRouter = executeIosCommand('conf t', cliRouter, [cliRouter], []).updatedNode;
+  cliRouter = executeIosCommand('router ospf 1', cliRouter, [cliRouter], []).updatedNode;
+  assert.equal(cliRouter.cli.mode, 'config-router');
+  assert.equal(cliRouter.ospfConfig?.enabled, true);
+
+  const netRes = executeIosCommand(
+    'network 10.0.0.0 0.0.0.3 area 0',
+    cliRouter,
+    [cliRouter],
+    []
+  );
+  cliRouter = netRes.updatedNode;
+  assert.equal(cliRouter.ospfConfig?.networks.length, 1);
+  assert.equal(cliRouter.ospfConfig?.networks[0].network, '10.0.0.0');
+  assert.equal(cliRouter.ospfConfig?.networks[0].wildcard, '0.0.0.3');
+
+  const showNbrCli = executeIosCommand(
+    'show ip ospf neighbor',
+    rtrBranch,
+    wanPreset.nodes,
+    wanPreset.links
+  );
+  assert.ok(
+    showNbrCli.outputLines.some((l) => l.includes('172.16.2.1') && l.includes('FULL')),
+    'CLI show ip ospf neighbor displays FULL adjacency with RTR-HQ (172.16.2.1)'
+  );
+
+  const showRouteOspfCli = executeIosCommand(
+    'show ip route ospf',
+    rtrBranch,
+    wanPreset.nodes,
+    wanPreset.links
+  );
+  assert.ok(
+    showRouteOspfCli.outputLines.some((l) => l.includes('O    172.16.2.0/255.255.255.0 [110/2]')),
+    'CLI show ip route ospf outputs OSPF route with [110/2] AD and cost'
+  );
+
+  // Synced routing table includes Connected + OSPF routes
+  const syncedRoutes = syncConnectedRoutes(rtrBranch, wanPreset.nodes, wanPreset.links);
+  assert.ok(syncedRoutes.some((r) => r.type === 'O' && r.network === '172.16.2.0'));
+});
+
+test('Multi-Preset Laboratory Suite: all 7 presets define valid testScenarios and Core Self-Diagnostics (L1-L7) passes 9/9 checks', () => {
+  assert.equal(TOPOLOGY_PRESETS.length, 7, 'Must provide 7 laboratory topology presets');
+
+  for (const preset of TOPOLOGY_PRESETS) {
+    assert.ok(preset.shortTag, `Preset ${preset.id} must have a shortTag`);
+    assert.ok(
+      preset.testScenarios && preset.testScenarios.length >= 3,
+      `Preset ${preset.id} must provide at least 3 built-in test scenarios`
+    );
+  }
+
+  // Execute the full L1-L7 Core Self-Diagnostics Suite across all 7 presets
+  const report = runCoreDiagnosticsSuite();
+  for (const check of report.results) {
+    assert.equal(
+      check.passed,
+      true,
+      `Core diagnostic check [${check.id}] (${check.title}) failed: ${check.detail}`
+    );
+  }
+  assert.equal(report.totalChecks, 9);
+  assert.equal(report.passedChecks, 9);
+  assert.equal(report.allPassed, true);
+});
+
+
+

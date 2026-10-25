@@ -6,14 +6,24 @@ import {
   NetworkNode,
   SimulationStep,
 } from './types';
-import { isValidIpv4, isValidSubnetMask } from './ipMath';
+import { isValidIpv4, isValidSubnetMask, maskToCidr } from './ipMath';
 import { getDeviceVlanDatabase, upsertDeviceVlan } from './hardwareChassis';
+import {
+  addOspfNetworkStatementToRouter,
+  calculateOspfInterfaceCost,
+  computeOspfNeighborsForRouter,
+  electOspfRouterId,
+  getDefaultOspfConfig,
+  getInterfaceBandwidthMbps,
+  synthesizeOspfHelloSteps,
+} from './ospfEngine';
 import {
   computeSpanningTreeState,
   runDhcpDoraSimulation,
   runHttpBrowserSimulation,
   runPacketSimulation,
   runTracerouteSimulation,
+  syncAllRoutersRoutingTables,
   syncConnectedRoutes,
 } from './simulator';
 
@@ -54,6 +64,8 @@ export function getCliPrompt(node: NetworkNode): string {
       return node.cli.selectedSubinterfaceVlan
         ? `${node.name}(config-subif)#`
         : `${node.name}(config-if)#`;
+    case 'config-router':
+      return `${node.name}(config-router)#`;
     default:
       return `${node.name}>`;
   }
@@ -86,6 +98,8 @@ export function autocompleteIosCommand(
     'nslookup ',
     'curl http://app.corp.local',
     'show ip interface brief',
+    'show ip ospf neighbor',
+    'show ip protocols',
     'show spanning-tree',
     'show ip nat translations',
     'show access-lists',
@@ -98,6 +112,8 @@ export function autocompleteIosCommand(
     'configure terminal',
     'show ip interface brief',
     'show ip route',
+    'show ip ospf neighbor',
+    'show ip protocols',
     'show ip dhcp binding',
     'show ip nat translations',
     'show access-lists',
@@ -119,12 +135,16 @@ export function autocompleteIosCommand(
 
   const configCandidates = [
     ...allPortCandidates.map((p) => `interface ${p}`),
+    'router ospf 1',
+    'router rip',
     'hostname ',
     'ip route ',
     'ip default-gateway ',
     'access-list 100 deny icmp any any',
     'access-list 100 permit ip any any',
     'spanning-tree vlan 1 priority ',
+    'do show ip ospf neighbor',
+    'do show ip route',
     'do show ip interface brief',
     'do write memory',
     'exit',
@@ -135,6 +155,7 @@ export function autocompleteIosCommand(
     'encapsulation dot1Q ',
     'ip address ',
     'ip address dhcp',
+    'ip ospf cost ',
     'ip helper-address ',
     'ip nat inside',
     'ip nat outside',
@@ -149,6 +170,20 @@ export function autocompleteIosCommand(
     'end',
   ];
 
+  const configRouterCandidates = [
+    'network 10.0.0.0 0.0.0.3 area 0',
+    'network 172.16.1.0 0.0.0.255 area 0',
+    'network 172.16.2.0 0.0.0.255 area 0',
+    'network 192.168.1.0 0.0.0.255 area 0',
+    'passive-interface ',
+    'router-id ',
+    'version 2',
+    'do show ip ospf neighbor',
+    'do show ip route',
+    'exit',
+    'end',
+  ];
+
   const pool =
     node.cli.mode === 'user'
       ? userCandidates
@@ -156,6 +191,8 @@ export function autocompleteIosCommand(
       ? privCandidates
       : node.cli.mode === 'config'
       ? configCandidates
+      : node.cli.mode === 'config-router'
+      ? configRouterCandidates
       : configIfCandidates;
 
   if (!trimmedLeft) {
@@ -170,6 +207,11 @@ export function autocompleteIosCommand(
     'conf t': 'configure terminal',
     'sh ip int': 'show ip interface brief',
     'sh ip int b': 'show ip interface brief',
+    'sh ip ospf': 'show ip ospf neighbor',
+    'sh ip ospf n': 'show ip ospf neighbor',
+    'sh ip ospf nei': 'show ip ospf neighbor',
+    'sh ip proto': 'show ip protocols',
+    'sh ip ro': 'show ip route',
     'sh run': 'show running-config',
     'sh mac': 'show mac address-table',
     'sh vlan': 'show vlan brief',
@@ -272,6 +314,9 @@ export function executeIosCommand(
       '  spanning-tree vlan 1 priority <0-61440>      — Приоритет STP 802.1D (выбор Root Bridge)',
       '  switchport mode access|trunk                 — Режим порта коммутатора (L2)',
       '  ip route <NET> <MASK> <NEXT_HOP>             — Статический маршрут L3',
+      '  router ospf 1 / network <IP> <WILD> area 0   — Динамическая маршрутизация OSPFv2 (SPF)',
+      '  ip ospf cost <1-65535>                       — Ручная стоимость линка OSPF на интерфейсе',
+      '  show ip ospf neighbor / show ip protocols    — Таблица соседей OSPF и параметры протокола',
       '  ping / traceroute / ipconfig /renew / curl   — Диагностика сети (ICMP, TTL, DHCP, HTTP)',
       '  show ip int brief / show ip route / show arp — Сводка интерфейсов, маршрутов и ARP',
       '  show spanning-tree (sh span)                 — Статус STP 802.1D (Root Bridge, FWD/BLK)',
@@ -300,14 +345,18 @@ export function executeIosCommand(
     node.cli.mode = 'priv';
     node.cli.selectedInterface = undefined;
     node.cli.selectedSubinterfaceVlan = undefined;
+    node.cli.selectedRoutingProtocol = undefined;
+    node.cli.selectedOspfProcessId = undefined;
     return { updatedNode: node, outputLines: output };
   }
 
   if (first === 'exit' || first === 'ex') {
-    if (node.cli.mode === 'config-if') {
+    if (node.cli.mode === 'config-if' || node.cli.mode === 'config-router') {
       node.cli.mode = 'config';
       node.cli.selectedInterface = undefined;
       node.cli.selectedSubinterfaceVlan = undefined;
+      node.cli.selectedRoutingProtocol = undefined;
+      node.cli.selectedOspfProcessId = undefined;
     } else if (node.cli.mode === 'config') {
       node.cli.mode = 'priv';
     } else if (node.cli.mode === 'priv') {
@@ -691,10 +740,114 @@ export function executeIosCommand(
       return { updatedNode: node, outputLines: output };
     }
 
-    if (sub1 === 'ip' && sub2.startsWith('ro')) {
-      const routes = syncConnectedRoutes(node);
+    // show ip ospf neighbor / show ip ospf interface
+    if (sub1 === 'ip' && sub2 === 'ospf') {
+      if (node.type !== 'router') {
+        output.push('% Протокол OSPFv2 работает только на маршрутизаторах L3.');
+        return { updatedNode: node, outputLines: output };
+      }
+      if (sub3.startsWith('int')) {
+        const ospfCfg = node.ospfConfig || getDefaultOspfConfig(node);
+        const rid = electOspfRouterId(node);
+        for (const iface of node.interfaces) {
+          if (!iface.ipAddress) continue;
+          const bw = getInterfaceBandwidthMbps(iface);
+          const cost = calculateOspfInterfaceCost(iface);
+          const passive = (ospfCfg.passiveInterfaces || []).includes(iface.shortName);
+          output.push(
+            `${iface.name} is ${iface.adminStatus === 'up' ? 'up, line protocol is up' : 'administratively down'}`,
+            `  Internet Address ${iface.ipAddress}/${maskToCidr(iface.subnetMask)}, Area 0`,
+            `  Process ID ${ospfCfg.processId}, Router ID ${rid}, Network Type POINT_TO_POINT, Cost: ${cost} (${bw} Mbps)`,
+            `  Timer intervals configured, Hello 10, Dead 40, Wait 40, Retransmit 5`,
+            passive
+              ? `  No Hellos (Passive interface)`
+              : `  Hello due in 00:00:07, Neighbor count is 1`
+          );
+        }
+        return { updatedNode: node, outputLines: output };
+      }
+
+      const neighbors = computeOspfNeighborsForRouter(node, allNodes, allLinks);
       output.push(
-        'Codes: C - connected, S - static',
+        'Neighbor ID     Pri   State           Dead Time   Address         Interface    Cost',
+        '--------------- ----- --------------- ----------- --------------- ------------ ------'
+      );
+      if (!node.ospfConfig?.enabled) {
+        output.push('  % OSPF process is not enabled on this router (use "router ospf 1" in config mode)');
+      } else if (neighbors.length === 0) {
+        output.push('  (Соседи OSPF не обнаружены — проверьте "network <ip> <wildcard> area 0" на обоих маршрутизаторах)');
+      } else {
+        for (const nb of neighbors) {
+          output.push(
+            `${nb.neighborRouterId.padEnd(15, ' ')} ${String(nb.priority).padEnd(
+              5,
+              ' '
+            )} ${nb.state.padEnd(15, ' ')} ${nb.deadTime.padEnd(11, ' ')} ${nb.neighborIp.padEnd(
+              15,
+              ' '
+            )} ${nb.localInterface.padEnd(12, ' ')} ${nb.interfaceCost}`
+          );
+        }
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // show ip protocols
+    if (sub1 === 'ip' && sub2.startsWith('prot')) {
+      if (node.type !== 'router') {
+        output.push('% Маршрутизирующие протоколы L3 активны только на маршрутизаторах.');
+        return { updatedNode: node, outputLines: output };
+      }
+      const ospfCfg = node.ospfConfig;
+      if (!ospfCfg || (!ospfCfg.enabled && !ospfCfg.ripEnabled)) {
+        output.push('*** IP Routing is NSF aware ***', '  (Ни один протокол динамической маршрутизации OSPF/RIP не включён)');
+        return { updatedNode: node, outputLines: output };
+      }
+      if (ospfCfg.enabled) {
+        const rid = electOspfRouterId(node);
+        output.push(
+          `Routing Protocol is "ospf ${ospfCfg.processId}"`,
+          `  Outgoing update filter list for all interfaces is not set`,
+          `  Incoming update filter list for all interfaces is not set`,
+          `  Router ID ${rid}`,
+          `  Number of areas in this router is 1. 1 normal 0 stub 0 nssa`,
+          `  Routing for Networks:`
+        );
+        for (const net of ospfCfg.networks) {
+          output.push(`    ${net.network} ${net.wildcard} area ${net.area}`);
+        }
+        if ((ospfCfg.passiveInterfaces || []).length > 0) {
+          output.push(`  Passive Interface(s):`);
+          for (const pIf of ospfCfg.passiveInterfaces) {
+            output.push(`    ${pIf}`);
+          }
+        }
+        output.push(`  Distance: (default is 110)`);
+      }
+      if (ospfCfg.ripEnabled) {
+        output.push(
+          `Routing Protocol is "rip"`,
+          `  Sending updates every 30 seconds, Hold down 180, flushed after 240`,
+          `  Default version control: send version 2, receive version 2`,
+          `  Distance: (default is 120)`
+        );
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (sub1 === 'ip' && sub2.startsWith('ro')) {
+      const nodesForSync = allNodes.map((n) => (n.id === node.id ? node : n));
+      const allRoutes = syncConnectedRoutes(node, nodesForSync, allLinks);
+      const filterOspfOnly = sub3 === 'ospf';
+      const filterRipOnly = sub3 === 'rip';
+      const routes = filterOspfOnly
+        ? allRoutes.filter((r) => r.type === 'O')
+        : filterRipOnly
+        ? allRoutes.filter((r) => r.type === 'R')
+        : allRoutes;
+
+      output.push(
+        'Codes: C - connected, S - static, O - OSPF, R - RIPv2',
         node.defaultGateway ? `Default Gateway is ${node.defaultGateway}` : 'Gateway of last resort is not set',
         ''
       );
@@ -702,11 +855,28 @@ export function executeIosCommand(
         output.push('  (Таблица маршрутизации пуста)');
       } else {
         for (const r of routes) {
-          output.push(
-            `${r.type}    ${r.network}/${r.mask} is ${
-              r.type === 'C' ? 'directly connected' : `via ${r.nextHop}`
-            }, ${r.interfaceName}`
-          );
+          if (r.type === 'C') {
+            output.push(
+              `C    ${r.network}/${r.mask} is directly connected, ${r.interfaceName}`
+            );
+          } else if (r.type === 'S') {
+            output.push(
+              `S    ${r.network}/${r.mask} [1/0] via ${r.nextHop}, ${r.interfaceName}`
+            );
+          } else if (r.type === 'O') {
+            const ad = r.administrativeDistance ?? 110;
+            const cost = r.metric ?? 1;
+            const areaTag = r.ospfArea !== undefined ? `, Area ${r.ospfArea}` : '';
+            output.push(
+              `O    ${r.network}/${r.mask} [${ad}/${cost}] via ${r.nextHop}, 00:01:12, ${r.interfaceName}${areaTag}`
+            );
+          } else if (r.type === 'R') {
+            const ad = r.administrativeDistance ?? 120;
+            const hops = r.metric ?? 1;
+            output.push(
+              `R    ${r.network}/${r.mask} [${ad}/${hops}] via ${r.nextHop}, 00:00:18, ${r.interfaceName}`
+            );
+          }
         }
       }
       return { updatedNode: node, outputLines: output };
@@ -818,6 +988,9 @@ export function executeIosCommand(
         if (iface.natRole && iface.natRole !== 'none') {
           output.push(` ip nat ${iface.natRole}`);
         }
+        if (iface.ospfCost !== undefined && iface.ospfCost > 0) {
+          output.push(` ip ospf cost ${iface.ospfCost}`);
+        }
         if (node.type === 'switch') {
           output.push(` switchport mode ${iface.vlanMode}`);
           if (iface.vlanMode === 'access') {
@@ -846,6 +1019,22 @@ export function executeIosCommand(
           }
         }
       }
+      if (node.ospfConfig?.enabled) {
+        output.push(`router ospf ${node.ospfConfig.processId}`);
+        if (node.ospfConfig.routerId) {
+          output.push(` router-id ${node.ospfConfig.routerId}`);
+        }
+        for (const pIf of node.ospfConfig.passiveInterfaces || []) {
+          output.push(` passive-interface ${pIf}`);
+        }
+        for (const net of node.ospfConfig.networks) {
+          output.push(` network ${net.network} ${net.wildcard} area ${net.area}`);
+        }
+        output.push('!');
+      }
+      if (node.ospfConfig?.ripEnabled) {
+        output.push(`router rip`, ` version 2`, ` no auto-summary`, '!');
+      }
       if (node.aclRules && node.aclRules.length > 0) {
         for (const r of node.aclRules) {
           output.push(
@@ -867,7 +1056,7 @@ export function executeIosCommand(
     }
 
     output.push(
-      '% Неизвестная команда show. Попробуйте: sh ip int b, sh span, sh ip nat tr, sh access-lists, sh ip route, sh arp, sh mac, sh run'
+      '% Неизвестная команда show. Попробуйте: sh ip int b, sh ip ospf neighbor, sh ip route, sh span, sh ip nat tr, sh access-lists, sh arp, sh mac, sh run'
     );
     return { updatedNode: node, outputLines: output };
   }
@@ -1066,9 +1255,225 @@ export function executeIosCommand(
         interfaceName: outIface,
         type: 'S',
       });
-      node.routingTable = syncConnectedRoutes(node);
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
       output.push(`[OK] Статический маршрут к ${net}/${mask} через ${nextHop} добавлен.`);
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+    }
+
+    // router ospf <id> / router rip / no router ospf / no router rip
+    if (first === 'no' && second === 'router' && (third === 'ospf' || third === 'rip')) {
+      if (node.type !== 'router') {
+        output.push('% Маршрутизирующие протоколы L3 доступны только на маршрутизаторах.');
+        return { updatedNode: node, outputLines: output };
+      }
+      const currentOspf = node.ospfConfig || getDefaultOspfConfig(node);
+      if (third === 'ospf') {
+        node.ospfConfig = { ...currentOspf, enabled: false };
+        output.push('[OK] Процесс динамической маршрутизации OSPF остановлен.');
+      } else {
+        node.ospfConfig = { ...currentOspf, ripEnabled: false };
+        output.push('[OK] Процесс маршрутизации RIPv2 остановлен.');
+      }
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+    }
+
+    if (first === 'router' && (second === 'ospf' || second === 'rip')) {
+      if (node.type !== 'router') {
+        output.push('% Команда "router ospf / rip" поддерживается только на маршрутизаторах L3.');
+        return { updatedNode: node, outputLines: output };
+      }
+      const currentOspf = node.ospfConfig || getDefaultOspfConfig(node);
+      if (second === 'ospf') {
+        const pid = Number(tokens[2]) || 1;
+        if (!Number.isInteger(pid) || pid < 1 || pid > 65535) {
+          output.push('% Использование: router ospf <1-65535>');
+          return { updatedNode: node, outputLines: output };
+        }
+        node.ospfConfig = {
+          ...currentOspf,
+          enabled: true,
+          processId: pid,
+          routerId: currentOspf.routerId || electOspfRouterId(node),
+        };
+        node.cli.mode = 'config-router';
+        node.cli.selectedRoutingProtocol = 'ospf';
+        node.cli.selectedOspfProcessId = pid;
+        const updatedAll = syncAllRoutersRoutingTables(
+          allNodes.map((n) => (n.id === node.id ? node : n)),
+          allLinks
+        );
+        const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+        return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+      } else {
+        node.ospfConfig = {
+          ...currentOspf,
+          ripEnabled: true,
+        };
+        node.cli.mode = 'config-router';
+        node.cli.selectedRoutingProtocol = 'rip';
+        const updatedAll = syncAllRoutersRoutingTables(
+          allNodes.map((n) => (n.id === node.id ? node : n)),
+          allLinks
+        );
+        const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+        output.push('[OK] Включён протокол RIPv2 (Distance-Vector, AD=120, метрика Hop Count).');
+        return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+      }
+    }
+  }
+
+  // Router OSPF / RIP sub-mode commands: Router(config-router)#
+  if (node.cli.mode === 'config-router') {
+    const ospfCfg = node.ospfConfig || getDefaultOspfConfig(node);
+
+    // Allow jumping straight to another interface from config-router
+    if (first === 'interface' || first === 'int') {
+      const ifaceQuery = tokens.slice(1).join('');
+      const found = findInterface(node, ifaceQuery);
+      if (found) {
+        node.cli.mode = 'config-if';
+        node.cli.selectedInterface = found.id;
+        node.cli.selectedSubinterfaceVlan = undefined;
+        node.cli.selectedRoutingProtocol = undefined;
+        return { updatedNode: node, outputLines: output };
+      }
+    }
+
+    if (first === 'router-id' && tokens[1]) {
+      if (!isValidIpv4(tokens[1])) {
+        output.push('% Использование: router-id <A.B.C.D>');
+        return { updatedNode: node, outputLines: output };
+      }
+      node.ospfConfig = { ...ospfCfg, routerId: tokens[1] };
+      output.push(`[OK] OSPF Router-ID установлен в ${tokens[1]}.`);
       return { updatedNode: node, outputLines: output };
+    }
+
+    if (first === 'version' && tokens[1] === '2') {
+      node.ospfConfig = { ...ospfCfg, ripEnabled: true };
+      output.push('[OK] RIPv2 (бесклассовая маршрутизация с передачей масок подсетей) активирован.');
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (first === 'passive-interface' && tokens[1]) {
+      const found = findInterface(node, tokens[1]);
+      const ifName = found ? found.shortName : tokens[1];
+      const nextPassive = Array.from(new Set([...(ospfCfg.passiveInterfaces || []), ifName]));
+      node.ospfConfig = { ...ospfCfg, passiveInterfaces: nextPassive };
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      output.push(`[OK] Интерфейс ${ifName} переведён в пассивный режим OSPF (рассылка Hello подавлена).`);
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+    }
+
+    if (first === 'no' && second === 'passive-interface' && tokens[2]) {
+      const found = findInterface(node, tokens[2]);
+      const ifName = found ? found.shortName : tokens[2];
+      const nextPassive = (ospfCfg.passiveInterfaces || []).filter(
+        (p) => p.toLowerCase() !== ifName.toLowerCase()
+      );
+      node.ospfConfig = { ...ospfCfg, passiveInterfaces: nextPassive };
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      output.push(`[OK] На интерфейсе ${ifName} возобновлена рассылка пакетов OSPF Hello.`);
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+    }
+
+    if (first === 'no' && second === 'network' && tokens[2]) {
+      const targetNet = tokens[2];
+      const nextNets = ospfCfg.networks.filter((n) => n.network !== targetNet);
+      node.ospfConfig = { ...ospfCfg, networks: nextNets };
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      output.push(`[OK] Сеть ${targetNet} удалена из анонсов OSPF.`);
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+    }
+
+    if (first === 'network') {
+      // Support both "network <ip> <wildcard> area <area>" and RIP "network <ip>"
+      if (node.cli.selectedRoutingProtocol === 'rip' && tokens.length === 2 && isValidIpv4(tokens[1])) {
+        const res = addOspfNetworkStatementToRouter(node, tokens[1], '0.0.0.255', 0);
+        const updatedRouter = {
+          ...res.updatedNode,
+          ospfConfig: {
+            ...(res.updatedNode.ospfConfig || ospfCfg),
+            ripEnabled: true,
+          },
+        };
+        const updatedAll = syncAllRoutersRoutingTables(
+          allNodes.map((n) => (n.id === updatedRouter.id ? updatedRouter : n)),
+          allLinks
+        );
+        const updatedSelf = updatedAll.find((n) => n.id === updatedRouter.id) || updatedRouter;
+        output.push(`[OK] Сеть ${tokens[1]} включена в рассылку RIPv2.`);
+        return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+      }
+
+      const netIp = tokens[1] || '';
+      const wildcard = tokens[2] || '0.0.0.255';
+      const areaTokenIdx = tokens.findIndex((t) => t.toLowerCase() === 'area');
+      const areaNum =
+        areaTokenIdx !== -1 && tokens[areaTokenIdx + 1] !== undefined
+          ? Number(tokens[areaTokenIdx + 1])
+          : 0;
+
+      const addRes = addOspfNetworkStatementToRouter(node, netIp, wildcard, areaNum);
+      if (addRes.error) {
+        output.push(`% ${addRes.error}. Использование: network <IP> <wildcard-mask> area <area-id>`);
+        return { updatedNode: node, outputLines: output };
+      }
+
+      const updatedNodeWithCli: NetworkNode = {
+        ...addRes.updatedNode,
+        cli: node.cli,
+      };
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === updatedNodeWithCli.id ? updatedNodeWithCli : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === updatedNodeWithCli.id) || updatedNodeWithCli;
+      const neighbors = computeOspfNeighborsForRouter(updatedSelf, updatedAll, allLinks);
+      const ospfSteps = synthesizeOspfHelloSteps(updatedAll, allLinks, 1, 0);
+
+      output.push(
+        `[OK] Анонс OSPF добавлен: network ${netIp} ${wildcard} area ${areaNum}.`
+      );
+      if (neighbors.length > 0) {
+        for (const nb of neighbors) {
+          output.push(
+            `%OSPF-5-ADJCHG: Process ${updatedSelf.ospfConfig?.processId || 1}, Nbr ${nb.neighborRouterId} (${nb.neighborRouterName}) on ${nb.localInterface} from LOADING to FULL, Loading Done`
+          );
+        }
+      }
+
+      return {
+        updatedNode: updatedSelf,
+        updatedAllNodes: updatedAll,
+        outputLines: output,
+        triggeredSimulationSteps: ospfSteps.length > 0 ? ospfSteps : undefined,
+        triggeredSummaryMessage:
+          ospfSteps.length > 0
+            ? `OSPFv2 Area ${areaNum}: рассылка Hello (224.0.0.5) и синхронизация LSDB / пересчёт дерева Дейкстры (SPF).`
+            : undefined,
+      };
     }
   }
 
@@ -1187,21 +1592,65 @@ export function executeIosCommand(
         iface.subnetMask = mask;
       }
       if (node.type === 'router') {
-        node.routingTable = syncConnectedRoutes(node);
+        const updatedAll = syncAllRoutersRoutingTables(
+          allNodes.map((n) => (n.id === node.id ? node : n)),
+          allLinks
+        );
+        const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+        return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
       }
       return { updatedNode: node, outputLines: output };
+    }
+
+    // ip ospf cost <1-65535> / no ip ospf cost
+    if (first === 'no' && second === 'ip' && third === 'ospf' && tokens[3]?.toLowerCase() === 'cost') {
+      iface.ospfCost = undefined;
+      const autoCost = calculateOspfInterfaceCost(iface);
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      output.push(`[OK] Ручная стоимость OSPF сброшена на ${iface.shortName} (автоматический Cost=${autoCost} по полосе пропускания).`);
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+    }
+
+    if (first === 'ip' && second === 'ospf' && third === 'cost') {
+      const costVal = Number(tokens[3]);
+      if (!Number.isInteger(costVal) || costVal < 1 || costVal > 65535) {
+        output.push('% Использование: ip ospf cost <1-65535>');
+        return { updatedNode: node, outputLines: output };
+      }
+      iface.ospfCost = costVal;
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      output.push(`[OK] Стоимость линка OSPF на интерфейсе ${iface.shortName} установлена в ${costVal} (пересчитано дерево Дейкстры SPF).`);
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
     }
 
     if (first === 'no' && second.startsWith('shut')) {
       iface.adminStatus = 'up';
       output.push(`%LINK-3-UPDOWN: Interface ${iface.name}, changed state to up`);
-      return { updatedNode: node, outputLines: output };
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
     }
 
     if (first.startsWith('shut')) {
       iface.adminStatus = 'down';
       output.push(`%LINK-5-CHANGED: Interface ${iface.name}, changed state to administratively down`);
-      return { updatedNode: node, outputLines: output };
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
     }
 
     if (first === 'switchport' || first === 'sw') {

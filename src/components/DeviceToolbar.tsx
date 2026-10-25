@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { CableType, DeviceType } from '../network/types';
+import { CableType, DeviceType, PresetTestScenario } from '../network/types';
+import { TOPOLOGY_PRESETS } from '../network/presets';
 import { WorkspaceTool } from './TopologyCanvas';
 import {
   MousePointer,
@@ -18,6 +19,9 @@ import {
   PanelLeftOpen,
   ChevronDown,
   ChevronRight,
+  CheckCircle2,
+  Play,
+  ShieldAlert,
 } from 'lucide-react';
 
 interface DeviceToolbarProps {
@@ -31,6 +35,8 @@ interface DeviceToolbarProps {
   onAddDevice: (type: DeviceType, switchPortCount?: number) => void;
   onAddZone: () => void;
   onLoadPreset: (presetId: string) => void;
+  onRunPresetTest?: (scenario: PresetTestScenario) => void;
+  onOpenCoreDiagnostics?: () => void;
   onClearCanvas: () => void;
   onExportJson: () => void;
   onImportJson: (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -47,11 +53,14 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
   onAddDevice,
   onAddZone,
   onLoadPreset,
+  onRunPresetTest,
+  onOpenCoreDiagnostics,
   onClearCanvas,
   onExportJson,
   onImportJson,
 }) => {
-  const [presetsOpen, setPresetsOpen] = useState(false);
+  const [presetsOpen, setPresetsOpen] = useState(true);
+  const activePreset = TOPOLOGY_PRESETS.find((p) => p.id === activePresetId) || TOPOLOGY_PRESETS[0];
 
   // Compact 56px Icon Rail Mode when collapsed
   if (isCollapsed) {
@@ -365,16 +374,79 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
           </div>
         </div>
 
-        {/* Section 3: Collapsible Lab Scenarios Accordion */}
-        <div className="pt-2.5 border-t border-slate-800">
+        {/* Section 3: Collapsible Lab Scenarios Accordion (All 7 Presets) */}
+        <div className="pt-2.5 border-t border-slate-800 space-y-2">
+          {onOpenCoreDiagnostics && (
+            <button
+              type="button"
+              data-testid="run-core-diagnostics-btn"
+              onClick={onOpenCoreDiagnostics}
+              className="w-full flex items-center justify-between px-2.5 py-2 rounded-md bg-emerald-950/80 hover:bg-emerald-800 border border-emerald-500/50 text-xs font-semibold text-emerald-200 hover:text-white transition-colors cursor-pointer"
+            >
+              <span className="flex items-center gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span>Автотест ядра (L1–L7)</span>
+              </span>
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-900/90 text-emerald-300">
+                9 тестов
+              </span>
+            </button>
+          )}
+
+          {/* Active Preset 1-Click Feature Test Scenarios */}
+          {activePreset && activePreset.testScenarios && activePreset.testScenarios.length > 0 && onRunPresetTest && (
+            <div className="p-2 rounded-md bg-slate-950/90 border border-sky-500/30 space-y-1.5">
+              <div className="flex items-center justify-between text-[11px] font-semibold text-sky-300">
+                <span>Тесты стенда ({activePreset.testScenarios.length})</span>
+                <span className="text-[9px] font-mono text-slate-400">1-клик запуск</span>
+              </div>
+              <div className="space-y-1">
+                {activePreset.testScenarios.map((sc) => (
+                  <button
+                    key={sc.id}
+                    type="button"
+                    data-testid={`preset-test-btn-${sc.id}`}
+                    onClick={() => onRunPresetTest(sc)}
+                    className={`w-full text-left p-1.5 rounded border text-[11px] transition-colors cursor-pointer ${
+                      sc.expectedOutcome === 'blocked'
+                        ? 'bg-red-950/35 hover:bg-red-900/50 border-red-500/40 text-red-200'
+                        : 'bg-slate-900/90 hover:bg-slate-800 border-slate-800 text-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-1 font-medium">
+                      <span className="truncate">{sc.title}</span>
+                      <span
+                        className={`px-1 py-0.2 rounded text-[9px] font-mono font-bold shrink-0 ${
+                          sc.expectedOutcome === 'blocked'
+                            ? 'bg-red-900/80 text-red-200'
+                            : sc.protocolBadge === 'OSPF'
+                            ? 'bg-lime-900/80 text-lime-300'
+                            : sc.protocolBadge === 'RIP'
+                            ? 'bg-amber-900/80 text-amber-300'
+                            : 'bg-sky-900/80 text-sky-300'
+                        }`}
+                      >
+                        {sc.protocolBadge}
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-slate-400 leading-tight mt-0.5 line-clamp-2">
+                      {sc.subtitle}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           <button
             type="button"
+            data-testid="toggle-presets-accordion-btn"
             onClick={() => setPresetsOpen((o) => !o)}
-            className="w-full flex items-center justify-between py-1 text-xs font-semibold text-slate-300 hover:text-white"
+            className="w-full flex items-center justify-between py-1 text-xs font-semibold text-slate-300 hover:text-white cursor-pointer"
           >
             <span className="flex items-center gap-1.5">
               <Sparkles className="w-3.5 h-3.5 text-sky-400" />
-              <span>Лабораторные стенды (3)</span>
+              <span>Лабораторные стенды ({TOPOLOGY_PRESETS.length})</span>
             </span>
             {presetsOpen ? (
               <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
@@ -384,42 +456,25 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
           </button>
 
           {presetsOpen && (
-            <div className="space-y-1.5 mt-2">
-              <button
-                onClick={() => onLoadPreset('routed-dual-lan')}
-                className={`w-full text-left px-2.5 py-1.5 rounded-md border text-xs transition-colors ${
-                  activePresetId === 'routed-dual-lan'
-                    ? 'bg-sky-500/15 border-sky-500/40 text-sky-200 font-medium'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:bg-slate-800'
-                }`}
-              >
-                <div>01. Две подсети и роутер</div>
-                <div className="text-[10px] text-slate-400 font-mono">ARP · L2 · L3</div>
-              </button>
-
-              <button
-                onClick={() => onLoadPreset('vlan-trunk-isolation')}
-                className={`w-full text-left px-2.5 py-1.5 rounded-md border text-xs transition-colors ${
-                  activePresetId === 'vlan-trunk-isolation'
-                    ? 'bg-sky-500/15 border-sky-500/40 text-sky-200 font-medium'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:bg-slate-800'
-                }`}
-              >
-                <div>02. VLAN 10/20 и Trunk</div>
-                <div className="text-[10px] text-slate-400 font-mono">802.1Q изоляция</div>
-              </button>
-
-              <button
-                onClick={() => onLoadPreset('static-wan-routing')}
-                className={`w-full text-left px-2.5 py-1.5 rounded-md border text-xs transition-colors ${
-                  activePresetId === 'static-wan-routing'
-                    ? 'bg-sky-500/15 border-sky-500/40 text-sky-200 font-medium'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:bg-slate-800'
-                }`}
-              >
-                <div>03. Статика WAN</div>
-                <div className="text-[10px] text-slate-400 font-mono">2 роутера · /30</div>
-              </button>
+            <div className="space-y-1.5 mt-1">
+              {TOPOLOGY_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  data-testid={`preset-btn-${preset.id}`}
+                  onClick={() => onLoadPreset(preset.id)}
+                  className={`w-full text-left px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${
+                    activePresetId === preset.id
+                      ? 'bg-sky-500/15 border-sky-500/40 text-sky-200 font-medium'
+                      : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:bg-slate-800'
+                  }`}
+                >
+                  <div className="leading-snug">{preset.name}</div>
+                  <div className="text-[10px] text-slate-400 font-mono mt-0.5">
+                    {preset.shortTag || `${preset.nodes.length} узлов`}
+                  </div>
+                </button>
+              ))}
             </div>
           )}
         </div>

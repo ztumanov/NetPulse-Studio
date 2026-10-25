@@ -1,4 +1,5 @@
 import { isValidIpv4 } from './ipMath';
+import { synthesizeOspfHelloSteps } from './ospfEngine';
 import {
   computeSpanningTreeState,
   getRouterLogicalInterfaces,
@@ -15,7 +16,14 @@ import {
   StepStatus,
 } from './types';
 
-export type ProtocolFilterCategory = 'ARP' | 'ICMP' | 'DHCP' | 'DNS' | 'HTTP' | 'STP';
+export type ProtocolFilterCategory =
+  | 'ARP'
+  | 'ICMP'
+  | 'DHCP'
+  | 'DNS'
+  | 'HTTP'
+  | 'STP'
+  | 'OSPF';
 
 export type SimulationExecutionMode = 'realtime' | 'simulation';
 
@@ -26,6 +34,7 @@ export const ALL_PROTOCOL_CATEGORIES: ProtocolFilterCategory[] = [
   'DNS',
   'HTTP',
   'STP',
+  'OSPF',
 ];
 
 export const SPEED_PRESETS: number[] = [0.1, 0.25, 0.5, 1, 2, 4];
@@ -98,6 +107,7 @@ export function createDefaultEnabledCategories(): Record<ProtocolFilterCategory,
     DNS: true,
     HTTP: true,
     STP: true,
+    OSPF: true,
   };
 }
 
@@ -107,6 +117,7 @@ export function getProtocolCategory(protocol: ProtocolType): ProtocolFilterCateg
   if (protocol.startsWith('DHCP')) return 'DHCP';
   if (protocol.startsWith('DNS')) return 'DNS';
   if (protocol === 'STP_BPDU') return 'STP';
+  if (protocol === 'OSPF_HELLO' || protocol === 'OSPF_LSA') return 'OSPF';
   return 'HTTP';
 }
 
@@ -209,6 +220,20 @@ export function getProtocolVisualMeta(
           'bg-indigo-500 border-indigo-200 text-white shadow-[0_0_11px_rgba(99,102,241,0.85)]',
         isDropped: false,
       };
+    case 'OSPF':
+      return {
+        category,
+        shortLabel: protocol === 'OSPF_LSA' ? 'LSA' : 'OSPF',
+        microGlyph: 'O',
+        fillHex: '#84cc16',
+        borderHex: '#ecfccb',
+        glowHex: 'rgba(132, 204, 22, 0.82)',
+        trailHex: '#a3e635',
+        badgeClass: 'bg-lime-500/20 text-lime-300 border-lime-500/45',
+        squareClass:
+          'bg-lime-500 border-lime-200 text-slate-950 shadow-[0_0_11px_rgba(132,204,22,0.88)]',
+        isDropped: false,
+      };
     case 'HTTP':
     default:
       return {
@@ -245,12 +270,13 @@ export function getConcurrentBroadcastWaveIndices(
 
   const result: number[] = [activeStepIndex];
 
-  // If this step is a broadcast flood or STP BPDU fan-out from the same node
+  // If this step is a broadcast flood or STP BPDU / OSPF Hello fan-out from the same node
   const isFloodCandidate =
     current.status === 'broadcast' ||
     current.protocol === 'ARP_REQUEST' ||
     current.protocol === 'DHCP_DISCOVER' ||
     current.protocol === 'STP_BPDU' ||
+    current.protocol === 'OSPF_HELLO' ||
     current.inboundPdu.l2.dstMac === 'FF:FF:FF:FF:FF:FF';
 
   if (isFloodCandidate) {
@@ -468,6 +494,10 @@ export function generateMultiFlowTrafficSteps(
   const stpSteps = synthesizeStpBpduSteps(workingNodes, links, nextStepIndex, 0);
   appendSteps(stpSteps);
 
+  // 1b. Add OSPFv2 Hello (224.0.0.5) & LSA Link-State Update packets between routers
+  const ospfSteps = synthesizeOspfHelloSteps(workingNodes, links, nextStepIndex, 0);
+  appendSteps(ospfSteps);
+
   // 2. Check if any PC in DHCP mode lacks an IP -> run DHCP DORA
   const dhcpClient = workingNodes.find(
     (n) =>
@@ -542,7 +572,7 @@ export function generateMultiFlowTrafficSteps(
   return {
     steps: combinedSteps,
     updatedNodes: workingNodes,
-    summaryMessage: `Прямой эфир (Multi-Flow): сгенерировано ${combinedSteps.length} пакетов (STP BPDU, ARP, ICMP, DNS, HTTP).`,
+    summaryMessage: `Прямой эфир (Multi-Flow): сгенерировано ${combinedSteps.length} пакетов (OSPF Hello/LSA, STP BPDU, ARP, ICMP, DNS, HTTP).`,
   };
 }
 
@@ -561,6 +591,7 @@ export function countStepsByProtocolCategory(steps: SimulationStep[]): {
     DNS: 0,
     HTTP: 0,
     STP: 0,
+    OSPF: 0,
   };
   let droppedCount = 0;
 

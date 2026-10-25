@@ -6,6 +6,7 @@ import {
   NetworkLink,
   NetworkNode,
   NetworkZone,
+  PresetTestScenario,
   SimulationStep,
   TracerouteHop,
   ZoneColor,
@@ -17,7 +18,13 @@ import {
   runHttpBrowserSimulation,
   runPacketSimulation,
   runTracerouteSimulation,
+  syncAllRoutersRoutingTables,
 } from './network/simulator';
+import { synthesizeOspfHelloSteps } from './network/ospfEngine';
+import {
+  CoreDiagnosticsReport,
+  runCoreDiagnosticsSuite,
+} from './network/diagnosticsSuite';
 import {
   PacketFilterOptions,
   ProtocolFilterCategory,
@@ -31,12 +38,11 @@ import { isValidIpv4 } from './network/ipMath';
 import { closeChassisWindow, openChassisWindow } from './network/hardwareChassis';
 import { DeviceToolbar } from './components/DeviceToolbar';
 import { TopologyCanvas, WorkspaceTool } from './components/TopologyCanvas';
-import { DeviceInspectorPanel } from './components/DeviceInspectorPanel';
 import { SimulationTimelineBar } from './components/SimulationTimelineBar';
 import { PduInspectorModal } from './components/PduInspectorModal';
 import { FloatingCliWindow } from './components/FloatingCliWindow';
 import { FloatingPcMonitor } from './components/FloatingPcMonitor';
-import { Play } from 'lucide-react';
+import { CheckCircle2, Play, RefreshCw, X } from 'lucide-react';
 
 const STORAGE_KEY = 'netpulse_studio_topology_v4';
 
@@ -98,7 +104,6 @@ export default function App() {
 
   // Collapsible Workspace Panel States
   const [isLeftCollapsed, setIsLeftCollapsed] = useState<boolean>(false);
-  const [isRightCollapsed, setIsRightCollapsed] = useState<boolean>(false);
   const [isBottomLogExpanded, setIsBottomLogExpanded] = useState<boolean>(false);
 
   // Floating 1U Hardware Switch Windows (Multi-Window Rack), Switch Web GUI, PC Monitor & Multi-Tab CLI Window States
@@ -162,9 +167,10 @@ export default function App() {
     searchQuery: '',
   }));
   const [summaryMessage, setSummaryMessage] = useState<string>(
-    'Стенд готов. Доступны протоколы L2–L7: ARP, VLAN, STP, ICMP Ping, Traceroute, DHCP, DNS и HTTP.'
+    'Стенд готов. Доступны протоколы L2–L7: ARP, VLAN, STP, OSPF, RIPv2, ICMP Ping, Traceroute, DHCP, DNS и HTTP.'
   );
   const [inspectedStep, setInspectedStep] = useState<SimulationStep | null>(null);
+  const [diagnosticsReport, setDiagnosticsReport] = useState<CoreDiagnosticsReport | null>(null);
 
   // Save topology to localStorage
   useEffect(() => {
@@ -253,9 +259,8 @@ export default function App() {
     setNodes((prev) => [...prev, newNode]);
     setSelectedNodeId(newNode.id);
     setSelectedZoneId(null);
-    setIsRightCollapsed(false);
     setActiveTool('select');
-    setSummaryMessage(`Добавлено устройство ${newNode.name} (${newNode.interfaces.length} портов). Настройте порты или подключите кабель.`);
+    setSummaryMessage(`Добавлено устройство ${newNode.name} (${newNode.interfaces.length} портов). Настройте порты в плавающем окне или подключите кабель.`);
   };
 
   const handleAddZone = () => {
@@ -275,9 +280,8 @@ export default function App() {
     setZones((prev) => [...prev, newZone]);
     setSelectedNodeId(null);
     setSelectedZoneId(newZone.id);
-    setIsRightCollapsed(false);
     setActiveTool('select');
-    setSummaryMessage(`Добавлена визуальная зона «${newZone.title}». Перетащите заголовок или настройте подпись.`);
+    setSummaryMessage(`Добавлена визуальная зона «${newZone.title}». Перетащите заголовок или нажмите значок карандаша для настройки.`);
   };
 
   const handleMoveNode = (nodeId: string, x: number, y: number) => {
@@ -300,7 +304,10 @@ export default function App() {
   };
 
   const handleUpdateNode = (updatedNode: NetworkNode) => {
-    setNodes((prev) => prev.map((n) => (n.id === updatedNode.id ? updatedNode : n)));
+    setNodes((prev) => {
+      const next = prev.map((n) => (n.id === updatedNode.id ? updatedNode : n));
+      return syncAllRoutersRoutingTables(next, links);
+    });
   };
 
   const handleCreateLink = (
@@ -318,19 +325,27 @@ export default function App() {
       targetPortId,
       cableType,
     };
-    setLinks((prev) => [...prev, newLink]);
+    const nextLinks = [...links, newLink];
+    setLinks(nextLinks);
+    setNodes((prev) => syncAllRoutersRoutingTables(prev, nextLinks));
     setActiveTool('select');
     const srcNode = nodes.find((n) => n.id === sourceNodeId);
     const dstNode = nodes.find((n) => n.id === targetNodeId);
     setSummaryMessage(
-      `Подключён патч-корд (${cableType}) между ${srcNode?.name || ''} и ${dstNode?.name || ''}.`
+      `Подключён патч-корд (${cableType}) между ${srcNode?.name || ''} и ${dstNode?.name || ''} (OSPF SPF пересчитан).`
     );
   };
 
   const handleDeleteNode = (nodeId: string) => {
-    setNodes((prev) => prev.filter((n) => n.id !== nodeId));
-    setLinks((prev) =>
-      prev.filter((l) => l.sourceNodeId !== nodeId && l.targetNodeId !== nodeId)
+    const nextLinks = links.filter(
+      (l) => l.sourceNodeId !== nodeId && l.targetNodeId !== nodeId
+    );
+    setLinks(nextLinks);
+    setNodes((prev) =>
+      syncAllRoutersRoutingTables(
+        prev.filter((n) => n.id !== nodeId),
+        nextLinks
+      )
     );
     if (selectedNodeId === nodeId) {
       setSelectedNodeId(null);
@@ -343,8 +358,11 @@ export default function App() {
   };
 
   const handleDeleteLink = (linkId: string) => {
-    setLinks((prev) => prev.filter((l) => l.id !== linkId));
+    const nextLinks = links.filter((l) => l.id !== linkId);
+    setLinks(nextLinks);
+    setNodes((prev) => syncAllRoutersRoutingTables(prev, nextLinks));
     setSimulationSteps([]);
+    setSummaryMessage('Кабель отключён — таблицы маршрутизации OSPF (SPF) автоматически перестроены.');
   };
 
   const handleLoadSimulationSteps = (steps: SimulationStep[], msg: string) => {
@@ -488,6 +506,57 @@ export default function App() {
     }
   };
 
+  const handleRunPresetTest = (scenario: PresetTestScenario) => {
+    setFilterOptions((prev) => ({
+      ...prev,
+      enabledCategories: createDefaultEnabledCategories(),
+      onlyDropped: false,
+    }));
+
+    if (scenario.actionType === 'ospf_hello') {
+      const synced = syncAllRoutersRoutingTables(nodes, links);
+      setNodes(synced);
+      const ospfSteps = synthesizeOspfHelloSteps(synced, links, 1, 0);
+      if (ospfSteps.length > 0) {
+        handleLoadSimulationSteps(
+          ospfSteps,
+          `Тест «${scenario.title}»: сгенерировано ${ospfSteps.length} пакетов OSPF Hello (224.0.0.5) и LSA.`
+        );
+      } else {
+        setSummaryMessage('На текущем стенде нет активных интерфейсов OSPF для рассылки Hello.');
+      }
+      return;
+    }
+
+    if (scenario.actionType === 'multi_flow') {
+      const batch = generateMultiFlowTrafficSteps(nodes, links, 1);
+      setNodes(batch.updatedNodes);
+      handleLoadSimulationSteps(batch.steps, batch.summaryMessage);
+      return;
+    }
+
+    const srcId = scenario.sourceNodeId || nodes.find((n) => n.type === 'pc')?.id || '';
+    const dst = scenario.targetIpOrHost || '';
+
+    if (scenario.actionType === 'ping' && srcId && dst) {
+      handleTriggerPingSimulation(srcId, dst, 'ICMP');
+    } else if (scenario.actionType === 'traceroute' && srcId && dst) {
+      handleTriggerTracerouteSimulation(srcId, dst);
+    } else if (scenario.actionType === 'dhcp' && srcId) {
+      handleTriggerDhcpSimulation(srcId);
+    } else if (scenario.actionType === 'http' && srcId && dst) {
+      handleTriggerHttpSimulation(srcId, dst);
+    }
+  };
+
+  const handleOpenCoreDiagnostics = () => {
+    const report = runCoreDiagnosticsSuite();
+    setDiagnosticsReport(report);
+    setSummaryMessage(
+      `Автотест ядра завершён: ${report.passedChecks}/${report.totalChecks} проверок L1–L7 успешно (${report.totalDurationMs} мс).`
+    );
+  };
+
   const handleClearCanvas = () => {
     setNodes([]);
     setLinks([]);
@@ -537,7 +606,6 @@ export default function App() {
     reader.readAsText(file);
   };
 
-  const selectedNode = nodes.find((n) => n.id === selectedNodeId) || null;
   const activeStep = simulationSteps[currentStepIndex] || null;
   const packetSquares = React.useMemo(
     () =>
@@ -653,6 +721,8 @@ export default function App() {
           onAddDevice={handleAddDevice}
           onAddZone={handleAddZone}
           onLoadPreset={handleLoadPreset}
+          onRunPresetTest={handleRunPresetTest}
+          onOpenCoreDiagnostics={handleOpenCoreDiagnostics}
           onClearCanvas={handleClearCanvas}
           onExportJson={handleExportJson}
           onImportJson={handleImportJson}
@@ -670,8 +740,6 @@ export default function App() {
             selectedCableType={selectedCableType}
             activeStep={activeStep}
             packetSquares={packetSquares}
-            isRightCollapsed={isRightCollapsed}
-            onExpandRightPanel={() => setIsRightCollapsed(false)}
             onSelectNode={setSelectedNodeId}
             onSelectZone={setSelectedZoneId}
             onSelectCableType={setSelectedCableType}
@@ -687,7 +755,12 @@ export default function App() {
             onMoveNode={handleMoveNode}
             onMoveZone={handleMoveZone}
             onUpdateNode={handleUpdateNode}
-            onUpdateLinks={setLinks}
+            onUpdateAllNodes={setNodes}
+            onLoadSimulationSteps={handleLoadSimulationSteps}
+            onUpdateLinks={(nextLinks) => {
+              setLinks(nextLinks);
+              setNodes((prev) => syncAllRoutersRoutingTables(prev, nextLinks));
+            }}
             onUpdateZone={handleUpdateZone}
             onCreateZone={(newZone) => setZones((prev) => [...prev, newZone])}
             onDeleteZone={handleDeleteZone}
@@ -785,38 +858,6 @@ export default function App() {
             }
           />
         </div>
-
-        {/* Right Inspector: Ports, L4-L7 Apps/Services, Cisco IOS CLI, ARP/DHCP/MAC State Tables & Subnet Zone Editor */}
-        <DeviceInspectorPanel
-          node={selectedNode}
-          selectedZone={zones.find((z) => z.id === selectedZoneId) || null}
-          allNodes={nodes}
-          allLinks={links}
-          allZones={zones}
-          isCollapsed={isRightCollapsed}
-          onToggleCollapse={() => setIsRightCollapsed((c) => !c)}
-          onUpdateNode={handleUpdateNode}
-          onUpdateAllNodes={setNodes}
-          onSelectZone={(zoneId) => {
-            if (zoneId) {
-              setSelectedNodeId(null);
-              setIsRightCollapsed(false);
-            }
-            setSelectedZoneId(zoneId);
-          }}
-          onUpdateZone={handleUpdateZone}
-          onDeleteZone={handleDeleteZone}
-          onAddZone={handleAddZone}
-          onTriggerPingSimulation={handleTriggerPingSimulation}
-          onTriggerDhcpSimulation={handleTriggerDhcpSimulation}
-          onTriggerTracerouteSimulation={handleTriggerTracerouteSimulation}
-          onTriggerHttpSimulation={handleTriggerHttpSimulation}
-          onLoadSimulationSteps={handleLoadSimulationSteps}
-          onOpenFloatingCli={handleOpenFloatingCli}
-          onOpenChassis={handleOpenChassis}
-          onOpenWebGui={(nodeId) => setWebGuiNodeId(nodeId)}
-          onOpenPcMonitor={handleOpenPcMonitor}
-        />
       </main>
 
       {/* Floating Workstation PC Monitor Windows */}
@@ -867,6 +908,99 @@ export default function App() {
         step={inspectedStep}
         onClose={() => setInspectedStep(null)}
       />
+
+      {/* Modal for Core & Multi-Preset L1-L7 Self-Diagnostics Report */}
+      {diagnosticsReport && (
+        <div
+          data-testid="core-diagnostics-modal"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-xs p-4"
+        >
+          <div className="w-full max-w-4xl max-h-[86vh] flex flex-col rounded-lg border border-slate-700 bg-slate-900 shadow-2xl overflow-hidden">
+            <div className="px-4 py-3 bg-slate-950 border-b border-slate-800 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+                <div>
+                  <h2 className="text-sm font-bold text-slate-100">
+                    Отчёт самопроверки сетевого ядра и всех 7 лабораторных стендов (L1–L7)
+                  </h2>
+                  <p className="text-xs text-slate-400 font-mono">
+                    Пройдено: {diagnosticsReport.passedChecks} из {diagnosticsReport.totalChecks} проверок · Время выполнения: {diagnosticsReport.totalDurationMs} мс
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleOpenCoreDiagnostics}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 text-xs font-medium text-white cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Перезапустить тесты</span>
+                </button>
+                <button
+                  type="button"
+                  data-testid="close-diagnostics-modal-btn"
+                  onClick={() => setDiagnosticsReport(null)}
+                  className="p-1.5 rounded text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
+                  aria-label="Закрыть окно диагностики"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-4 overflow-y-auto space-y-2">
+              {diagnosticsReport.results.map((item, idx) => (
+                <div
+                  key={item.id}
+                  data-testid={`diag-row-${item.id}`}
+                  className={`p-3 rounded-md border flex items-start justify-between gap-3 ${
+                    item.passed
+                      ? 'bg-slate-950/90 border-emerald-500/30'
+                      : 'bg-red-950/40 border-red-500/50'
+                  }`}
+                >
+                  <div className="space-y-1 min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-mono font-bold text-slate-400">
+                        #{idx + 1}
+                      </span>
+                      <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] font-mono font-bold text-sky-300">
+                        {item.layer}
+                      </span>
+                      <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] font-mono text-slate-300">
+                        {item.presetName}
+                      </span>
+                      <span className="text-xs font-semibold text-slate-100">
+                        {item.title}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-300 font-mono leading-relaxed">
+                      {item.detail}
+                    </p>
+                  </div>
+
+                  <div className="flex flex-col items-end gap-1 shrink-0">
+                    <span
+                      className={`px-2 py-0.5 rounded text-[11px] font-mono font-bold ${
+                        item.passed
+                          ? 'bg-emerald-950 border border-emerald-500/50 text-emerald-300'
+                          : 'bg-red-950 border border-red-500/50 text-red-300'
+                      }`}
+                    >
+                      {item.passed ? 'PASS [OK]' : 'FAIL [ERR]'}
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      {item.stepsGenerated} PDU · {item.durationMs} мс
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

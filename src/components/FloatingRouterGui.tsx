@@ -20,11 +20,30 @@ import {
 } from '../network/routerGuiHelpers';
 import {
   formatIpv4Input,
+  getNetworkAddress,
+  isValidIpv4,
+  isValidSubnetMask,
   maskToCidr,
   suggestSubnetMaskForIp,
 } from '../network/ipMath';
-import { syncConnectedRoutes } from '../network/simulator';
 import {
+  addOspfNetworkStatementToRouter,
+  calculateOspfInterfaceCost,
+  computeOspfNeighborsForRouter,
+  electOspfRouterId,
+  enableOspfAutoArea0OnRouter,
+  getDefaultOspfConfig,
+  getInterfaceBandwidthMbps,
+  subnetMaskToWildcard,
+  synthesizeOspfHelloSteps,
+} from '../network/ospfEngine';
+import {
+  getRouterLogicalInterfaces,
+  syncAllRoutersRoutingTables,
+  syncConnectedRoutes,
+} from '../network/simulator';
+import {
+  Activity,
   ArrowRightLeft,
   Cpu,
   Globe,
@@ -33,7 +52,9 @@ import {
   Minus,
   Plus,
   Power,
+  Radio,
   Route,
+  Share2,
   Shield,
   ShieldAlert,
   ShieldCheck,
@@ -51,6 +72,8 @@ interface FloatingRouterGuiProps {
   activeStep: SimulationStep | null;
   onSelectNode: (nodeId: string) => void;
   onUpdateNode: (updatedNode: NetworkNode) => void;
+  onUpdateAllNodes?: (updatedNodes: NetworkNode[]) => void;
+  onLoadSimulationSteps?: (steps: SimulationStep[], summaryMessage: string) => void;
   onOpenChassis: (nodeId: string) => void;
   onOpenFloatingCli: (nodeId: string) => void;
   onClose: () => void;
@@ -63,12 +86,14 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
   activeStep,
   onSelectNode,
   onUpdateNode,
+  onUpdateAllNodes,
+  onLoadSimulationSteps,
   onOpenChassis,
   onOpenFloatingCli,
   onClose,
 }) => {
   const [activeTab, setActiveTab] = useState<
-    'interfaces' | 'routes' | 'nat' | 'acl'
+    'interfaces' | 'routes' | 'ospf' | 'nat' | 'acl' | 'dhcp_arp'
   >('interfaces');
   const [position, setPosition] = useState<{ x: number; y: number }>({
     x: 240,
@@ -104,6 +129,21 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
   const [aclProto, setAclProto] = useState<AclProtocol>('ICMP');
   const [aclSrc, setAclSrc] = useState<string>('any');
   const [aclDst, setAclDst] = useState<string>('any');
+
+  // OSPF Network Statement creation form state
+  const [ospfNetIp, setOspfNetIp] = useState<string>('10.0.0.0');
+  const [ospfWildcard, setOspfWildcard] = useState<string>('0.0.0.3');
+  const [ospfArea, setOspfArea] = useState<string>('0');
+  const [ospfError, setOspfError] = useState<string | null>(null);
+
+  // Router DHCP Pool creation state
+  const [newPoolName, setNewPoolName] = useState<string>('LAN_POOL');
+  const [newPoolNet, setNewPoolNet] = useState<string>('192.168.1.0');
+  const [newPoolMask, setNewPoolMask] = useState<string>('255.255.255.0');
+  const [newPoolGw, setNewPoolGw] = useState<string>('192.168.1.1');
+  const [newPoolDns, setNewPoolDns] = useState<string>('192.168.2.100');
+  const [newPoolStart, setNewPoolStart] = useState<string>('192.168.1.50');
+  const [newPoolEnd, setNewPoolEnd] = useState<string>('192.168.1.150');
 
   useEffect(() => {
     if (!node.interfaces.some((i) => i.id === targetParentIfaceId)) {
@@ -161,8 +201,14 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
     allLinks,
     activeStep
   );
-  const routes = syncConnectedRoutes(node);
+  const routes = syncConnectedRoutes(node, allNodes, allLinks);
   const staticRoutesCount = routes.filter((r) => r.type === 'S').length;
+  const dynamicRoutesCount = routes.filter(
+    (r) => r.type === 'O' || r.type === 'R'
+  ).length;
+  const ospfConfig = node.ospfConfig || getDefaultOspfConfig(node);
+  const ospfRouterId = electOspfRouterId(node);
+  const ospfNeighbors = computeOspfNeighborsForRouter(node, allNodes, allLinks);
   const totalSubinterfaces = node.interfaces.reduce(
     (sum, i) => sum + (i.subinterfaces?.length || 0),
     0
@@ -348,6 +394,90 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
     setStatusToast(label);
   };
 
+  const commitRouterUpdateAndSyncAll = (updatedRouter: NetworkNode, triggerHello = false) => {
+    const mergedNodes = allNodes.map((n) =>
+      n.id === updatedRouter.id ? updatedRouter : n
+    );
+    const syncedAll = syncAllRoutersRoutingTables(mergedNodes, allLinks);
+    const syncedSelf = syncedAll.find((n) => n.id === updatedRouter.id) || updatedRouter;
+    if (onUpdateAllNodes) {
+      onUpdateAllNodes(syncedAll);
+    } else {
+      onUpdateNode(syncedSelf);
+    }
+    if (triggerHello && onLoadSimulationSteps) {
+      const steps = synthesizeOspfHelloSteps(syncedAll, allLinks, 1, 0);
+      if (steps.length > 0) {
+        onLoadSimulationSteps(
+          steps,
+          `OSPFv2 (Area 0): рассылка пакетов OSPF Hello (224.0.0.5) и синхронизация LSDB / расчёт кратчайшего пути Дейкстры (SPF).`
+        );
+      }
+    }
+  };
+
+  const handleAddOspfNetworkSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setOspfError(null);
+    const areaNum = Math.max(0, Math.floor(Number(ospfArea) || 0));
+    const { updatedNode, error } = addOspfNetworkStatementToRouter(
+      node,
+      ospfNetIp,
+      ospfWildcard,
+      areaNum
+    );
+    if (error) {
+      setOspfError(error);
+      return;
+    }
+    commitRouterUpdateAndSyncAll(updatedNode, true);
+    setStatusToast(
+      `Анонс OSPF добавлен: network ${ospfNetIp} ${ospfWildcard} area ${areaNum}`
+    );
+  };
+
+  const handleAutoConfigureOspfAllRouters = () => {
+    const updatedNodes = allNodes.map((n) =>
+      n.type === 'router' ? enableOspfAutoArea0OnRouter(n, 1) : n
+    );
+    const syncedAll = syncAllRoutersRoutingTables(updatedNodes, allLinks);
+    const syncedSelf = syncedAll.find((n) => n.id === node.id) || node;
+    if (onUpdateAllNodes) {
+      onUpdateAllNodes(syncedAll);
+    } else {
+      onUpdateNode(syncedSelf);
+    }
+    if (onLoadSimulationSteps) {
+      const steps = synthesizeOspfHelloSteps(syncedAll, allLinks, 1, 0);
+      if (steps.length > 0) {
+        onLoadSimulationSteps(
+          steps,
+          `OSPFv2 Area 0 включён на всех маршрутизаторах: установлены соседства FULL и выполнен расчёт дерева Дейкстры (SPF).`
+        );
+      }
+    }
+    setStatusToast(
+      'OSPFv2 Area 0 автоматически настроен на всех маршрутизаторах топологии (SPF пересчитан)'
+    );
+  };
+
+  const handleSendOspfHelloWave = () => {
+    const syncedAll = syncAllRoutersRoutingTables(allNodes, allLinks);
+    const steps = synthesizeOspfHelloSteps(syncedAll, allLinks, 1, 0);
+    if (onUpdateAllNodes) {
+      onUpdateAllNodes(syncedAll);
+    }
+    if (onLoadSimulationSteps && steps.length > 0) {
+      onLoadSimulationSteps(
+        steps,
+        `OSPFv2 Multicast 224.0.0.5: отправлено ${steps.length} пакетов OSPF Hello и LSA Update между маршрутизаторами.`
+      );
+      setStatusToast(`Отправлено ${steps.length} пакетов OSPF Hello / LSA (224.0.0.5)`);
+    } else {
+      setStatusToast('Включите OSPF на соседних маршрутизаторах для обмена Hello-пакетами');
+    }
+  };
+
   return (
     <div
       data-testid="floating-router-gui"
@@ -359,7 +489,7 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
       }}
       onClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
-      className="fixed z-46 w-[740px] max-w-[96vw] rounded-lg bg-slate-950/98 border-2 border-sky-500/65 shadow-[0_24px_60px_rgba(0,0,0,0.92)] select-none overflow-hidden flex flex-col"
+      className="fixed z-46 w-[820px] max-w-[96vw] rounded-lg bg-slate-950/98 border-2 border-sky-500/65 shadow-[0_24px_60px_rgba(0,0,0,0.92)] select-none overflow-hidden flex flex-col"
     >
       {/* Top Draggable Cisco ISR GUI Header */}
       <div
@@ -386,9 +516,15 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
             ))}
           </select>
 
-          <span className="hidden md:inline text-[10px] font-mono text-slate-500 truncate">
-            https://{node.name.toLowerCase()}.isr.local/l3-control
-          </span>
+          <input
+            type="text"
+            aria-label="Hostname маршрутизатора"
+            value={node.name}
+            onChange={(e) => onUpdateNode({ ...node, name: e.target.value })}
+            placeholder="Hostname..."
+            title="Переименовать маршрутизатор (hostname)"
+            className="w-28 bg-slate-950 border border-slate-700 rounded px-2 py-0.5 text-xs font-mono text-slate-100 focus:outline-none focus:border-sky-500"
+          />
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
@@ -434,23 +570,23 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
 
       {!isMinimized && (
         <>
-          {/* Navigation Tabs: Interfaces & 802.1Q | Static Routes | NAT / PAT | ACL Firewall */}
-          <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-1.5 bg-slate-900/80 border-b border-slate-800">
+          {/* Navigation Tabs: Interfaces & 802.1Q | Static Routes | OSPF/RIP | NAT/PAT | ACL | DHCP/ARP */}
+          <div className="flex flex-wrap items-center justify-between gap-1.5 px-3 py-1.5 bg-slate-900/80 border-b border-slate-800">
             <div className="flex flex-wrap items-center gap-1">
               <button
                 type="button"
                 data-testid="router-tab-interfaces"
                 onClick={() => setActiveTab('interfaces')}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer ${
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
                   activeTab === 'interfaces'
                     ? 'bg-sky-600 text-white shadow-xs'
                     : 'text-slate-300 hover:text-white hover:bg-slate-800'
                 }`}
               >
-                <SlidersHorizontal className="w-3.5 h-3.5" />
+                <SlidersHorizontal className="w-3 h-3" />
                 <span>
                   Порты и 802.1Q ({node.interfaces.length}
-                  {totalSubinterfaces > 0 ? ` + ${totalSubinterfaces} dot1Q` : ''})
+                  {totalSubinterfaces > 0 ? `+${totalSubinterfaces}` : ''})
                 </span>
               </button>
 
@@ -458,42 +594,74 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                 type="button"
                 data-testid="router-tab-routes"
                 onClick={() => setActiveTab('routes')}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer ${
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
                   activeTab === 'routes'
                     ? 'bg-sky-600 text-white shadow-xs'
                     : 'text-slate-300 hover:text-white hover:bg-slate-800'
                 }`}
               >
-                <Route className="w-3.5 h-3.5" />
-                <span>Static Routes ({staticRoutesCount})</span>
+                <Route className="w-3 h-3" />
+                <span>Static ({staticRoutesCount})</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="router-tab-ospf"
+                onClick={() => setActiveTab('ospf')}
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                  activeTab === 'ospf'
+                    ? 'bg-lime-600 text-slate-950 font-semibold shadow-xs'
+                    : 'text-lime-300 hover:text-white hover:bg-slate-800'
+                }`}
+              >
+                <Share2 className="w-3 h-3" />
+                <span>
+                  OSPF / RIP ({ospfConfig.enabled ? `ON·${ospfNeighbors.length}` : dynamicRoutesCount > 0 ? `${dynamicRoutesCount}` : 'OFF'})
+                </span>
               </button>
 
               <button
                 type="button"
                 data-testid="router-tab-nat"
                 onClick={() => setActiveTab('nat')}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer ${
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
                   activeTab === 'nat'
                     ? 'bg-sky-600 text-white shadow-xs'
                     : 'text-slate-300 hover:text-white hover:bg-slate-800'
                 }`}
               >
-                <ArrowRightLeft className="w-3.5 h-3.5" />
-                <span>NAT / PAT ({node.natEnabled ? 'ON' : 'OFF'})</span>
+                <ArrowRightLeft className="w-3 h-3" />
+                <span>NAT ({node.natEnabled ? 'ON' : 'OFF'})</span>
               </button>
 
               <button
                 type="button"
                 data-testid="router-tab-acl"
                 onClick={() => setActiveTab('acl')}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer ${
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
                   activeTab === 'acl'
                     ? 'bg-sky-600 text-white shadow-xs'
                     : 'text-slate-300 hover:text-white hover:bg-slate-800'
                 }`}
               >
-                <Shield className="w-3.5 h-3.5" />
-                <span>ACL Firewall ({aclRules.length})</span>
+                <Shield className="w-3 h-3" />
+                <span>ACL ({aclRules.length})</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="router-tab-dhcp-arp"
+                onClick={() => setActiveTab('dhcp_arp')}
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                  activeTab === 'dhcp_arp'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-amber-300 hover:text-white hover:bg-slate-800'
+                }`}
+              >
+                <Activity className="w-3 h-3" />
+                <span>
+                  DHCP / ARP ({node.services?.dhcpPools?.length || 0}·{node.arpTable.length})
+                </span>
               </button>
             </div>
 
@@ -501,7 +669,7 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
               {statusToast && (
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-950/90 border border-emerald-500/50 text-[10px] font-mono text-emerald-300">
                   <ShieldCheck className="w-3 h-3 shrink-0" />
-                  <span className="truncate max-w-[230px]">{statusToast}</span>
+                  <span className="truncate max-w-[200px]">{statusToast}</span>
                 </span>
               )}
 
@@ -1008,22 +1176,22 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                   )}
                 </form>
 
-                {/* Active Routing Table (Connected + Static) */}
+                {/* Active Routing Table (Connected + Static + OSPF + RIP) */}
                 <div className="rounded-md border border-slate-800 overflow-hidden bg-slate-950">
                   <div className="px-3 py-2 bg-slate-900/95 border-b border-slate-800 flex items-center justify-between text-xs font-mono">
                     <span className="font-semibold text-slate-200">
                       Таблица маршрутизации L3 (show ip route)
                     </span>
                     <span className="text-[11px] text-slate-400">
-                      Всего записей: {routes.length} (C: {routes.filter((r) => r.type === 'C').length}, S: {staticRoutesCount})
+                      Всего: {routes.length} (C: {routes.filter((r) => r.type === 'C').length}, S: {staticRoutesCount}, O: {routes.filter((r) => r.type === 'O').length}, R: {routes.filter((r) => r.type === 'R').length})
                     </span>
                   </div>
                   <table className="w-full text-left border-collapse text-xs font-mono">
                     <thead>
                       <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
-                        <th className="py-1.5 px-2.5 w-16">Код</th>
+                        <th className="py-1.5 px-2.5 w-20">Код / AD</th>
                         <th className="py-1.5 px-2">Сеть / Префикс</th>
-                        <th className="py-1.5 px-2">Next-Hop / Статус</th>
+                        <th className="py-1.5 px-2">Next-Hop / SPF Путь</th>
                         <th className="py-1.5 px-2">Выходной порт</th>
                         <th className="py-1.5 px-2.5 w-16 text-right">Действие</th>
                       </tr>
@@ -1032,15 +1200,26 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                       {routes.map((rt) => (
                         <tr key={rt.id} className="hover:bg-slate-900/50">
                           <td className="py-1.5 px-2.5">
-                            <span
-                              className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
-                                rt.type === 'C'
-                                  ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
-                                  : 'bg-sky-950/80 border-sky-500/50 text-sky-300'
-                              }`}
-                            >
-                              {rt.type}
-                            </span>
+                            <div className="flex items-center gap-1">
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
+                                  rt.type === 'C'
+                                    ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
+                                    : rt.type === 'O'
+                                    ? 'bg-lime-950/80 border-lime-500/50 text-lime-300'
+                                    : rt.type === 'R'
+                                    ? 'bg-purple-950/80 border-purple-500/50 text-purple-300'
+                                    : 'bg-sky-950/80 border-sky-500/50 text-sky-300'
+                                }`}
+                              >
+                                {rt.type}
+                              </span>
+                              {rt.type !== 'C' && (
+                                <span className="text-[9.5px] text-slate-400">
+                                  [{rt.administrativeDistance ?? (rt.type === 'S' ? 1 : rt.type === 'O' ? 110 : 120)}/{rt.metric ?? 0}]
+                                </span>
+                              )}
+                            </div>
                           </td>
                           <td className="py-1.5 px-2 text-slate-100 font-semibold">
                             {rt.network}/{maskToCidr(rt.mask)}
@@ -1049,7 +1228,14 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                             </span>
                           </td>
                           <td className="py-1.5 px-2 text-sky-300">
-                            {rt.type === 'C' ? 'Directly connected' : `via ${rt.nextHop}`}
+                            <div>
+                              {rt.type === 'C' ? 'Directly connected' : `via ${rt.nextHop}`}
+                            </div>
+                            {rt.spfPath && rt.spfPath.length > 0 && (
+                              <div className="text-[9.5px] text-lime-300/90 truncate">
+                                SPF: {rt.spfPath.join(' → ')}
+                              </div>
+                            )}
                           </td>
                           <td className="py-1.5 px-2 text-indigo-300">
                             {rt.interfaceName}
@@ -1065,11 +1251,442 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                                 <Trash2 className="w-3.5 h-3.5" />
                               </button>
                             ) : (
-                              <span className="text-[10px] text-slate-600">авто</span>
+                              <span className="text-[10px] text-slate-500">
+                                {rt.type === 'O' ? 'OSPF' : rt.type === 'R' ? 'RIPv2' : 'авто'}
+                              </span>
                             )}
                           </td>
                         </tr>
                       ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* TAB 2B: DYNAMIC ROUTING — OSPFv2 (SINGLE-AREA SPF DIJKSTRA) & RIPv2 */}
+            {activeTab === 'ospf' && (
+              <div className="space-y-3.5" data-testid="router-ospf-panel">
+                {/* Master OSPF / RIPv2 Header Card */}
+                <div className="p-3 rounded-md bg-slate-900/95 border border-lime-500/40 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-100 flex items-center gap-2">
+                      <Radio className="w-3.5 h-3.5 text-lime-400" />
+                      <span>Динамическая маршрутизация L3: OSPFv2 (Process {ospfConfig.processId}) & RIPv2</span>
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                          ospfConfig.enabled
+                            ? 'bg-lime-950 border-lime-500/60 text-lime-300'
+                            : 'bg-slate-950 border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        {ospfConfig.enabled ? `OSPF AREA 0 · RID ${ospfRouterId}` : 'OSPF ВЫКЛЮЧЕН'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-0.5">
+                      Алгоритм Дейкстры (SPF) вычисляет кратчайший путь с учётом пропускной способности (Cost = 100 Мбит/с / Bandwidth) и автоматически перестраивает таблицу при обрыве линка.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      data-testid="ospf-auto-all-btn"
+                      onClick={handleAutoConfigureOspfAllRouters}
+                      className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-lime-950 hover:bg-lime-800 border border-lime-500/60 text-xs font-mono font-semibold text-lime-200 transition-colors cursor-pointer"
+                    >
+                      <Sparkles className="w-3.5 h-3.5 text-lime-400" />
+                      <span>Авто-OSPF Area 0 (все роутеры)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid="ospf-send-hello-btn"
+                      onClick={handleSendOspfHelloWave}
+                      className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-emerald-950 hover:bg-emerald-800 border border-emerald-500/50 text-xs font-mono text-emerald-200 transition-colors cursor-pointer"
+                    >
+                      <Activity className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Пакеты OSPF Hello / LSA</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid="ospf-toggle-process-btn"
+                      onClick={() => {
+                        const nextEnabled = !ospfConfig.enabled;
+                        const updated: NetworkNode = {
+                          ...node,
+                          ospfConfig: {
+                            ...ospfConfig,
+                            enabled: nextEnabled,
+                            routerId: ospfConfig.routerId || ospfRouterId,
+                          },
+                        };
+                        commitRouterUpdateAndSyncAll(updated, nextEnabled);
+                        setStatusToast(
+                          nextEnabled
+                            ? `Процесс router ospf ${ospfConfig.processId} запущен`
+                            : 'Процесс OSPF остановлен'
+                        );
+                      }}
+                      className={`px-2.5 py-1.5 rounded text-xs font-medium transition-colors cursor-pointer ${
+                        ospfConfig.enabled
+                          ? 'bg-lime-600 hover:bg-lime-500 text-slate-950 font-semibold'
+                          : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
+                      }`}
+                    >
+                      {ospfConfig.enabled ? 'OSPF: ВКЛ' : 'Включить OSPF'}
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid="rip-toggle-process-btn"
+                      onClick={() => {
+                        const nextRip = !ospfConfig.ripEnabled;
+                        const updated: NetworkNode = {
+                          ...node,
+                          ospfConfig: {
+                            ...ospfConfig,
+                            ripEnabled: nextRip,
+                          },
+                        };
+                        commitRouterUpdateAndSyncAll(updated, false);
+                        setStatusToast(
+                          nextRip
+                            ? 'Протокол RIPv2 (AD 120, метрика Hop Count) включён'
+                            : 'Протокол RIPv2 выключен'
+                        );
+                      }}
+                      className={`px-2.5 py-1.5 rounded text-xs font-mono transition-colors cursor-pointer ${
+                        ospfConfig.ripEnabled
+                          ? 'bg-purple-600 hover:bg-purple-500 text-white font-semibold'
+                          : 'bg-slate-900 hover:bg-slate-800 text-purple-300 border border-purple-500/40'
+                      }`}
+                    >
+                      {ospfConfig.ripEnabled ? 'RIPv2: ВКЛ' : 'RIPv2'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* OSPF Network Statements Form (`network <ip> <wildcard> area 0`) */}
+                <form
+                  onSubmit={handleAddOspfNetworkSubmit}
+                  className="p-3 rounded-md bg-slate-900/90 border border-slate-800 space-y-2.5"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-100 font-mono">
+                      Анонсируемые сети OSPF (router ospf {ospfConfig.processId} → network &lt;ip&gt; &lt;wildcard&gt; area &lt;id&gt;)
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      Router-ID: <strong className="text-lime-300">{ospfRouterId}</strong> · AD: 110
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-12 gap-2 items-end">
+                    <div className="col-span-4">
+                      <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                        Сеть (Network IP)
+                      </label>
+                      <input
+                        type="text"
+                        aria-label="Сеть для анонса OSPF"
+                        value={ospfNetIp}
+                        onChange={(e) => setOspfNetIp(formatIpv4Input(e.target.value))}
+                        placeholder="10.0.0.0"
+                        className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-slate-100 focus:outline-none focus:border-lime-500"
+                      />
+                    </div>
+
+                    <div className="col-span-4">
+                      <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                        Обратная маска (Wildcard Mask)
+                      </label>
+                      <input
+                        type="text"
+                        aria-label="Обратная маска Wildcard OSPF"
+                        value={ospfWildcard}
+                        onChange={(e) => setOspfWildcard(formatIpv4Input(e.target.value))}
+                        placeholder="0.0.0.255"
+                        className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-lime-300 focus:outline-none focus:border-lime-500"
+                      />
+                    </div>
+
+                    <div className="col-span-4 flex items-center gap-1.5">
+                      <div className="flex-1">
+                        <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                          OSPF Area
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          aria-label="Номер зоны OSPF Area"
+                          value={ospfArea}
+                          onChange={(e) => setOspfArea(e.target.value)}
+                          placeholder="0"
+                          className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-slate-100 focus:outline-none focus:border-lime-500"
+                        />
+                      </div>
+                      <button
+                        type="submit"
+                        data-testid="add-ospf-network-btn"
+                        className="px-3 py-1.5 rounded bg-lime-600 hover:bg-lime-500 text-xs font-semibold text-slate-950 shrink-0 cursor-pointer"
+                      >
+                        + network
+                      </button>
+                    </div>
+                  </div>
+
+                  {ospfError && (
+                    <div className="text-xs font-mono text-red-400">{ospfError}</div>
+                  )}
+
+                  {/* Quick 1-Click Connected Interface Subnets */}
+                  <div className="pt-2 border-t border-slate-800/80 space-y-1.5">
+                    <div className="text-[10px] font-mono text-lime-300 flex items-center gap-1">
+                      <Sparkles className="w-3 h-3" />
+                      <span>Быстрое включение подключённых подсетей {node.name} в OSPF Area 0:</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {getRouterLogicalInterfaces(node)
+                        .filter((i) => isValidIpv4(i.ipAddress) && isValidSubnetMask(i.subnetMask))
+                        .map((iface) => {
+                          const net = getNetworkAddress(iface.ipAddress, iface.subnetMask);
+                          const wild = subnetMaskToWildcard(iface.subnetMask);
+                          return (
+                            <button
+                              key={`${iface.logicalName}-${net}`}
+                              type="button"
+                              onClick={() => {
+                                const res = addOspfNetworkStatementToRouter(node, net, wild, 0);
+                                if (!res.error) {
+                                  commitRouterUpdateAndSyncAll(res.updatedNode, true);
+                                  setStatusToast(
+                                    `Добавлен анонс OSPF: network ${net} ${wild} area 0 (${iface.logicalName})`
+                                  );
+                                }
+                              }}
+                              className="px-2 py-1 rounded bg-lime-950/80 hover:bg-lime-700 border border-lime-500/50 text-[11px] font-mono text-lime-200 hover:text-white transition-colors cursor-pointer"
+                            >
+                              + network {net} {wild} area 0 ({iface.logicalName})
+                            </button>
+                          );
+                        })}
+                    </div>
+                  </div>
+
+                  {/* Active OSPF Network Statements */}
+                  {ospfConfig.networks.length > 0 && (
+                    <div className="pt-2 border-t border-slate-800/80 flex flex-wrap gap-1.5">
+                      {ospfConfig.networks.map((net) => (
+                        <div
+                          key={net.id}
+                          className="inline-flex items-center gap-2 px-2.5 py-1 rounded bg-slate-950 border border-lime-500/40 text-xs font-mono text-lime-200"
+                        >
+                          <span>
+                            network <strong>{net.network}</strong> {net.wildcard} area {net.area}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const updated: NetworkNode = {
+                                ...node,
+                                ospfConfig: {
+                                  ...ospfConfig,
+                                  networks: ospfConfig.networks.filter((n) => n.id !== net.id),
+                                },
+                              };
+                              commitRouterUpdateAndSyncAll(updated, false);
+                              setStatusToast(`Сеть ${net.network} удалена из OSPF`);
+                            }}
+                            className="text-slate-400 hover:text-red-400 cursor-pointer"
+                            title="Удалить сеть из OSPF"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </form>
+
+                {/* OSPF Neighbor Table (`show ip ospf neighbor`) */}
+                <div className="rounded-md border border-slate-800 overflow-hidden bg-slate-950">
+                  <div className="px-3 py-2 bg-slate-900/95 border-b border-slate-800 flex items-center justify-between text-xs font-mono">
+                    <span className="font-semibold text-lime-300">
+                      Таблица соседей OSPF (show ip ospf neighbor) — {ospfNeighbors.length}
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      Multicast 224.0.0.5 · Hello 10s / Dead 40s
+                    </span>
+                  </div>
+
+                  {ospfNeighbors.length > 0 ? (
+                    <table
+                      data-testid="ospf-neighbor-table"
+                      className="w-full text-left border-collapse text-xs font-mono"
+                    >
+                      <thead>
+                        <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                          <th className="py-1.5 px-2.5">Neighbor ID</th>
+                          <th className="py-1.5 px-2">Узел</th>
+                          <th className="py-1.5 px-2">State</th>
+                          <th className="py-1.5 px-2">Dead Time</th>
+                          <th className="py-1.5 px-2">Neighbor IP</th>
+                          <th className="py-1.5 px-2">Лок. порт</th>
+                          <th className="py-1.5 px-2.5 text-right">Cost</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70">
+                        {ospfNeighbors.map((nb) => (
+                          <tr key={`${nb.neighborRouterId}-${nb.localInterface}`}>
+                            <td className="py-1.5 px-2.5 font-bold text-lime-300">
+                              {nb.neighborRouterId}
+                            </td>
+                            <td className="py-1.5 px-2 text-slate-200">
+                              {nb.neighborRouterName}
+                            </td>
+                            <td className="py-1.5 px-2">
+                              <span className="px-1.5 py-0.5 rounded bg-emerald-950 border border-emerald-500/50 text-[10px] font-bold text-emerald-300">
+                                {nb.state}
+                              </span>
+                            </td>
+                            <td className="py-1.5 px-2 text-slate-400">{nb.deadTime}</td>
+                            <td className="py-1.5 px-2 text-sky-300">{nb.neighborIp}</td>
+                            <td className="py-1.5 px-2 text-indigo-300">
+                              {nb.localInterface}
+                            </td>
+                            <td className="py-1.5 px-2.5 text-right font-bold text-amber-300">
+                              {nb.interfaceCost}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <div className="p-3.5 text-center text-xs font-mono text-slate-400">
+                      Соседи OSPF ещё не установлены. Нажмите «Авто-OSPF Area 0 (все роутеры)» выше или добавьте общую транзитную подсеть на соседних маршрутизаторах.
+                    </div>
+                  )}
+                </div>
+
+                {/* Interface OSPF Cost (Cost = 100 Mbps / Bandwidth) & Passive-Interface Matrix */}
+                <div className="rounded-md border border-slate-800 overflow-hidden bg-slate-950">
+                  <div className="px-3 py-2 bg-slate-900/95 border-b border-slate-800 flex items-center justify-between text-xs font-mono">
+                    <span className="font-semibold text-slate-200">
+                      Метрики интерфейсов OSPF (ip ospf cost = 100 Мбит/с / Bandwidth)
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      Меньший Cost = приоритетный маршрут Дейкстры (SPF)
+                    </span>
+                  </div>
+                  <table className="w-full text-left border-collapse text-xs font-mono">
+                    <thead>
+                      <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                        <th className="py-1.5 px-2.5">Порт</th>
+                        <th className="py-1.5 px-2">IPv4 / Маска</th>
+                        <th className="py-1.5 px-2">Полоса (Bandwidth)</th>
+                        <th className="py-1.5 px-2">OSPF Cost (1..65535)</th>
+                        <th className="py-1.5 px-2.5 text-right">Режим Hello</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70">
+                      {node.interfaces.map((iface) => {
+                        const bw = getInterfaceBandwidthMbps(iface);
+                        const effectiveCost = calculateOspfInterfaceCost(iface);
+                        const isPassive = (ospfConfig.passiveInterfaces || []).includes(
+                          iface.shortName
+                        );
+                        return (
+                          <tr key={iface.id}>
+                            <td className="py-1.5 px-2.5 font-bold text-slate-100">
+                              {iface.shortName}
+                            </td>
+                            <td className="py-1.5 px-2 text-sky-300">
+                              {iface.ipAddress
+                                ? `${iface.ipAddress}/${maskToCidr(iface.subnetMask)}`
+                                : 'не назначен'}
+                            </td>
+                            <td className="py-1.5 px-2">
+                              <select
+                                aria-label={`Полоса пропускания интерфейса ${iface.shortName}`}
+                                value={bw}
+                                onChange={(e) => {
+                                  const nextBw = Number(e.target.value);
+                                  const nextIfaces = node.interfaces.map((i) =>
+                                    i.id === iface.id
+                                      ? { ...i, bandwidthMbps: nextBw, ospfCost: undefined }
+                                      : i
+                                  );
+                                  commitRouterUpdateAndSyncAll(
+                                    { ...node, interfaces: nextIfaces },
+                                    false
+                                  );
+                                  setStatusToast(
+                                    `${iface.shortName}: полоса ${nextBw} Мбит/с (OSPF Cost пересчитан)`
+                                  );
+                                }}
+                                className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px] text-slate-200"
+                              >
+                                <option value={1000}>1000 Mbps (Gi / Cost 1)</option>
+                                <option value={100}>100 Mbps (Fa / Cost 1)</option>
+                                <option value={10}>10 Mbps (Backup / Cost 10)</option>
+                                <option value={2}>2 Mbps (Serial WAN / Cost 50)</option>
+                              </select>
+                            </td>
+                            <td className="py-1.5 px-2">
+                              <input
+                                type="number"
+                                min={1}
+                                max={65535}
+                                aria-label={`OSPF Cost для ${iface.shortName}`}
+                                value={effectiveCost}
+                                onChange={(e) => {
+                                  const nextCost = Math.max(
+                                    1,
+                                    Math.min(65535, Number(e.target.value) || 1)
+                                  );
+                                  const nextIfaces = node.interfaces.map((i) =>
+                                    i.id === iface.id ? { ...i, ospfCost: nextCost } : i
+                                  );
+                                  commitRouterUpdateAndSyncAll(
+                                    { ...node, interfaces: nextIfaces },
+                                    false
+                                  );
+                                }}
+                                className="w-20 px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-xs text-amber-300 font-bold"
+                              />
+                            </td>
+                            <td className="py-1.5 px-2.5 text-right">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const currentPassive = ospfConfig.passiveInterfaces || [];
+                                  const nextPassive = isPassive
+                                    ? currentPassive.filter((p) => p !== iface.shortName)
+                                    : [...currentPassive, iface.shortName];
+                                  commitRouterUpdateAndSyncAll(
+                                    {
+                                      ...node,
+                                      ospfConfig: {
+                                        ...ospfConfig,
+                                        passiveInterfaces: nextPassive,
+                                      },
+                                    },
+                                    false
+                                  );
+                                }}
+                                className={`px-2 py-0.5 rounded text-[10px] border cursor-pointer ${
+                                  isPassive
+                                    ? 'bg-amber-950/80 border-amber-500/50 text-amber-300'
+                                    : 'bg-lime-950/80 border-lime-500/50 text-lime-300'
+                                }`}
+                              >
+                                {isPassive ? 'Passive (No Hello)' : 'Active (Hello 10s)'}
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -1494,6 +2111,275 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                   ) : (
                     <div className="p-4 text-center text-xs font-mono text-slate-500">
                       Список ACL пуст — весь транзитный трафик между подсетями разрешён (permit ip any any).
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 6: ROUTER DHCP SERVER POOLS & ARP TABLE */}
+            {activeTab === 'dhcp_arp' && (
+              <div className="space-y-3">
+                {/* Router DHCP Server Toggle & Pool Creation */}
+                <div className="p-3 rounded-md bg-slate-900/95 border border-slate-800 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-100">
+                        Сервер DHCP маршрутизатора (Cisco IOS DHCP Server — UDP 67/68)
+                      </div>
+                      <p className="text-[11px] text-slate-400">
+                        Выдаёт динамические IPv4-адреса, маску, шлюз и DNS клиентам в локальных VLAN по процессу DORA.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextDhcp = !node.services?.dhcpEnabled;
+                        onUpdateNode({
+                          ...node,
+                          services: {
+                            httpEnabled: node.services?.httpEnabled ?? false,
+                            serverBanner: node.services?.serverBanner ?? 'Cisco-IOS-HTTP/1.1',
+                            dnsEnabled: node.services?.dnsEnabled ?? false,
+                            dnsRecords: node.services?.dnsRecords ?? [],
+                            dhcpEnabled: nextDhcp,
+                            dhcpPools: node.services?.dhcpPools ?? [],
+                            dhcpLeases: node.services?.dhcpLeases ?? [],
+                          },
+                        });
+                        setStatusToast(
+                          nextDhcp
+                            ? 'Служба DHCP-сервера на маршрутизаторе ВКЛЮЧЕНА'
+                            : 'Служба DHCP-сервера на маршрутизаторе ВЫКЛЮЧЕНА'
+                        );
+                      }}
+                      className={`px-3 py-1 rounded text-xs font-mono font-bold border cursor-pointer ${
+                        node.services?.dhcpEnabled
+                          ? 'bg-emerald-600 border-emerald-400 text-white'
+                          : 'bg-slate-950 border-slate-700 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {node.services?.dhcpEnabled ? 'DHCP SERVER: ON' : 'DHCP SERVER: OFF'}
+                    </button>
+                  </div>
+
+                  {/* Add DHCP Pool Form */}
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (!isValidIpv4(newPoolNet) || !isValidIpv4(newPoolStart) || !isValidIpv4(newPoolEnd)) {
+                        setStatusToast('Проверьте корректность IPv4-адресов пула DHCP');
+                        return;
+                      }
+                      const currentPools = node.services?.dhcpPools || [];
+                      const nextPool = {
+                        id: `pool-${Date.now()}`,
+                        poolName: newPoolName.trim() || `POOL_${currentPools.length + 1}`,
+                        network: newPoolNet.trim(),
+                        mask: newPoolMask.trim() || '255.255.255.0',
+                        defaultRouter: newPoolGw.trim(),
+                        dnsServer: newPoolDns.trim(),
+                        startIp: newPoolStart.trim(),
+                        endIp: newPoolEnd.trim(),
+                      };
+                      onUpdateNode({
+                        ...node,
+                        services: {
+                          httpEnabled: node.services?.httpEnabled ?? false,
+                          serverBanner: node.services?.serverBanner ?? 'Cisco-IOS-HTTP/1.1',
+                          dnsEnabled: node.services?.dnsEnabled ?? false,
+                          dnsRecords: node.services?.dnsRecords ?? [],
+                          dhcpEnabled: true,
+                          dhcpPools: [...currentPools, nextPool],
+                          dhcpLeases: node.services?.dhcpLeases ?? [],
+                        },
+                      });
+                      setStatusToast(`Пул DHCP ${nextPool.poolName} (${nextPool.network}) добавлен`);
+                    }}
+                    className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-800 text-xs"
+                  >
+                    <div>
+                      <label className="block text-[10px] font-mono text-slate-400 mb-0.5">Имя пула</label>
+                      <input
+                        type="text"
+                        value={newPoolName}
+                        onChange={(e) => setNewPoolName(e.target.value)}
+                        className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-mono text-slate-400 mb-0.5">Сеть (Network)</label>
+                      <input
+                        type="text"
+                        value={newPoolNet}
+                        onChange={(e) => setNewPoolNet(e.target.value)}
+                        className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-mono text-slate-400 mb-0.5">Шлюз (Default Router)</label>
+                      <input
+                        type="text"
+                        value={newPoolGw}
+                        onChange={(e) => setNewPoolGw(e.target.value)}
+                        className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-mono text-slate-400 mb-0.5">DNS-сервер</label>
+                      <input
+                        type="text"
+                        value={newPoolDns}
+                        onChange={(e) => setNewPoolDns(e.target.value)}
+                        className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-mono text-slate-400 mb-0.5">Начальный IP</label>
+                      <input
+                        type="text"
+                        value={newPoolStart}
+                        onChange={(e) => setNewPoolStart(e.target.value)}
+                        className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-mono text-slate-400 mb-0.5">Конечный IP</label>
+                      <input
+                        type="text"
+                        value={newPoolEnd}
+                        onChange={(e) => setNewPoolEnd(e.target.value)}
+                        className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-mono text-slate-400 mb-0.5">Маска</label>
+                      <input
+                        type="text"
+                        value={newPoolMask}
+                        onChange={(e) => setNewPoolMask(e.target.value)}
+                        className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                      />
+                    </div>
+                    <div className="flex items-end">
+                      <button
+                        type="submit"
+                        className="w-full px-2.5 py-1.5 rounded bg-amber-600 hover:bg-amber-500 text-xs font-semibold text-white cursor-pointer"
+                      >
+                        + Добавить пул DHCP
+                      </button>
+                    </div>
+                  </form>
+
+                  {/* Existing DHCP Pools & Leases */}
+                  {(node.services?.dhcpPools || []).length > 0 ? (
+                    <div className="space-y-2 pt-1">
+                      {(node.services?.dhcpPools || []).map((pool) => {
+                        const poolLeases = (node.services?.dhcpLeases || []).filter(
+                          (l) => l.poolName === pool.poolName
+                        );
+                        return (
+                          <div
+                            key={pool.id}
+                            className="p-2.5 rounded bg-slate-950 border border-slate-800 space-y-1.5 text-xs font-mono"
+                          >
+                            <div className="flex items-center justify-between">
+                              <div>
+                                <span className="font-bold text-amber-300">{pool.poolName}</span>
+                                <span className="text-slate-400 ml-2">
+                                  {pool.network}/{maskToCidr(pool.mask || '255.255.255.0')} · Пул {pool.startIp}–{pool.endIp}
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  onUpdateNode({
+                                    ...node,
+                                    services: {
+                                      ...node.services!,
+                                      dhcpPools: (node.services?.dhcpPools || []).filter(
+                                        (p) => p.id !== pool.id
+                                      ),
+                                    },
+                                  });
+                                }}
+                                className="p-1 rounded text-slate-400 hover:text-red-400 cursor-pointer"
+                                title="Удалить пул DHCP"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                            <div className="text-[11px] text-slate-400">
+                              Шлюз: <span className="text-slate-200">{pool.defaultRouter || '—'}</span> · DNS:{' '}
+                              <span className="text-slate-200">{pool.dnsServer || '—'}</span> · Выдано аренд (Leases):{' '}
+                              <span className="text-emerald-300 font-bold">{poolLeases.length}</span>
+                            </div>
+                            {poolLeases.length > 0 && (
+                              <div className="pt-1 border-t border-slate-900 flex flex-wrap gap-1.5">
+                                {poolLeases.map((lease) => (
+                                  <span
+                                    key={lease.ipAddress}
+                                    className="px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-[10px] text-emerald-300"
+                                  >
+                                    {lease.hostname}: {lease.ipAddress} ({lease.macAddress})
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="text-xs font-mono text-slate-500">
+                      Пулы DHCP не созданы.
+                    </div>
+                  )}
+                </div>
+
+                {/* Router ARP Table (show ip arp) */}
+                <div className="rounded-md border border-slate-800 overflow-hidden bg-slate-950">
+                  <div className="px-3 py-2 bg-slate-900/95 border-b border-slate-800 flex items-center justify-between text-xs font-mono">
+                    <span className="font-semibold text-slate-200">
+                      Таблица ARP маршрутизатора (show ip arp) — {node.arpTable.length} записей
+                    </span>
+                    {node.arpTable.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onUpdateNode({ ...node, arpTable: [] });
+                          setStatusToast('Таблица ARP маршрутизатора очищена');
+                        }}
+                        className="text-[11px] text-red-300 hover:text-red-200 underline cursor-pointer"
+                      >
+                        Очистить ARP
+                      </button>
+                    )}
+                  </div>
+                  {node.arpTable.length > 0 ? (
+                    <table className="w-full text-left border-collapse text-xs font-mono">
+                      <thead>
+                        <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                          <th className="py-1.5 px-2.5">IPv4-адрес</th>
+                          <th className="py-1.5 px-2">MAC-адрес (Hardware)</th>
+                          <th className="py-1.5 px-2">Интерфейс</th>
+                          <th className="py-1.5 px-2.5">VLAN</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70">
+                        {node.arpTable.map((entry, i) => (
+                          <tr key={`${entry.ipAddress}-${i}`}>
+                            <td className="py-1.5 px-2.5 text-sky-300 font-semibold">{entry.ipAddress}</td>
+                            <td className="py-1.5 px-2 text-emerald-300">{entry.macAddress}</td>
+                            <td className="py-1.5 px-2 text-slate-200">{entry.interfaceName}</td>
+                            <td className="py-1.5 px-2.5 text-slate-400">VLAN {entry.vlan}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <div className="p-4 text-center text-xs font-mono text-slate-500">
+                      Таблица ARP пуста. Запустите Ping для динамического разрешения MAC-адресов.
                     </div>
                   )}
                 </div>

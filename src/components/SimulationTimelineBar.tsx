@@ -96,6 +96,11 @@ const PROTOCOL_CHIP_META: Record<
     activeClass: 'bg-indigo-500/20 text-indigo-200 border-indigo-500/50',
     dotColor: 'bg-indigo-400',
   },
+  OSPF: {
+    label: 'OSPF',
+    activeClass: 'bg-lime-500/20 text-lime-200 border-lime-500/50',
+    dotColor: 'bg-lime-400',
+  },
 };
 
 export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({

@@ -281,9 +281,15 @@ export const FloatingSwitchWebGui: React.FC<FloatingSwitchWebGuiProps> = ({
             ))}
           </select>
 
-          <span className="hidden sm:inline text-[10px] font-mono text-slate-500 truncate">
-            https://{node.name.toLowerCase()}.netpulse.local/vlan-ports
-          </span>
+          <input
+            type="text"
+            aria-label="Hostname коммутатора"
+            value={node.name}
+            onChange={(e) => onUpdateNode({ ...node, name: e.target.value })}
+            placeholder="Hostname..."
+            title="Переименовать коммутатор (hostname)"
+            className="w-28 bg-slate-950 border border-slate-700 rounded px-2 py-0.5 text-xs font-mono text-slate-100 focus:outline-none focus:border-indigo-500"
+          />
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
