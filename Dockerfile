@@ -8,8 +8,8 @@ WORKDIR /app
 # Copy package manifests first for optimal Docker layer caching
 COPY package.json package-lock.json* ./
 
-# Install dependencies
-RUN npm install --no-audit --no-fund
+# Install dependencies (with --legacy-peer-deps to avoid peerOptional conflicts)
+RUN npm install --legacy-peer-deps --no-audit --no-fund
 
 # Copy application source code
 COPY . .
