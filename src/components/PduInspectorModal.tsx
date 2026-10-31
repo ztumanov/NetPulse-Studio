@@ -1,13 +1,18 @@
 import React from 'react';
 import { SimulationStep } from '../network/types';
-import { X, ArrowRight, CheckCircle2, AlertTriangle, Radio, Layers, Globe } from 'lucide-react';
+import { X, ArrowRight, CheckCircle2, AlertTriangle, Radio, Layers, Globe, Activity } from 'lucide-react';
 
 interface PduInspectorModalProps {
   step: SimulationStep | null;
   onClose: () => void;
+  onOpenWireshark?: () => void;
 }
 
-export const PduInspectorModal: React.FC<PduInspectorModalProps> = ({ step, onClose }) => {
+export const PduInspectorModal: React.FC<PduInspectorModalProps> = ({
+  step,
+  onClose,
+  onOpenWireshark,
+}) => {
   const [activeTab, setActiveTab] = React.useState<'osi' | 'pdu'>('osi');
 
   if (!step) return null;
@@ -70,13 +75,29 @@ export const PduInspectorModal: React.FC<PduInspectorModalProps> = ({ step, onCl
               </div>
             </div>
           </div>
-          <button
-            onClick={onClose}
-            aria-label="Закрыть инспектор PDU"
-            className="p-1.5 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded-md transition-colors"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2">
+            {onOpenWireshark && (
+              <button
+                type="button"
+                data-testid="pdu-open-wireshark-btn"
+                onClick={() => {
+                  onClose();
+                  onOpenWireshark();
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-indigo-600 hover:bg-indigo-500 text-white transition-colors cursor-pointer"
+              >
+                <Activity className="w-3.5 h-3.5" />
+                <span>Открыть в Wireshark (Hex / DPI)</span>
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              aria-label="Закрыть инспектор PDU"
+              className="p-1.5 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded-md transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Sub-navigation tabs */}

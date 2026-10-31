@@ -1,11 +1,22 @@
 import {
   AclAction,
   AclProtocol,
+  FirewallZoneName,
   NetworkInterface,
   NetworkLink,
   NetworkNode,
   SimulationStep,
+  SwitchSviInterface,
 } from './types';
+import {
+  getDefaultSecurityLevelForZone,
+  getInterfaceSecurityZoneAndLevel,
+} from './firewallEngine';
+import {
+  getDefaultStackVirtualMac,
+  getNodeStackStatus,
+  getStackGroups,
+} from './stackEngine';
 import { isValidIpv4, isValidSubnetMask, maskToCidr } from './ipMath';
 import { getDeviceVlanDatabase, upsertDeviceVlan } from './hardwareChassis';
 import {
@@ -19,13 +30,30 @@ import {
 } from './ospfEngine';
 import {
   computeSpanningTreeState,
+  getEtherChannelBundles,
+  isSwitchSviLineProtocolUp,
+  runBgpPeeringSimulation,
   runDhcpDoraSimulation,
   runHttpBrowserSimulation,
   runPacketSimulation,
+  runRtspVideoStreamSimulation,
   runTracerouteSimulation,
+  runVoipSipCallSimulation,
   syncAllRoutersRoutingTables,
   syncConnectedRoutes,
 } from './simulator';
+import {
+  computeBgpRoutesForRouter,
+  discoverBgpPeersForRouter,
+  formatWanImpairmentSummary,
+  resolveBgpRouterId,
+} from './bgpAndWanEngine';
+import {
+  computeSwitchPoeStatus,
+  getIpCameraDirectory,
+  getVoipDirectory,
+  isVoipPhoneNode,
+} from './poeAndVoipEngine';
 
 export interface CliExecutionResult {
   updatedNode: NetworkNode;
@@ -50,6 +78,16 @@ function findInterface(node: NetworkNode, rawName: string): NetworkInterface | u
       i.shortName.toLowerCase() === norm ||
       i.name.toLowerCase().replace(/\s+/g, '') === norm
   );
+}
+
+export function generateSviMacAddress(node: NetworkNode, vlanId: number): string {
+  const baseMac = node.interfaces[0]?.macAddress || '00:D0:BA:10:00:01';
+  const parts = baseMac.split(':');
+  const hexVlan = (vlanId & 0xff).toString(16).toUpperCase().padStart(2, '0');
+  if (parts.length === 6) {
+    return `${parts[0]}:${parts[1]}:${parts[2]}:5F:${parts[4]}:${hexVlan}`;
+  }
+  return `00:D0:BA:5F:00:${hexVlan}`;
 }
 
 export function getCliPrompt(node: NetworkNode): string {
@@ -86,7 +124,11 @@ export function autocompleteIosCommand(
   const subPortNames = node.interfaces.flatMap((i) =>
     (i.subinterfaces || []).map((s) => `${i.shortName.toLowerCase()}.${s.vlanId}`)
   );
-  const allPortCandidates = [...portNames, ...subPortNames];
+  const sviPortNames =
+    node.type === 'switch'
+      ? (node.sviInterfaces || []).map((s) => `vlan ${s.vlanId}`)
+      : [];
+  const allPortCandidates = [...portNames, ...subPortNames, ...sviPortNames];
 
   // Mode-specific root command dictionaries
   const userCandidates = [
@@ -101,6 +143,7 @@ export function autocompleteIosCommand(
     'show ip ospf neighbor',
     'show ip protocols',
     'show spanning-tree',
+    'show etherchannel summary',
     'show ip nat translations',
     'show access-lists',
     'show arp',
@@ -112,12 +155,22 @@ export function autocompleteIosCommand(
     'configure terminal',
     'show ip interface brief',
     'show ip route',
+    'show ip bgp summary',
+    'show ip bgp',
+    'show wan',
     'show ip ospf neighbor',
     'show ip protocols',
     'show ip dhcp binding',
     'show ip nat translations',
+    'show nameif',
+    'show conn',
+    'show nat',
+    'show crypto ipsec sa',
     'show access-lists',
     'show spanning-tree',
+    'show etherchannel summary',
+    'show switch',
+    'show standby brief',
     'show arp',
     'show mac address-table',
     'show vlan brief',
@@ -135,6 +188,9 @@ export function autocompleteIosCommand(
 
   const configCandidates = [
     ...allPortCandidates.map((p) => `interface ${p}`),
+    'interface vlan 10',
+    'interface vlan 20',
+    'ip routing',
     'router ospf 1',
     'router rip',
     'hostname ',
@@ -144,6 +200,7 @@ export function autocompleteIosCommand(
     'access-list 100 permit ip any any',
     'spanning-tree vlan 1 priority ',
     'do show ip ospf neighbor',
+    'do show etherchannel summary',
     'do show ip route',
     'do show ip interface brief',
     'do write memory',
@@ -155,10 +212,18 @@ export function autocompleteIosCommand(
     'encapsulation dot1Q ',
     'ip address ',
     'ip address dhcp',
+    'nameif inside',
+    'nameif dmz',
+    'nameif outside',
+    'security-level ',
     'ip ospf cost ',
     'ip helper-address ',
     'ip nat inside',
     'ip nat outside',
+    'channel-group 1 mode active',
+    'channel-group 1 mode passive',
+    'channel-group 1 mode on',
+    'no channel-group',
     'no shutdown',
     'shutdown',
     'switchport mode access',
@@ -216,6 +281,9 @@ export function autocompleteIosCommand(
     'sh mac': 'show mac address-table',
     'sh vlan': 'show vlan brief',
     'sh span': 'show spanning-tree',
+    'sh eth': 'show etherchannel summary',
+    'sh eth sum': 'show etherchannel summary',
+    'sh etherchannel': 'show etherchannel summary',
     'sh ip nat': 'show ip nat translations',
     'sh ip nat tr': 'show ip nat translations',
     'sh access-lists': 'show access-lists',
@@ -223,6 +291,8 @@ export function autocompleteIosCommand(
     'encap': 'encapsulation dot1Q ',
     'encap dot1q': 'encapsulation dot1Q ',
     'ip helper': 'ip helper-address ',
+    'ch': 'channel-group 1 mode active',
+    'channel-group': 'channel-group 1 mode active',
     'no shut': 'no shutdown',
     'shut': 'shutdown',
     'wr': 'write memory',
@@ -305,7 +375,9 @@ export function executeIosCommand(
     output.push(
       'Доступные команды Cisco IOS / Host CLI (поддерживаются Tab и стрелки ↑/↓):',
       '  enable (en) / configure terminal (conf t)    — Привилегированный режим и конфигурация',
-      '  interface <fa0/0 | fa0/0.10 | gi0/1>         — Выбор порта или 802.1Q подинтерфейса (RoAS)',
+      '  interface <fa0/0 | fa0/0.10 | vlan 10>       — Выбор порта, 802.1Q подинтерфейса или SVI Vlan',
+      '  ip routing / no ip routing                   — Включение маршрутизации L3 на коммутаторе (SVI)',
+      '  channel-group <1-6> mode <active|passive|on> — Агрегация портов EtherChannel / LACP (Po1..Po6)',
       '  encapsulation dot1Q <vlan-id>                — Привязка VLAN к подинтерфейсу маршрутизатора',
       '  ip address <IP> <MASK> | dhcp                — Назначение IPv4 или запрос по DHCP',
       '  ip helper-address <DHCP_SERVER_IP>           — Ретрансляция DHCP (DHCP Relay Agent)',
@@ -317,6 +389,7 @@ export function executeIosCommand(
       '  router ospf 1 / network <IP> <WILD> area 0   — Динамическая маршрутизация OSPFv2 (SPF)',
       '  ip ospf cost <1-65535>                       — Ручная стоимость линка OSPF на интерфейсе',
       '  show ip ospf neighbor / show ip protocols    — Таблица соседей OSPF и параметры протокола',
+      '  show etherchannel summary (sh eth sum)       — Сводка агрегированных каналов Port-channel (LACP)',
       '  ping / traceroute / ipconfig /renew / curl   — Диагностика сети (ICMP, TTL, DHCP, HTTP)',
       '  show ip int brief / show ip route / show arp — Сводка интерфейсов, маршрутов и ARP',
       '  show spanning-tree (sh span)                 — Статус STP 802.1D (Root Bridge, FWD/BLK)',
@@ -345,6 +418,7 @@ export function executeIosCommand(
     node.cli.mode = 'priv';
     node.cli.selectedInterface = undefined;
     node.cli.selectedSubinterfaceVlan = undefined;
+    node.cli.selectedSviVlan = undefined;
     node.cli.selectedRoutingProtocol = undefined;
     node.cli.selectedOspfProcessId = undefined;
     return { updatedNode: node, outputLines: output };
@@ -355,6 +429,7 @@ export function executeIosCommand(
       node.cli.mode = 'config';
       node.cli.selectedInterface = undefined;
       node.cli.selectedSubinterfaceVlan = undefined;
+      node.cli.selectedSviVlan = undefined;
       node.cli.selectedRoutingProtocol = undefined;
       node.cli.selectedOspfProcessId = undefined;
     } else if (node.cli.mode === 'config') {
@@ -375,6 +450,7 @@ export function executeIosCommand(
     node.cli.mode = 'user';
     node.cli.selectedInterface = undefined;
     node.cli.selectedSubinterfaceVlan = undefined;
+    node.cli.selectedSviVlan = undefined;
     return { updatedNode: node, outputLines: output };
   }
 
@@ -386,6 +462,7 @@ export function executeIosCommand(
     node.cli.mode = 'config';
     node.cli.selectedInterface = undefined;
     node.cli.selectedSubinterfaceVlan = undefined;
+    node.cli.selectedSviVlan = undefined;
     output.push('Enter configuration commands, one per line. End with CNTL/Z or "end".');
     return { updatedNode: node, outputLines: output };
   }
@@ -592,6 +669,77 @@ export function executeIosCommand(
     const sub2 = showTokens[1]?.toLowerCase() || '';
     const sub3 = showTokens[2]?.toLowerCase() || '';
 
+    // show etherchannel summary
+    if (sub1.startsWith('ether') || sub1.startsWith('eth') || sub1 === 'port-channel') {
+      if (node.type !== 'switch') {
+        output.push('% Агрегация каналов EtherChannel (IEEE 802.3ad LACP) поддерживается на коммутаторах.');
+        return { updatedNode: node, outputLines: output };
+      }
+      const allBundles = getEtherChannelBundles(allNodes, allLinks);
+      const myGroups = new Map<
+        number,
+        {
+          mode: string;
+          ports: { shortName: string; flag: 'P' | 'D' | 'I' }[];
+          activeBundle?: ReturnType<typeof getEtherChannelBundles>[number];
+        }
+      >();
+
+      for (const iface of node.interfaces) {
+        if (!iface.channelGroup) continue;
+        const g = iface.channelGroup;
+        if (!myGroups.has(g)) {
+          myGroups.set(g, {
+            mode: (iface.channelMode || 'active') === 'on' ? 'NONE (Static ON)' : 'LACP',
+            ports: [],
+            activeBundle: allBundles.find(
+              (b) =>
+                b.channelGroup === g && (b.switchAId === node.id || b.switchBId === node.id)
+            ),
+          });
+        }
+        const entry = myGroups.get(g)!;
+        const inActiveBundle = Boolean(
+          entry.activeBundle?.memberPortIdsOnSwitch[node.id]?.includes(iface.id)
+        );
+        const flag: 'P' | 'D' | 'I' =
+          iface.adminStatus !== 'up' ? 'D' : inActiveBundle ? 'P' : 'I';
+        entry.ports.push({ shortName: iface.shortName, flag });
+      }
+
+      output.push(
+        'Flags:  D - down        P - bundled in port-channel',
+        '        I - stand-alone s - suspended',
+        '        S - Layer2      U - in use',
+        `Number of channel-groups in use: ${myGroups.size}`,
+        '',
+        'Group  Port-channel  Protocol        Ports',
+        '------+-------------+---------------+-------------------------------------------'
+      );
+
+      if (myGroups.size === 0) {
+        output.push('  (Агрегированные каналы Port-channel не настроены — используйте "channel-group 1 mode active" на интерфейсе)');
+      } else {
+        Array.from(myGroups.entries())
+          .sort((a, b) => a[0] - b[0])
+          .forEach(([groupNum, info]) => {
+            const poStatus = info.activeBundle ? 'SU' : 'SD';
+            const poName = `Po${groupNum}(${poStatus})`;
+            const portsStr = info.ports.map((p) => `${p.shortName}(${p.flag})`).join(' ');
+            const bwSuffix = info.activeBundle
+              ? ` [${info.activeBundle.totalBandwidthMbps} Mbps, STP Cost ${info.activeBundle.stpCost}]`
+              : '';
+            output.push(
+              `${String(groupNum).padEnd(6, ' ')} ${poName.padEnd(13, ' ')} ${info.mode.padEnd(
+                15,
+                ' '
+              )} ${portsStr}${bwSuffix}`
+            );
+          });
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
     // show spanning-tree
     if (sub1.startsWith('span') || sub1 === 'stp') {
       if (node.type !== 'switch') {
@@ -631,7 +779,12 @@ export function executeIosCommand(
             ? 'Altn'
             : 'Dis ';
         const stateStr = pSt.state === 'forwarding' ? 'FWD' : pSt.state === 'blocking' ? 'BLK' : 'DIS';
-        const peerLabel = pSt.peerNodeName ? `P2p (${pSt.peerNodeName}:${pSt.peerPortName})` : 'Edge';
+        const poTag = pSt.portChannelName
+          ? ` [${pSt.portChannelName} ${pSt.aggregatedBandwidthMbps || 200}M]`
+          : '';
+        const peerLabel = pSt.peerNodeName
+          ? `P2p (${pSt.peerNodeName}:${pSt.peerPortName})${poTag}`
+          : 'Edge';
         output.push(
           `${iface.shortName.padEnd(16, ' ')} ${roleStr} ${stateStr} ${String(pSt.pathCost).padEnd(9, ' ')} 128.${String(
             idx + 1
@@ -641,8 +794,190 @@ export function executeIosCommand(
       return { updatedNode: node, outputLines: output };
     }
 
-    // show ip nat translations
-    if (sub1 === 'ip' && sub2.startsWith('nat')) {
+    // show nameif (Cisco ASA Security Zones & Levels)
+    if (sub1 === 'nameif') {
+      output.push(
+        'Interface                Name                     Security',
+        '-----------------------  -----------------------  --------'
+      );
+      for (const iface of node.interfaces) {
+        const zInfo = getInterfaceSecurityZoneAndLevel(iface);
+        output.push(
+          `${iface.name.slice(0, 23).padEnd(23, ' ')}  ${zInfo.zone.padEnd(23, ' ')}  ${String(
+            zInfo.level
+          ).padStart(3, ' ')}`
+        );
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // show conn (Cisco ASA Stateful Packet Inspection table)
+    if (sub1.startsWith('conn')) {
+      const sessions = node.firewallConfig?.statefulSessions || [];
+      output.push(
+        `${sessions.length} in use, ${sessions.length} most used`,
+        'Proto  Initiator (High Sec)       Responder (Low Sec)        Zones                  State',
+        '-----  -------------------------  -------------------------  ---------------------  -----------'
+      );
+      if (sessions.length === 0) {
+        output.push(
+          '  (Таблица активных соединений SPI пуста — отправьте пакет из зоны Inside наружу или в DMZ)'
+        );
+      } else {
+        for (const s of sessions) {
+          const zonesCol = `${s.initiatorZone}(${s.initiatorLevel})->${s.responderZone}(${s.responderLevel})`;
+          output.push(
+            `${s.protocol.padEnd(5, ' ')}  ${`${s.initiatorIp}:${s.initiatorPort}`.padEnd(
+              25,
+              ' '
+            )}  ${`${s.responderIp}:${s.responderPort}`.padEnd(25, ' ')}  ${zonesCol.padEnd(
+              21,
+              ' '
+            )}  ${s.state}`
+          );
+        }
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // show crypto ipsec sa (Cisco ASA / IOS Site-to-Site IPsec VPN)
+    if (sub1 === 'crypto' || sub1 === 'ipsec' || sub1 === 'vpn') {
+      const tunnels = node.firewallConfig?.ipsecTunnels || [];
+      if (tunnels.length === 0) {
+        output.push('% На устройстве не настроены криптотуннели Site-to-Site IPsec VPN.');
+      } else {
+        for (const t of tunnels) {
+          output.push(
+            `interface: ${t.localInterface} (${t.tunnelName})`,
+            `    Crypto map tag: ${t.tunnelName}, seq num: 10, local addr: ${t.localPublicIp}`,
+            `    access-list VPN_ACL extended permit ip ${t.localSubnet} ${t.remoteSubnet}`,
+            `    current_peer: ${t.peerPublicIp} (${t.ikeVersion}, Status: ${
+              t.enabled ? t.status : 'DOWN'
+            })`,
+            `    #pkts encaps: ${t.packetsEncrypted}, #pkts encrypt: ${t.packetsEncrypted}, #pkts decaps: ${t.packetsDecrypted}, #pkts decrypt: ${t.packetsDecrypted}`,
+            `    transform-set: ${t.cryptoSuite}`
+          );
+        }
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // show power inline (IEEE 802.3af/at PoE status on Switches)
+    if (sub1.startsWith('power') || sub1 === 'poe') {
+      if (node.type !== 'switch') {
+        output.push('% Команда "show power inline" поддерживается на коммутаторах с поддержкой PoE 802.3af/at.');
+        return { updatedNode: node, outputLines: output };
+      }
+      const poe = computeSwitchPoeStatus(node, allNodes, allLinks);
+      output.push(
+        `Available: ${poe.totalBudgetWatts.toFixed(1)}(w)  Used: ${poe.usedWatts.toFixed(1)}(w)  Remaining: ${poe.remainingWatts.toFixed(1)}(w)  [${poe.standard}]`,
+        '',
+        'Interface   Admin  Oper       Power   Device                  Class              Max',
+        '                              (Watts)                                            ',
+        '---------   -----  ---------  ------  ----------------------  -----------------  ----'
+      );
+      for (const p of poe.portList) {
+        const operStr =
+          p.operStatus === 'delivering'
+            ? 'on'
+            : p.operStatus === 'fault_overload'
+            ? 'fault(ovl)'
+            : 'off';
+        const devStr = p.pdNodeName
+          ? `${p.pdNodeName} (${p.pdDeviceTypeLabel || 'PD'})`.slice(0, 32)
+          : 'n/a';
+        output.push(
+          `${p.portShortName.padEnd(10, ' ')}  ${p.adminMode.padEnd(5, ' ')}  ${operStr.padEnd(
+            9,
+            ' '
+          )}  ${p.allocatedWatts.toFixed(1).padEnd(6, ' ')}  ${devStr.padEnd(
+            32,
+            ' '
+          )}  ${p.poeClass.padEnd(17, ' ')}  ${p.maxPortWatts.toFixed(1)}`
+        );
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // show voip sip / show ephone / show sip
+    if (sub1 === 'voip' || sub1 === 'ephone' || sub1 === 'sip') {
+      const phones = getVoipDirectory(allNodes, allLinks);
+      output.push(
+        'Cisco Unified Communications / SIP Registrar Directory (UDP 5060):',
+        'Ext   Device Name     IPv4 Address     Voice VLAN  Data VLAN  PoE Power       Status',
+        '----  --------------  ---------------  ----------  ---------  --------------  ----------'
+      );
+      if (phones.length === 0) {
+        output.push('  (В топологии нет IP-телефонов VoIP)');
+      } else {
+        for (const ph of phones) {
+          output.push(
+            `${ph.extension.padEnd(4, ' ')}  ${ph.nodeName.padEnd(14, ' ')}  ${(
+              ph.ipAddress || 'unassigned'
+            ).padEnd(15, ' ')}  VLAN ${String(ph.voiceVlan).padEnd(5, ' ')}  VLAN ${String(
+              ph.dataVlan
+            ).padEnd(4, ' ')}  ${`${ph.poeWatts.toFixed(1)}W 802.3af`.padEnd(14, ' ')}  ${
+              ph.isPowered ? 'REGISTERED' : 'POWER OFF'
+            }`
+          );
+        }
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // show cctv / show camera / show rtsp / show nvr
+    if (sub1 === 'cctv' || sub1 === 'camera' || sub1 === 'rtsp' || sub1 === 'nvr') {
+      const cameras = getIpCameraDirectory(allNodes, allLinks);
+      output.push(
+        'NetPulse CCTV / RTSP Video Surveillance Directory (TCP 554 / RTP UDP 5004):',
+        'Device Name     IPv4 Address     VLAN     Codec / Res             Mode / NVR Target           PoE Power       Status',
+        '--------------  ---------------  -------  ----------------------  --------------------------  --------------  ----------'
+      );
+      if (cameras.length === 0) {
+        output.push('  (В топологии нет IP-камер видеонаблюдения)');
+      } else {
+        for (const cam of cameras) {
+          const codecRes = `${cam.codec.split(' ')[0]} ${cam.resolution.split(' ')[0]}`;
+          const targetCol =
+            cam.streamMode === 'multicast'
+              ? `Mcast ${cam.multicastGroupIp}`
+              : `Unicast ${cam.nvrTargetIp}`;
+          output.push(
+            `${cam.nodeName.padEnd(14, ' ')}  ${(cam.ipAddress || 'unassigned').padEnd(
+              15,
+              ' '
+            )}  VLAN ${String(cam.surveillanceVlan).padEnd(2, ' ')}  ${codecRes.padEnd(
+              22,
+              ' '
+            )}  ${targetCol.padEnd(26, ' ')}  ${`${cam.poeWatts.toFixed(1)}W 802.3af`.padEnd(
+              14,
+              ' '
+            )}  ${cam.isPowered ? 'STREAMING' : 'POWER OFF'}`
+          );
+        }
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // show ip nat translations / show nat
+    if ((sub1 === 'ip' && sub2.startsWith('nat')) || sub1 === 'nat') {
+      const portForwards = node.firewallConfig?.portForwards || [];
+      if (portForwards.length > 0) {
+        output.push(
+          'Static NAT / Port Forwarding Policies (Section 1):',
+          'Rule Name             Ext Interface   Public IP:Port          Internal DMZ IP:Port    Hits',
+          '--------------------  --------------  ----------------------  ----------------------  ----'
+        );
+        for (const pf of portForwards) {
+          output.push(
+            `${pf.name.padEnd(20, ' ')}  ${pf.externalInterface.padEnd(14, ' ')}  ${`${pf.externalIp}:${pf.externalPort}`.padEnd(
+              22,
+              ' '
+            )}  ${`${pf.internalIp}:${pf.internalPort}`.padEnd(22, ' ')}  ${pf.hitCount}`
+          );
+        }
+        output.push('');
+      }
       output.push(
         'Pro  Inside global         Inside local          Outside local         Outside global',
         '---  --------------------  --------------------  --------------------  --------------------'
@@ -704,7 +1039,7 @@ export function executeIosCommand(
       return { updatedNode: node, outputLines: output };
     }
 
-    if (sub1 === 'ip' && (sub2.startsWith('int') || sub2.startsWith('b') || sub3.startsWith('b'))) {
+    if (sub1 === 'ip' && (sub2.startsWith('int') || sub2.startsWith('br') || sub3.startsWith('b'))) {
       output.push(
         'Interface    IP-Address       Mask             Status   VLAN / Role',
         '-----------  ---------------  ---------------  -------  --------------------'
@@ -717,10 +1052,13 @@ export function executeIosCommand(
         const natTag =
           iface.natRole && iface.natRole !== 'none' ? ` [NAT ${iface.natRole}]` : '';
         const helperTag = iface.helperAddress ? ` [Helper ${iface.helperAddress}]` : '';
+        const poTag = iface.channelGroup
+          ? ` [Po${iface.channelGroup} ${iface.channelMode || 'active'}]`
+          : '';
         const vlanCol =
           iface.vlanMode === 'trunk'
-            ? `trunk(${iface.trunkAllowedVlans.join(',')})${natTag}${helperTag}`
-            : `vlan ${iface.accessVlan}${natTag}${helperTag}`;
+            ? `trunk(${iface.trunkAllowedVlans.join(',')})${poTag}${natTag}${helperTag}`
+            : `vlan ${iface.accessVlan}${poTag}${natTag}${helperTag}`;
         output.push(`${nameCol}  ${ipCol}  ${maskCol}  ${statusCol}  ${vlanCol}`);
 
         if (Array.isArray(iface.subinterfaces)) {
@@ -737,6 +1075,26 @@ export function executeIosCommand(
           }
         }
       }
+
+      if (node.type === 'switch' && Array.isArray(node.sviInterfaces)) {
+        for (const svi of node.sviInterfaces) {
+          const sviName = `Vlan${svi.vlanId}`.padEnd(11, ' ');
+          const sviIp = (svi.ipAddress || 'unassigned').padEnd(15, ' ');
+          const sviMask = (svi.subnetMask || 'unassigned').padEnd(15, ' ');
+          const lineUp =
+            svi.adminStatus === 'up' && isSwitchSviLineProtocolUp(node, svi.vlanId, allNodes, allLinks);
+          const sviStatus = (svi.adminStatus === 'up' ? (lineUp ? 'up' : 'up/down') : 'down').padEnd(
+            7,
+            ' '
+          );
+          const helperTag = svi.helperAddress ? ` [Helper ${svi.helperAddress}]` : '';
+          const l3Tag = node.ipRoutingEnabled ? ' [L3 SVI Gateway]' : ' [Mgmt SVI]';
+          output.push(
+            `${sviName}  ${sviIp}  ${sviMask}  ${sviStatus}  SVI vlan ${svi.vlanId}${l3Tag}${helperTag}`
+          );
+        }
+      }
+
       return { updatedNode: node, outputLines: output };
     }
 
@@ -835,19 +1193,114 @@ export function executeIosCommand(
       return { updatedNode: node, outputLines: output };
     }
 
+    // show wan / show impairment (WAN Link Impairment Emulator status)
+    if (sub1 === 'wan' || sub1.startsWith('impair')) {
+      const wanCfg = node.wanImpairment;
+      output.push(
+        `NetPulse WAN Link Impairment Emulator (${node.name}):`,
+        'Parameter                Value                         Status',
+        '-----------------------  ----------------------------  ----------------'
+      );
+      if (!wanCfg || !wanCfg.enabled) {
+        output.push(
+          `WAN Impairment Engine    0 ms / 0% Loss / Unlimited    BYPASS (Ideal Link)`
+        );
+      } else {
+        output.push(
+          `Profile Name             ${(wanCfg.profileName || 'Custom WAN Link').padEnd(28, ' ')}  ACTIVE`,
+          `Propagation Latency      ${`${wanCfg.latencyMs} ms`.padEnd(28, ' ')}  +${wanCfg.latencyMs}ms per hop`,
+          `Delay Jitter             ${`±${wanCfg.jitterMs} ms`.padEnd(28, ' ')}  RFC 3393 Jitter`,
+          `Packet Loss Rate         ${`${wanCfg.packetLossPercent}%`.padEnd(28, ' ')}  ${
+            wanCfg.packetLossPercent >= 50 ? 'CRITICAL DROP (>=50%)' : wanCfg.packetLossPercent > 0 ? 'DEGRADED' : '0% Loss'
+          }`,
+          `Bandwidth Policing       ${`${wanCfg.bandwidthLimitMbps} Mbps`.padEnd(28, ' ')}  ${
+            wanCfg.bandwidthLimitMbps <= 0 ? 'THROTTLED (0 Mbps)' : 'Token Bucket QoS'
+          }`
+        );
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // show ip bgp summary / show ip bgp / show bgp
+    if ((sub1 === 'ip' && sub2 === 'bgp') || sub1 === 'bgp') {
+      const bgpArg = sub1 === 'bgp' ? sub2 : sub3;
+      const bgpCfg = node.bgpConfig;
+      if (!bgpCfg || !bgpCfg.enabled) {
+        output.push('% BGP not active on this router (enable eBGP in Router GUI or configure ASN)');
+        return { updatedNode: node, outputLines: output };
+      }
+      const rid = resolveBgpRouterId(node);
+      const peers = discoverBgpPeersForRouter(node, allNodes, allLinks);
+
+      if (bgpArg.startsWith('sum')) {
+        output.push(
+          `BGP router identifier ${rid}, local AS number ${bgpCfg.asn}`,
+          `BGP table version is 4, main routing table version 4`,
+          '',
+          'Neighbor        V           AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd',
+          '--------------- - ------------ ------- ------- -------- ---- ---- -------- --------------'
+        );
+        if (peers.length === 0) {
+          output.push('  (Соседи eBGP не настроены)');
+        } else {
+          for (const p of peers) {
+            const stateCol =
+              p.state === 'Established' ? String(p.prefixesReceived) : p.state;
+            const wanTag = p.wanImpairment?.enabled
+              ? ` [${formatWanImpairmentSummary(p.wanImpairment)}]`
+              : '';
+            output.push(
+              `${p.neighborIp.padEnd(15, ' ')} 4 ${String(p.remoteAs).padStart(
+                12,
+                ' '
+              )}      18      18        4    0    0 00:14:22 ${stateCol}${wanTag}`
+            );
+          }
+        }
+        return { updatedNode: node, outputLines: output };
+      }
+
+      const bgpComp = computeBgpRoutesForRouter(node, allNodes, allLinks);
+      output.push(
+        `BGP table version is 4, local router ID is ${rid}, Local AS ${bgpCfg.asn}`,
+        'Status codes: s suppressed, d damped, h history, * valid, > best, i - internal',
+        'Origin codes: i - IGP, e - EGP, ? - incomplete',
+        '',
+        '   Network          Next Hop            Metric LocPrf Weight Path'
+      );
+      if (bgpComp.allCandidateBgpRoutes.length === 0) {
+        output.push('   (В таблице BGP нет полученных маршрутов от соседей eBGP)');
+      } else {
+        for (const r of bgpComp.allCandidateBgpRoutes) {
+          const code = r.bgpBestPath ? '*>' : '* ';
+          const prefixStr = `${r.network}/${maskToCidr(r.mask)}`.padEnd(16, ' ');
+          const nhStr = r.nextHop.padEnd(19, ' ');
+          const metricStr = String(r.metric ?? 0).padStart(6, ' ');
+          const lpStr = String(r.bgpLocalPref ?? 100).padStart(6, ' ');
+          const wtStr = String(r.bgpWeight ?? 100).padStart(6, ' ');
+          const pathStr = `${(r.bgpAsPath || []).join(' ')} ${r.bgpOrigin || 'i'}`.trim();
+          output.push(`${code} ${prefixStr} ${nhStr} ${metricStr} ${lpStr} ${wtStr} ${pathStr}`);
+        }
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
     if (sub1 === 'ip' && sub2.startsWith('ro')) {
       const nodesForSync = allNodes.map((n) => (n.id === node.id ? node : n));
       const allRoutes = syncConnectedRoutes(node, nodesForSync, allLinks);
       const filterOspfOnly = sub3 === 'ospf';
       const filterRipOnly = sub3 === 'rip';
+      const filterBgpOnly = sub3 === 'bgp';
       const routes = filterOspfOnly
         ? allRoutes.filter((r) => r.type === 'O')
         : filterRipOnly
         ? allRoutes.filter((r) => r.type === 'R')
+        : filterBgpOnly
+        ? allRoutes.filter((r) => r.type === 'B')
         : allRoutes;
 
       output.push(
-        'Codes: C - connected, S - static, O - OSPF, R - RIPv2',
+        'Codes: C - connected, S - static, B - eBGP (AD 20), O - OSPF (AD 110), R - RIPv2 (AD 120)',
         node.defaultGateway ? `Default Gateway is ${node.defaultGateway}` : 'Gateway of last resort is not set',
         ''
       );
@@ -862,6 +1315,13 @@ export function executeIosCommand(
           } else if (r.type === 'S') {
             output.push(
               `S    ${r.network}/${r.mask} [1/0] via ${r.nextHop}, ${r.interfaceName}`
+            );
+          } else if (r.type === 'B') {
+            const ad = r.administrativeDistance ?? 20;
+            const med = r.metric ?? 0;
+            const asPathStr = r.bgpAsPath?.length ? ` [AS_PATH: ${r.bgpAsPath.join(' ')}]` : '';
+            output.push(
+              `B    ${r.network}/${r.mask} [${ad}/${med}] via ${r.nextHop}, 00:04:15, ${r.interfaceName}${asPathStr}`
             );
           } else if (r.type === 'O') {
             const ad = r.administrativeDistance ?? 110;
@@ -962,6 +1422,9 @@ export function executeIosCommand(
         '!'
       );
       if (node.type === 'switch') {
+        if (node.ipRoutingEnabled) {
+          output.push('ip routing', '!');
+        }
         output.push(`spanning-tree mode ieee`, `spanning-tree vlan 1 priority ${node.stpPriority ?? 32768}`, '!');
       }
       if (node.services?.dhcpEnabled && node.services.dhcpPools.length > 0) {
@@ -998,6 +1461,9 @@ export function executeIosCommand(
           } else {
             output.push(` switchport trunk allowed vlan ${iface.trunkAllowedVlans.join(',')}`);
           }
+          if (iface.channelGroup) {
+            output.push(` channel-group ${iface.channelGroup} mode ${iface.channelMode || 'active'}`);
+          }
         }
         output.push(iface.adminStatus === 'up' ? ` no shutdown` : ` shutdown`);
         output.push('!');
@@ -1017,6 +1483,18 @@ export function executeIosCommand(
             }
             output.push('!');
           }
+        }
+      }
+      if (node.type === 'switch' && Array.isArray(node.sviInterfaces)) {
+        for (const svi of node.sviInterfaces) {
+          output.push(
+            `interface Vlan${svi.vlanId}`,
+            svi.ipAddress ? ` ip address ${svi.ipAddress} ${svi.subnetMask}` : ` no ip address`
+          );
+          if (svi.helperAddress) {
+            output.push(` ip helper-address ${svi.helperAddress}`);
+          }
+          output.push(svi.adminStatus === 'up' ? ` no shutdown` : ` shutdown`, '!');
         }
       }
       if (node.ospfConfig?.enabled) {
@@ -1055,8 +1533,71 @@ export function executeIosCommand(
       return { updatedNode: node, outputLines: output };
     }
 
+    if (sub1 === 'switch' || sub1 === 'stack') {
+      const stackInfo = getNodeStackStatus(node.id, allNodes, allLinks);
+      const groups = getStackGroups(allNodes, allLinks);
+      const group = stackInfo?.group || groups.find((g) => g.deviceType === node.type);
+
+      if (!group) {
+        output.push(
+          `Switch/Router ${node.name} is operating in Standalone mode (StackWise / VSS disabled).`,
+          'Используйте Стек-кабель (StackWise / HA), вкладку «Стек» в Web GUI или команду "stack-group STACK-1" в режиме config.'
+        );
+        return { updatedNode: node, outputLines: output };
+      }
+
+      output.push(
+        `Stack/Cluster ID : ${group.stackId} (${group.protocol} · Backplane ${group.backplaneSpeedGbps} Gbps)`,
+        `Stack Virtual MAC: ${group.virtualMac}${group.virtualIp ? ` · Virtual IP (VIP): ${group.virtualIp}` : ''}`,
+        `                                           H/W   Current`,
+        `Switch#   Role        Mac Address        Priority Version  State       Node Name`,
+        `-------------------------------------------------------------------------------------`
+      );
+      for (const m of group.members) {
+        const star = m.role === 'master' ? '*' : ' ';
+        const roleLabel =
+          m.role === 'master' ? 'Master' : m.role === 'standby' ? 'Standby' : 'Member';
+        output.push(
+          `${star}${String(m.memberNumber).padEnd(8, ' ')} ${roleLabel.padEnd(11, ' ')} ${m.macAddress}   ${String(
+            m.priority
+          ).padEnd(8, ' ')} V04      ${m.state.padEnd(11, ' ')} ${m.nodeName}`
+        );
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (sub1 === 'standby' || sub1 === 'hsrp' || sub1 === 'vrrp') {
+      const stackInfo = getNodeStackStatus(node.id, allNodes, allLinks);
+      if (!stackInfo) {
+        output.push(
+          `% HSRP / Router Stack не настроен на ${node.name}.`,
+          'Используйте команду "standby 1 ip <VIP>" в режиме config-if или вкладку «Стек / HA» в GUI роутера.'
+        );
+        return { updatedNode: node, outputLines: output };
+      }
+      const { group, member } = stackInfo;
+      const lanPort =
+        node.interfaces.find((i) => isValidIpv4(i.ipAddress))?.shortName ||
+        node.interfaces[0]?.shortName ||
+        'Gi0/0';
+      output.push(
+        `                     P indicates configured to preempt.`,
+        `                     |`,
+        `Interface   Grp  Pri P State    Active          Standby         Virtual IP      Virtual MAC`,
+        `---------------------------------------------------------------------------------------------------`,
+        `${lanPort.padEnd(11, ' ')} ${String(group.domainId).padEnd(4, ' ')} ${String(
+          member.priority
+        ).padEnd(3, ' ')} P ${member.state.padEnd(8, ' ')} ${(
+          group.masterNodeName || 'local'
+        ).padEnd(15, ' ')} ${(group.standbyNodeName || 'unknown').padEnd(15, ' ')} ${(
+          group.virtualIp || 'unassigned'
+        ).padEnd(15, ' ')} ${group.virtualMac}`
+      );
+      return { updatedNode: node, outputLines: output };
+    }
+
     output.push(
-      '% Неизвестная команда show. Попробуйте: sh ip int b, sh ip ospf neighbor, sh ip route, sh span, sh ip nat tr, sh access-lists, sh arp, sh mac, sh run'
+      '% Неизвестная команда show. Попробуйте: sh ip int b, sh switch, sh standby, sh etherchannel summary, sh ip ospf neighbor, sh ip route, sh span, sh ip nat tr, sh access-lists, sh arp, sh mac, sh run'
     );
     return { updatedNode: node, outputLines: output };
   }
@@ -1066,6 +1607,130 @@ export function executeIosCommand(
     if ((first === 'hostname' || first === 'host') && tokens[1]) {
       node.name = tokens[1];
       return { updatedNode: node, outputLines: output };
+    }
+
+    // L3 Switch IP Routing: ip routing / no ip routing
+    if (first === 'ip' && second === 'routing') {
+      if (node.type === 'switch') {
+        node.ipRoutingEnabled = true;
+        node.routingTable = syncConnectedRoutes(node, allNodes, allLinks);
+        const updatedAll = syncAllRoutersRoutingTables(
+          allNodes.map((n) => (n.id === node.id ? node : n)),
+          allLinks
+        );
+        const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+        output.push(
+          `[OK] Аппаратная межсетевая маршрутизация L3 (ip routing) включена на коммутаторе ${node.name}.`
+        );
+        return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+      }
+      output.push('[OK] Маршрутизация IPv4 уже активна на данном устройстве.');
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (first === 'no' && second === 'ip' && third === 'routing') {
+      if (node.type === 'switch') {
+        node.ipRoutingEnabled = false;
+        output.push(`[OK] Маршрутизация L3 (ip routing) отключена на коммутаторе ${node.name} (режим чистого L2).`);
+        return { updatedNode: node, outputLines: output };
+      }
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // Switch / Router Stack CLI configuration:
+    // "stack-group <stackId>" or "switch <1-8> priority <1-15>" or "standby <grp> ip <vip>"
+    if (first === 'stack-group' && tokens[1]) {
+      const stackId = tokens[1].toUpperCase();
+      const isSw = node.type === 'switch';
+      node.stackConfig = {
+        enabled: true,
+        stackId,
+        domainId: node.stackConfig?.domainId || 1,
+        memberNumber: node.stackConfig?.memberNumber || 1,
+        priority: node.stackConfig?.priority || 15,
+        protocol: isSw ? 'StackWise-480' : 'HSRP',
+        virtualIp: node.stackConfig?.virtualIp,
+        virtualMac: node.stackConfig?.virtualMac || getDefaultStackVirtualMac(1),
+        preempt: true,
+        backplaneSpeedGbps: isSw ? 480 : 80,
+      };
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      output.push(
+        `[OK] Устройство ${node.name} включено в стек ${stackId} (${node.stackConfig.protocol}, Member #${node.stackConfig.memberNumber}, Priority ${node.stackConfig.priority}).`
+      );
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+    }
+
+    if (first === 'switch' && /^\d+$/.test(second) && third === 'priority' && tokens[3]) {
+      const memberNum = Math.max(1, Math.min(8, Number(second)));
+      const prioVal = Math.max(1, Math.min(15, Number(tokens[3])));
+      const isSw = node.type === 'switch';
+      node.stackConfig = {
+        enabled: true,
+        stackId: node.stackConfig?.stackId || (isSw ? 'STACK-CORE-1' : 'STACK-WAN-1'),
+        domainId: node.stackConfig?.domainId || 1,
+        memberNumber: memberNum,
+        priority: prioVal,
+        protocol: node.stackConfig?.protocol || (isSw ? 'StackWise-480' : 'HSRP'),
+        virtualIp: node.stackConfig?.virtualIp,
+        virtualMac: node.stackConfig?.virtualMac || getDefaultStackVirtualMac(1),
+        preempt: true,
+        backplaneSpeedGbps: isSw ? 480 : 80,
+      };
+      output.push(
+        `[OK] Стек ${node.stackConfig.stackId}: Member #${memberNum} приоритет установлен в ${prioVal} (1..15, максимальный становится Master).`
+      );
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (first === 'standby') {
+      const hasGrp = /^\d+$/.test(second);
+      const grpId = hasGrp ? Number(second) : 1;
+      const subCmd = (hasGrp ? third : second).toLowerCase();
+      const argVal = hasGrp ? tokens[3] : tokens[2];
+
+      const baseStack = node.stackConfig || {
+        enabled: true,
+        stackId: 'STACK-WAN-1',
+        domainId: grpId,
+        memberNumber: 1,
+        priority: 15,
+        protocol: 'HSRP' as const,
+        virtualMac: getDefaultStackVirtualMac(grpId),
+        preempt: true,
+        backplaneSpeedGbps: 80,
+      };
+
+      if (subCmd === 'ip' && argVal && isValidIpv4(argVal)) {
+        node.stackConfig = {
+          ...baseStack,
+          enabled: true,
+          domainId: grpId,
+          virtualIp: argVal,
+          virtualMac: getDefaultStackVirtualMac(grpId),
+        };
+        output.push(
+          `%HSRP-5-STATECHANGE: Группа HSRP ${grpId} активна. Виртуальный шлюз VIP: ${argVal} (Virtual MAC ${node.stackConfig.virtualMac}).`
+        );
+        return { updatedNode: node, outputLines: output };
+      }
+
+      if (subCmd === 'priority' && argVal && /^\d+$/.test(argVal)) {
+        const rawPrio = Number(argVal);
+        const normPrio = rawPrio > 15 ? Math.max(1, Math.min(15, Math.round(rawPrio / 10))) : Math.max(1, rawPrio);
+        node.stackConfig = {
+          ...baseStack,
+          enabled: true,
+          domainId: grpId,
+          priority: normPrio,
+        };
+        output.push(`[OK] Приоритет HSRP / Stack для ${node.name} установлен в ${normPrio}.`);
+        return { updatedNode: node, outputLines: output };
+      }
     }
 
     // Spanning-tree priority command
@@ -1097,7 +1762,6 @@ export function executeIosCommand(
     }
 
     if (first === 'access-list' || first === 'acl') {
-      // Support both "access-list 100 deny icmp any any" and "access-list deny icmp any any"
       const hasNumber = /^\d+$/.test(tokens[1] || '');
       const baseIdx = hasNumber ? 2 : 1;
       const actionRaw = (tokens[baseIdx] || '').toLowerCase();
@@ -1166,6 +1830,53 @@ export function executeIosCommand(
 
     if (first === 'interface' || first === 'int') {
       const ifaceQuery = tokens.slice(1).join('');
+
+      // Check for Switch Virtual Interface (SVI): e.g. "interface vlan 10" or "int vlan10"
+      const vlanMatch = ifaceQuery.match(/^vlan(\d+)$/i);
+      if (vlanMatch) {
+        if (node.type !== 'switch') {
+          output.push('% Виртуальные интерфейсы SVI (interface Vlan<ID>) поддерживаются на коммутаторах L2/L3.');
+          return { updatedNode: node, outputLines: output };
+        }
+        const sviVlan = Number(vlanMatch[1]);
+        if (!Number.isInteger(sviVlan) || sviVlan < 1 || sviVlan > 4094) {
+          output.push('% Недопустимый номер интерфейса Vlan (1..4094).');
+          return { updatedNode: node, outputLines: output };
+        }
+        if (!Array.isArray(node.sviInterfaces)) {
+          node.sviInterfaces = [];
+        }
+        let svi = node.sviInterfaces.find((s) => s.vlanId === sviVlan);
+        if (!svi) {
+          svi = {
+            id: `${node.id}-svi-${sviVlan}`,
+            vlanId: sviVlan,
+            name: `Vlan${sviVlan}`,
+            ipAddress: '',
+            subnetMask: '255.255.255.0',
+            adminStatus: 'up',
+            macAddress: generateSviMacAddress(node, sviVlan),
+          };
+          node.sviInterfaces.push(svi);
+          node.sviInterfaces.sort((a, b) => a.vlanId - b.vlanId);
+        }
+        const withVlan = upsertDeviceVlan(
+          node,
+          sviVlan,
+          `VLAN${String(sviVlan).padStart(4, '0')}`,
+          '',
+          true
+        );
+        node.vlanDatabase = withVlan.vlanDatabase;
+        node.cli.mode = 'config-if';
+        node.cli.selectedSviVlan = sviVlan;
+        node.cli.selectedInterface = undefined;
+        node.cli.selectedSubinterfaceVlan = undefined;
+        node.routingTable = syncConnectedRoutes(node, allNodes, allLinks);
+        output.push(`%LINEPROTO-5-UPDOWN: Line protocol on Interface Vlan${sviVlan}, changed state to up`);
+        return { updatedNode: node, outputLines: output };
+      }
+
       // Check for Router-on-a-Stick subinterface notation: e.g. fa0/0.10 or FastEthernet0/0.20
       const dotMatch = ifaceQuery.match(/^([^.]+)\.(\d+)$/);
       if (dotMatch && node.type === 'router') {
@@ -1207,6 +1918,7 @@ export function executeIosCommand(
         node.cli.mode = 'config-if';
         node.cli.selectedInterface = foundBase.id;
         node.cli.selectedSubinterfaceVlan = subVlan;
+        node.cli.selectedSviVlan = undefined;
         node.routingTable = syncConnectedRoutes(node);
         return { updatedNode: node, outputLines: output };
       }
@@ -1223,6 +1935,7 @@ export function executeIosCommand(
       node.cli.mode = 'config-if';
       node.cli.selectedInterface = found.id;
       node.cli.selectedSubinterfaceVlan = undefined;
+      node.cli.selectedSviVlan = undefined;
       return { updatedNode: node, outputLines: output };
     }
 
@@ -1245,6 +1958,7 @@ export function executeIosCommand(
       }
       const outIface =
         node.interfaces.find((i) => i.ipAddress && i.subnetMask)?.shortName ||
+        (node.sviInterfaces?.[0] ? `Vlan${node.sviInterfaces[0].vlanId}` : undefined) ||
         node.interfaces[0]?.shortName ||
         'Fa0/0';
       node.routingTable.push({
@@ -1343,6 +2057,7 @@ export function executeIosCommand(
         node.cli.mode = 'config-if';
         node.cli.selectedInterface = found.id;
         node.cli.selectedSubinterfaceVlan = undefined;
+        node.cli.selectedSviVlan = undefined;
         node.cli.selectedRoutingProtocol = undefined;
         return { updatedNode: node, outputLines: output };
       }
@@ -1477,7 +2192,71 @@ export function executeIosCommand(
     }
   }
 
-  // Interface / Subinterface configuration commands
+  // Switch Virtual Interface (SVI: interface Vlan<ID>) configuration commands
+  if (node.cli.mode === 'config-if' && node.cli.selectedSviVlan) {
+    const sviVlan = node.cli.selectedSviVlan;
+    const svi: SwitchSviInterface | undefined = (node.sviInterfaces || []).find(
+      (s) => s.vlanId === sviVlan
+    );
+    if (!svi) {
+      node.cli.mode = 'config';
+      node.cli.selectedSviVlan = undefined;
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (first === 'ip' && second.startsWith('add')) {
+      const ip = tokens[2];
+      const mask = tokens[3];
+      if (!isValidIpv4(ip) || !isValidSubnetMask(mask)) {
+        output.push('% Некорректный IPv4-адрес или маска. Пример: ip address 192.168.10.1 255.255.255.0');
+        return { updatedNode: node, outputLines: output };
+      }
+      svi.ipAddress = ip;
+      svi.subnetMask = mask;
+      node.routingTable = syncConnectedRoutes(node, allNodes, allLinks);
+      const updatedAll = syncAllRoutersRoutingTables(
+        allNodes.map((n) => (n.id === node.id ? node : n)),
+        allLinks
+      );
+      const updatedSelf = updatedAll.find((n) => n.id === node.id) || node;
+      output.push(`[OK] Назначен адрес шлюза SVI Vlan${sviVlan}: ${ip}/${maskToCidr(mask)}.`);
+      return { updatedNode: updatedSelf, updatedAllNodes: updatedAll, outputLines: output };
+    }
+
+    if (first === 'no' && second === 'ip' && third.startsWith('add')) {
+      svi.ipAddress = '';
+      node.routingTable = syncConnectedRoutes(node, allNodes, allLinks);
+      output.push(`[OK] IPv4-адрес удалён с интерфейса Vlan${sviVlan}.`);
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (first === 'ip' && second.startsWith('helper')) {
+      const helperIp = tokens[2];
+      if (!isValidIpv4(helperIp)) {
+        output.push('% Использование: ip helper-address <IPv4-адрес DHCP-сервера>');
+        return { updatedNode: node, outputLines: output };
+      }
+      svi.helperAddress = helperIp;
+      output.push(`[OK] DHCP Relay (ip helper-address ${helperIp}) настроен на SVI Vlan${sviVlan}.`);
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (first === 'no' && second.startsWith('shut')) {
+      svi.adminStatus = 'up';
+      node.routingTable = syncConnectedRoutes(node, allNodes, allLinks);
+      output.push(`%LINK-3-UPDOWN: Interface Vlan${sviVlan}, changed state to up`);
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (first.startsWith('shut')) {
+      svi.adminStatus = 'down';
+      node.routingTable = syncConnectedRoutes(node, allNodes, allLinks);
+      output.push(`%LINK-5-CHANGED: Interface Vlan${sviVlan}, changed state to administratively down`);
+      return { updatedNode: node, outputLines: output };
+    }
+  }
+
+  // Physical Interface / Subinterface configuration commands
   if (node.cli.mode === 'config-if' && node.cli.selectedInterface) {
     const iface = node.interfaces.find((i) => i.id === node.cli.selectedInterface);
     if (!iface) {
@@ -1491,6 +2270,43 @@ export function executeIosCommand(
       activeSubVlan && Array.isArray(iface.subinterfaces)
         ? iface.subinterfaces.find((s) => s.vlanId === activeSubVlan)
         : undefined;
+
+    // channel-group <1-6> mode <active|passive|on> / no channel-group
+    if (first === 'no' && second.startsWith('channel-group')) {
+      iface.channelGroup = undefined;
+      iface.channelMode = undefined;
+      output.push(`[OK] Интерфейс ${iface.shortName} исключён из агрегированного канала Port-channel.`);
+      return { updatedNode: node, outputLines: output };
+    }
+
+    if (first.startsWith('channel-group') || first === 'ch') {
+      if (node.type !== 'switch') {
+        output.push('% Агрегация каналов EtherChannel (channel-group) поддерживается на коммутаторах.');
+        return { updatedNode: node, outputLines: output };
+      }
+      const groupNum = Number(tokens[1]);
+      const modeTokenIdx = tokens.findIndex((t) => t.toLowerCase() === 'mode');
+      const modeRaw = (
+        modeTokenIdx !== -1 && tokens[modeTokenIdx + 1]
+          ? tokens[modeTokenIdx + 1]
+          : tokens[2] || 'active'
+      ).toLowerCase();
+
+      if (!Number.isInteger(groupNum) || groupNum < 1 || groupNum > 6) {
+        output.push('% Использование: channel-group <1-6> mode <active | passive | on>');
+        return { updatedNode: node, outputLines: output };
+      }
+
+      const modeVal: 'active' | 'passive' | 'on' =
+        modeRaw === 'passive' ? 'passive' : modeRaw === 'on' ? 'on' : 'active';
+      iface.channelGroup = groupNum;
+      iface.channelMode = modeVal;
+      output.push(
+        `Creating a port-channel interface Port-channel ${groupNum}`,
+        `[OK] Порт ${iface.shortName} добавлен в Port-channel${groupNum} (Po${groupNum}, режим: ${modeVal.toUpperCase()}).`
+      );
+      return { updatedNode: node, outputLines: output };
+    }
 
     // encapsulation dot1Q <vlan>
     if (first.startsWith('encap') && second.startsWith('dot1q')) {
@@ -1561,6 +2377,47 @@ export function executeIosCommand(
       }
     }
 
+    // Cisco ASA: nameif <inside|dmz|outside>
+    if (first === 'nameif') {
+      const zoneArg = (second || '').toLowerCase();
+      if (zoneArg !== 'inside' && zoneArg !== 'dmz' && zoneArg !== 'outside') {
+        output.push('% Использование: nameif <inside | dmz | outside>');
+        return { updatedNode: node, outputLines: output };
+      }
+      const zone = zoneArg as FirewallZoneName;
+      const defaultLevel = getDefaultSecurityLevelForZone(zone);
+      if (activeSub) {
+        activeSub.securityZone = zone;
+        activeSub.securityLevel = defaultLevel;
+        activeSub.natRole = zone === 'outside' ? 'outside' : 'inside';
+      } else {
+        iface.securityZone = zone;
+        iface.securityLevel = defaultLevel;
+        iface.natRole = zone === 'outside' ? 'outside' : 'inside';
+      }
+      output.push(
+        `INFO: Security level for "${zone}" is set to ${defaultLevel} by default.`,
+        `[OK] Интерфейс ${iface.shortName} назначен в зону безопасности "${zone.toUpperCase()}" (Security Level ${defaultLevel}).`
+      );
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // Cisco ASA: security-level <0-100>
+    if (first === 'security-level' || (first === 'security' && second === 'level')) {
+      const lvlVal = Number(first === 'security-level' ? second : third);
+      if (!Number.isInteger(lvlVal) || lvlVal < 0 || lvlVal > 100) {
+        output.push('% Использование: security-level <0-100>');
+        return { updatedNode: node, outputLines: output };
+      }
+      if (activeSub) {
+        activeSub.securityLevel = lvlVal;
+      } else {
+        iface.securityLevel = lvlVal;
+      }
+      output.push(`[OK] Уровень безопасности (security-level) на интерфейсе ${iface.shortName} установлен в ${lvlVal}.`);
+      return { updatedNode: node, outputLines: output };
+    }
+
     if (first === 'ip' && second.startsWith('add')) {
       if (tokens[2]?.toLowerCase() === 'dhcp') {
         const dhcpRes = runDhcpDoraSimulation(allNodes, allLinks, node.id);
@@ -1591,7 +2448,7 @@ export function executeIosCommand(
         iface.ipAddress = ip;
         iface.subnetMask = mask;
       }
-      if (node.type === 'router') {
+      if (node.type === 'router' || node.type === 'switch') {
         const updatedAll = syncAllRoutersRoutingTables(
           allNodes.map((n) => (n.id === node.id ? node : n)),
           allLinks
@@ -1691,7 +2548,78 @@ export function executeIosCommand(
           return { updatedNode: node, outputLines: output };
         }
       }
+      if (second === 'voice' && tokens[2]?.toLowerCase().startsWith('v') && tokens[3]) {
+        const vVlan = Number(tokens[3]);
+        if (Number.isInteger(vVlan) && vVlan >= 1 && vVlan <= 4094) {
+          iface.voiceVlan = vVlan;
+          output.push(
+            `[OK] На порту ${iface.shortName} настроен голосовой Auxiliary Voice VLAN ${vVlan} (IEEE 802.1p CoS 5 / DSCP EF).`
+          );
+          return { updatedNode: node, outputLines: output };
+        }
+        output.push('% Недопустимый номер Voice VLAN (1..4094). Использование: switchport voice vlan <1-4094>');
+        return { updatedNode: node, outputLines: output };
+      }
     }
+
+    if (
+      first === 'no' &&
+      (second === 'switchport' || second === 'sw') &&
+      third === 'voice'
+    ) {
+      iface.voiceVlan = undefined;
+      output.push(`[OK] Голосовой Voice VLAN отключён на порту ${iface.shortName}.`);
+      return { updatedNode: node, outputLines: output };
+    }
+
+    // power inline auto | never (IEEE 802.3af/at PoE on switch ports)
+    if (first === 'power' && second === 'inline') {
+      const modeArg = (third || 'auto').toLowerCase();
+      if (modeArg === 'never' || modeArg === 'off') {
+        iface.poeEnabled = false;
+        output.push(
+          `%ILPOWER-5-IEEE_DISCONNECT: Interface ${iface.shortName}: PD removed (power inline never)`
+        );
+        return { updatedNode: node, outputLines: output };
+      }
+      iface.poeEnabled = true;
+      output.push(
+        `%ILPOWER-7-DETECT: Interface ${iface.shortName}: Power Device detected: IEEE 802.3af/at PoE Auto enabled`
+      );
+      return { updatedNode: node, outputLines: output };
+    }
+  }
+
+  // VoIP SIP call command: "call <extension>" (e.g. "call 102")
+  if (first === 'call' && tokens[1]) {
+    const targetExt = tokens[1];
+    const callRes = runVoipSipCallSimulation(allNodes, allLinks, node.id, targetExt);
+    const updatedSelf = callRes.updatedNodes.find((n) => n.id === node.id) || node;
+    updatedSelf.cli = node.cli;
+    output.push(callRes.summaryMessage);
+    return {
+      updatedNode: updatedSelf,
+      updatedAllNodes: callRes.updatedNodes,
+      outputLines: output,
+      triggeredSimulationSteps: callRes.steps,
+      triggeredSummaryMessage: callRes.summaryMessage,
+    };
+  }
+
+  // RTSP video stream command: "rtsp [targetIpOrMulticast]" or "stream [targetIpOrMulticast]"
+  if (first === 'rtsp' || first === 'stream') {
+    const targetArg = tokens[1];
+    const rtspRes = runRtspVideoStreamSimulation(allNodes, allLinks, node.id, targetArg);
+    const updatedSelf = rtspRes.updatedNodes.find((n) => n.id === node.id) || node;
+    updatedSelf.cli = node.cli;
+    output.push(rtspRes.summaryMessage);
+    return {
+      updatedNode: updatedSelf,
+      updatedAllNodes: rtspRes.updatedNodes,
+      outputLines: output,
+      triggeredSimulationSteps: rtspRes.steps,
+      triggeredSummaryMessage: rtspRes.summaryMessage,
+    };
   }
 
   output.push(`% Неизвестная команда или неверный режим: "${cmd}". Нажмите Tab для автодополнения или введите "?".`);

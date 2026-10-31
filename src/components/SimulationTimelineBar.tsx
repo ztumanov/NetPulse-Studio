@@ -11,6 +11,7 @@ import {
   filterSimulationSteps,
   getProtocolVisualMeta,
 } from '../network/packetStreamEngine';
+import { NetworkTroubleDiagnostic } from '../network/networkTroubleshooter';
 import {
   Play,
   Pause,
@@ -31,6 +32,10 @@ import {
   Search,
   Layers,
   Crosshair,
+  Wrench,
+  Sparkles,
+  Terminal,
+  X,
 } from 'lucide-react';
 
 interface SimulationTimelineBarProps {
@@ -44,6 +49,9 @@ interface SimulationTimelineBarProps {
   filterOptions: PacketFilterOptions;
   summaryMessage: string;
   isExpanded: boolean;
+  troubleDiagnostics?: NetworkTroubleDiagnostic[];
+  onApplyTroubleFix?: (diagnostic: NetworkTroubleDiagnostic) => void;
+  onSelectNodeFromTrouble?: (nodeId: string) => void;
   onToggleExpand: () => void;
   onPlayPause: () => void;
   onStepForward: () => void;
@@ -60,6 +68,7 @@ interface SimulationTimelineBarProps {
   onToggleOnlyDropped: () => void;
   onChangeDeviceFilter: (nodeId: string) => void;
   onChangeSearchQuery: (query: string) => void;
+  onOpenWireshark?: () => void;
 }
 
 const PROTOCOL_CHIP_META: Record<
@@ -114,6 +123,9 @@ export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
   filterOptions,
   summaryMessage,
   isExpanded,
+  troubleDiagnostics = [],
+  onApplyTroubleFix,
+  onSelectNodeFromTrouble,
   onToggleExpand,
   onPlayPause,
   onStepForward,
@@ -130,12 +142,35 @@ export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
   onToggleOnlyDropped,
   onChangeDeviceFilter,
   onChangeSearchQuery,
+  onOpenWireshark,
 }) => {
   const currentStep = steps[currentStepIndex] || null;
   const { counts, droppedCount, total } = React.useMemo(
     () => countStepsByProtocolCategory(steps),
     [steps]
   );
+
+  const hasSimulationFailure = React.useMemo(() => {
+    if (droppedCount > 0) return true;
+    const lower = summaryMessage.toLowerCase();
+    return (
+      lower.includes('ошибка') ||
+      lower.includes('отказ') ||
+      lower.includes('не задан') ||
+      lower.includes('заблокирован') ||
+      lower.includes('отброшен') ||
+      lower.includes('недоступен') ||
+      lower.includes('обесточен') ||
+      lower.includes('выключен') ||
+      lower.includes('drop') ||
+      lower.includes('unreachable')
+    );
+  }, [droppedCount, summaryMessage]);
+
+  const [isTroubleshooterOpen, setIsTroubleshooterOpen] = React.useState<boolean>(false);
+
+  const showTroubleshooterBanner =
+    troubleDiagnostics.length > 0 && isTroubleshooterOpen;
 
   const filteredEntries = React.useMemo(
     () => filterSimulationSteps(steps, filterOptions),
@@ -155,9 +190,97 @@ export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
     <section
       aria-label="Панель управления пошаговой симуляцией и журнал пакетов"
       className={`${
-        isExpanded ? 'h-80' : 'h-21'
+        isExpanded
+          ? 'h-96'
+          : showTroubleshooterBanner
+          ? 'h-auto max-h-72'
+          : 'h-21'
       } border-t border-slate-800 bg-slate-900/98 flex flex-col shrink-0 select-none transition-all z-30`}
     >
+      {/* Interactive Network Troubleshooter Card (1-Click Auto-Fix) — Opened ONLY on user button click */}
+      {showTroubleshooterBanner && (
+        <div
+          data-testid="network-troubleshooter-panel"
+          className="px-3 py-2 bg-gradient-to-r from-amber-950/90 via-slate-900 to-rose-950/85 border-b border-amber-500/40 shrink-0"
+        >
+          <div className="flex items-center justify-between gap-2 mb-1.5">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-500/20 border border-amber-400/50 text-[10px] font-mono font-bold text-amber-200 uppercase tracking-wide shrink-0">
+                <Wrench className="w-3 h-3 text-amber-400" />
+                <span>Анализатор проблем сети ({troubleDiagnostics.length})</span>
+              </span>
+              <span className="text-[11px] text-slate-300 truncate">
+                Обнаружены причины потери пакетов или ошибки конфигурации L1–L4 — доступно автоматическое исправление в 1 клик:
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsTroubleshooterOpen(false)}
+              className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800/80 transition-colors cursor-pointer shrink-0"
+              title="Скрыть подсказки анализатора"
+              aria-label="Скрыть подсказки анализатора"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-2 max-h-36 overflow-y-auto pr-1">
+            {troubleDiagnostics.slice(0, 4).map((diag, idx) => (
+              <div
+                key={diag.id}
+                data-testid={`troubleshooter-card-${diag.id}`}
+                className="p-2 rounded-md bg-slate-950/90 border border-slate-700/90 hover:border-amber-500/50 flex items-center justify-between gap-3 transition-colors"
+              >
+                <div className="min-w-0 flex-1 space-y-0.5">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span
+                      className={`px-1.5 py-0.2 rounded text-[9px] font-mono font-bold uppercase ${
+                        diag.severity === 'critical'
+                          ? 'bg-rose-500/25 text-rose-200 border border-rose-500/40'
+                          : 'bg-amber-500/25 text-amber-200 border border-amber-500/40'
+                      }`}
+                    >
+                      {diag.category}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onSelectNodeFromTrouble?.(diag.nodeId)}
+                      className="text-[11px] font-bold text-sky-300 hover:underline font-mono cursor-pointer truncate"
+                    >
+                      [{diag.nodeName}]
+                    </button>
+                    <span className="text-xs font-semibold text-slate-100 truncate">
+                      {diag.title}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-300 leading-snug line-clamp-2">
+                    {diag.explanation}
+                  </p>
+                  {diag.cliHint && (
+                    <div className="flex items-center gap-1 text-[10px] font-mono text-emerald-300/90 truncate pt-0.5">
+                      <Terminal className="w-3 h-3 shrink-0 text-emerald-400" />
+                      <span className="truncate">{diag.cliHint}</span>
+                    </div>
+                  )}
+                </div>
+
+                {onApplyTroubleFix && (
+                  <button
+                    type="button"
+                    data-testid={idx === 0 ? 'troubleshooter-autofix-btn' : `troubleshooter-autofix-btn-${idx}`}
+                    onClick={() => onApplyTroubleFix(diag)}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold shadow-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                    <span>{diag.fixButtonLabel}</span>
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Row 1: Realtime / Simulation Mode Switch, Playback Controls, Time Dilation Slider & Presets, Actions */}
       <div className="h-11 px-3 flex items-center justify-between gap-2 bg-slate-950/90 border-b border-slate-800/80 shrink-0">
         {/* Left: Cisco Packet Tracer Mode Switcher (Realtime vs Simulation) + Live Stream Generator + Step Controls */}
@@ -311,6 +434,22 @@ export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
               Пакет {currentStepIndex + 1}/{steps.length}
             </span>
           )}
+          {troubleDiagnostics.length > 0 && (
+            <button
+              type="button"
+              data-testid="toggle-troubleshooter-btn"
+              onClick={() => setIsTroubleshooterOpen((open) => !open)}
+              className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                showTroubleshooterBanner
+                  ? 'bg-amber-500 text-slate-950 border-amber-300 shadow-xs'
+                  : 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border-amber-500/50'
+              }`}
+              title="Открыть или скрыть интерактивный анализатор проблем сети"
+            >
+              <Wrench className="w-3.5 h-3.5 shrink-0" />
+              <span>Диагностика ({troubleDiagnostics.length})</span>
+            </button>
+          )}
           {currentStep && (
             <button
               type="button"
@@ -319,6 +458,18 @@ export const SimulationTimelineBar: React.FC<SimulationTimelineBarProps> = ({
             >
               <Eye className="w-3.5 h-3.5 shrink-0" />
               <span>Инспектор PDU</span>
+            </button>
+          )}
+          {onOpenWireshark && (
+            <button
+              type="button"
+              data-testid="open-wireshark-btn"
+              onClick={onOpenWireshark}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold bg-indigo-600/25 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-400/50 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer shadow-xs"
+              title="Открыть 3-панельный анализатор трафика Wireshark (Packet List, Details Tree, Hex/ASCII Dump, Follow Stream)"
+            >
+              <Activity className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+              <span>Wireshark DPI</span>
             </button>
           )}
           <button

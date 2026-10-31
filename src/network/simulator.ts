@@ -16,6 +16,7 @@ import {
   StepStatus,
   StpPortStatus,
   StpSwitchState,
+  SwitchSviInterface,
   TracerouteHop,
 } from './types';
 import {
@@ -31,6 +32,41 @@ import {
   computeDijkstraSpfRoutesForRouter,
   computeRipRoutesForRouter,
 } from './ospfEngine';
+import {
+  computeWifiSignalMetrics,
+  isWifiAccessPointNode,
+} from './wifiEngine';
+import {
+  evaluateFirewallInboundDnat,
+  evaluateFirewallZonePolicyAndSpi,
+  findMatchingIpsecTunnel,
+  isFirewallNode,
+} from './firewallEngine';
+import { FirewallPortForwardRule } from './types';
+import {
+  isStackInterconnectLink,
+  resolveStackVirtualGatewayOnPort,
+} from './stackEngine';
+import {
+  buildRtspStreamStepsFromPath,
+  buildVoipCallStepsFromPath,
+  getPoweredDevicePoeState,
+  isIpCameraNode,
+  isPoweredDeviceNode,
+  isVoipPhoneNode,
+  recordVoipCallHistory,
+  resolveRtspNvrTarget,
+  resolveSipExtensionTarget,
+} from './poeAndVoipEngine';
+import {
+  buildBgpSessionSimulationSteps,
+  computeBgpRoutesForRouter,
+  formatWanImpairmentSummary,
+  resolveLinkWanImpairment,
+} from './bgpAndWanEngine';
+import {
+  evaluateGponLinkTransfer,
+} from './gponEngine';
 
 export const BROADCAST_MAC = 'FF:FF:FF:FF:FF:FF';
 export const BROADCAST_IP = '255.255.255.255';
@@ -38,7 +74,8 @@ export const BROADCAST_IP = '255.255.255.255';
 export interface LogicalInterfaceView {
   physicalPort: NetworkInterface;
   subinterface?: RouterSubinterface;
-  logicalName: string; // e.g., 'Fa0/0' or 'Fa0/0.10'
+  sviInterface?: SwitchSviInterface;
+  logicalName: string; // e.g., 'Fa0/0', 'Fa0/0.10', or 'Vlan10'
   ipAddress: string;
   subnetMask: string;
   macAddress: string;
@@ -49,7 +86,165 @@ export interface LogicalInterfaceView {
 }
 
 /**
- * Returns all active L3 logical interfaces on a node (physical ports + 802.1Q subinterfaces).
+ * Checks whether a node acts as an L3 router (either a standard Router or a Multilayer Switch with `ip routing` enabled).
+ */
+export function isL3RoutingNode(node: NetworkNode): boolean {
+  return node.type === 'router' || (node.type === 'switch' && Boolean(node.ipRoutingEnabled));
+}
+
+/**
+ * Checks if two switch ports connected by an operational cable form an active IEEE 802.3ad (LACP) or static ('on') EtherChannel.
+ */
+export function arePortsInActiveEtherChannel(
+  portA: NetworkInterface,
+  portB: NetworkInterface
+): boolean {
+  if (portA.adminStatus !== 'up' || portB.adminStatus !== 'up') return false;
+  if (
+    !portA.channelGroup ||
+    !portB.channelGroup ||
+    portA.channelGroup !== portB.channelGroup ||
+    portA.channelGroup < 1 ||
+    portA.channelGroup > 6
+  ) {
+    return false;
+  }
+  const modeA = portA.channelMode || 'active';
+  const modeB = portB.channelMode || 'active';
+  if (modeA === 'on' || modeB === 'on') {
+    return modeA === 'on' && modeB === 'on';
+  }
+  // LACP requires at least one end to be 'active' (active+active or active+passive)
+  return !(modeA === 'passive' && modeB === 'passive');
+}
+
+export interface EtherChannelBundleInfo {
+  bundleKey: string;
+  channelGroup: number;
+  portChannelName: string; // e.g., 'Po1'
+  protocol: 'LACP' | 'ON';
+  switchAId: string;
+  switchBId: string;
+  nodeAId: string;
+  nodeBId: string;
+  memberLinks: NetworkLink[];
+  memberLinkIds: string[];
+  memberPortIdsOnSwitch: Record<string, string[]>;
+  nodeAPortIds: string[];
+  nodeBPortIds: string[];
+  totalBandwidthMbps: number;
+  aggregatedBandwidthMbps: number;
+  stpCost: number;
+}
+
+/**
+ * Discovers all active EtherChannel (Port-channel) bundles between switches in the topology.
+ */
+export function getEtherChannelBundles(
+  nodes: NetworkNode[],
+  links: NetworkLink[]
+): EtherChannelBundleInfo[] {
+  const bundleMap = new Map<string, EtherChannelBundleInfo>();
+
+  const getPortBw = (port: NetworkInterface, link: NetworkLink): number => {
+    if (port.bandwidthMbps && port.bandwidthMbps > 0) return port.bandwidthMbps;
+    if (
+      link.cableType === 'fiber' ||
+      port.shortName.toLowerCase().startsWith('gi') ||
+      port.name.toLowerCase().includes('gigabit')
+    ) {
+      return 1000;
+    }
+    return 100;
+  };
+
+  const getSingleStpCost = (bwMbps: number): number => (bwMbps >= 1000 ? 4 : 19);
+
+  for (const link of links) {
+    const srcNode = nodes.find((n) => n.id === link.sourceNodeId);
+    const dstNode = nodes.find((n) => n.id === link.targetNodeId);
+    if (!srcNode || !dstNode || srcNode.type !== 'switch' || dstNode.type !== 'switch') continue;
+    if (srcNode.id === dstNode.id) continue;
+
+    const srcPort = srcNode.interfaces.find((p) => p.id === link.sourcePortId);
+    const dstPort = dstNode.interfaces.find((p) => p.id === link.targetPortId);
+    if (!srcPort || !dstPort) continue;
+
+    if (!arePortsInActiveEtherChannel(srcPort, dstPort)) continue;
+
+    const groupNum = srcPort.channelGroup!;
+    const [swA, swB] =
+      srcNode.id < dstNode.id ? [srcNode, dstNode] : [dstNode, srcNode];
+    const key = `${swA.id}<->${swB.id}:Po${groupNum}`;
+
+    let bundle = bundleMap.get(key);
+    if (!bundle) {
+      const mode = (srcPort.channelMode || 'active') === 'on' ? 'ON' : 'LACP';
+      bundle = {
+        bundleKey: key,
+        channelGroup: groupNum,
+        portChannelName: `Po${groupNum}`,
+        protocol: mode,
+        switchAId: swA.id,
+        switchBId: swB.id,
+        nodeAId: swA.id,
+        nodeBId: swB.id,
+        memberLinks: [],
+        memberLinkIds: [],
+        memberPortIdsOnSwitch: {
+          [swA.id]: [],
+          [swB.id]: [],
+        },
+        nodeAPortIds: [],
+        nodeBPortIds: [],
+        totalBandwidthMbps: 0,
+        aggregatedBandwidthMbps: 0,
+        stpCost: 19,
+      };
+      bundleMap.set(key, bundle);
+    }
+
+    bundle.memberLinks.push(link);
+    bundle.memberLinkIds.push(link.id);
+    bundle.memberPortIdsOnSwitch[srcNode.id].push(srcPort.id);
+    bundle.memberPortIdsOnSwitch[dstNode.id].push(dstPort.id);
+    bundle.nodeAPortIds = bundle.memberPortIdsOnSwitch[swA.id];
+    bundle.nodeBPortIds = bundle.memberPortIdsOnSwitch[swB.id];
+    const bw = Math.min(getPortBw(srcPort, link), getPortBw(dstPort, link));
+    bundle.totalBandwidthMbps += bw;
+    bundle.aggregatedBandwidthMbps = bundle.totalBandwidthMbps;
+    const baseCost = getSingleStpCost(bw);
+    bundle.stpCost = Math.max(1, Math.floor(baseCost / bundle.memberLinks.length));
+  }
+
+  return Array.from(bundleMap.values());
+}
+
+/**
+ * Helper to check if a switch port carries a given VLAN ID.
+ */
+export function doesSwitchPortCarryVlan(port: NetworkInterface, vlanId: number): boolean {
+  if (port.adminStatus !== 'up') return false;
+  if (port.vlanMode === 'trunk') {
+    return port.trunkAllowedVlans.includes(vlanId);
+  }
+  return (port.accessVlan || 1) === vlanId || (Boolean(port.voiceVlan) && port.voiceVlan === vlanId);
+}
+
+/**
+ * Finds the best active physical switch port that carries the given SVI's VLAN ID.
+ */
+function findBackingPortForSwitchSvi(
+  switchNode: NetworkNode,
+  vlanId: number
+): NetworkInterface | undefined {
+  const carryingPort = switchNode.interfaces.find((p) => doesSwitchPortCarryVlan(p, vlanId));
+  if (carryingPort) return carryingPort;
+  return switchNode.interfaces.find((p) => p.adminStatus === 'up') || switchNode.interfaces[0];
+}
+
+/**
+ * Returns all active L3 logical interfaces on a node (physical ports + 802.1Q subinterfaces + Switch SVIs).
  */
 export function getRouterLogicalInterfaces(node: NetworkNode): LogicalInterfaceView[] {
   const views: LogicalInterfaceView[] = [];
@@ -57,14 +252,18 @@ export function getRouterLogicalInterfaces(node: NetworkNode): LogicalInterfaceV
     if (iface.adminStatus !== 'up') continue;
 
     if (isValidIpv4(iface.ipAddress) && isValidIpv4(iface.subnetMask)) {
+      const voiceVlanId =
+        node.deviceModel === 'ip_phone' && node.voipConfig?.voiceVlan
+          ? node.voipConfig.voiceVlan
+          : iface.accessVlan || 1;
       views.push({
         physicalPort: iface,
         logicalName: iface.shortName,
         ipAddress: iface.ipAddress,
         subnetMask: iface.subnetMask,
         macAddress: iface.macAddress,
-        vlanId: iface.accessVlan || 1,
-        isTagged8021Q: iface.vlanMode === 'trunk',
+        vlanId: voiceVlanId,
+        isTagged8021Q: iface.vlanMode === 'trunk' || node.deviceModel === 'ip_phone',
         helperAddress: iface.helperAddress,
         natRole: iface.natRole,
       });
@@ -72,7 +271,12 @@ export function getRouterLogicalInterfaces(node: NetworkNode): LogicalInterfaceV
 
     if (Array.isArray(iface.subinterfaces)) {
       for (const sub of iface.subinterfaces) {
-        if (isValidIpv4(sub.ipAddress) && isValidIpv4(sub.subnetMask) && sub.vlanId >= 1 && sub.vlanId <= 4094) {
+        if (
+          isValidIpv4(sub.ipAddress) &&
+          isValidIpv4(sub.subnetMask) &&
+          sub.vlanId >= 1 &&
+          sub.vlanId <= 4094
+        ) {
           views.push({
             physicalPort: iface,
             subinterface: sub,
@@ -89,11 +293,39 @@ export function getRouterLogicalInterfaces(node: NetworkNode): LogicalInterfaceV
       }
     }
   }
+
+  // Switch Virtual Interfaces (SVIs: interface Vlan10, interface Vlan20...)
+  if (node.type === 'switch' && Array.isArray(node.sviInterfaces)) {
+    for (const svi of node.sviInterfaces) {
+      if (
+        svi.adminStatus === 'up' &&
+        svi.vlanId >= 1 &&
+        svi.vlanId <= 4094 &&
+        isValidIpv4(svi.ipAddress) &&
+        isValidIpv4(svi.subnetMask)
+      ) {
+        const backingPort = findBackingPortForSwitchSvi(node, svi.vlanId);
+        if (!backingPort) continue;
+        views.push({
+          physicalPort: backingPort,
+          sviInterface: svi,
+          logicalName: `Vlan${svi.vlanId}`,
+          ipAddress: svi.ipAddress,
+          subnetMask: svi.subnetMask,
+          macAddress: svi.macAddress || backingPort.macAddress,
+          vlanId: svi.vlanId,
+          isTagged8021Q: backingPort.vlanMode === 'trunk',
+          helperAddress: svi.helperAddress,
+        });
+      }
+    }
+  }
+
   return views;
 }
 
 /**
- * Finds a specific logical interface on a node by its logical name (e.g., 'Fa0/0' or 'Fa0/0.10').
+ * Finds a specific logical interface on a node by its logical name (e.g., 'Fa0/0', 'Fa0/0.10', or 'Vlan10').
  */
 export function findLogicalInterfaceByName(
   node: NetworkNode,
@@ -123,16 +355,43 @@ export function findLogicalInterfaceByName(
 }
 
 /**
- * Automatically builds Connected ('C') routes from active interfaces and 802.1Q subinterfaces
- * with IPv4 addresses, preserving Static ('S') routes configured by the user, and computing
- * Dynamic OSPFv2 ('O', AD 110) and RIPv2 ('R', AD 120) routes when topology context is provided.
+ * Checks whether a Switch SVI has at least one active port in that VLAN (SVI Autostate UP).
+ */
+export function isSwitchSviLineProtocolUp(
+  switchNode: NetworkNode,
+  vlanId: number,
+  allNodes?: NetworkNode[],
+  allLinks?: NetworkLink[]
+): boolean {
+  for (const port of switchNode.interfaces) {
+    if (!doesSwitchPortCarryVlan(port, vlanId)) continue;
+    if (!allNodes || !allLinks) {
+      return true;
+    }
+    const peer = getConnectedPeer(switchNode.id, port.id, allNodes, allLinks);
+    if (peer && isLinkOperational(peer.link, allNodes)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Automatically builds Connected ('C') routes from active interfaces, 802.1Q subinterfaces,
+ * and Multilayer Switch SVIs (`Vlan10`, `Vlan20`...) with IPv4 addresses, preserving Static ('S') routes
+ * configured by the user, and computing Dynamic OSPFv2 ('O', AD 110) and RIPv2 ('R', AD 120) routes.
  */
 export function syncConnectedRoutes(
   node: NetworkNode,
   allNodes?: NetworkNode[],
   allLinks?: NetworkLink[]
 ): RouteEntry[] {
-  const staticRoutes = node.routingTable.filter((r) => r.type === 'S');
+  const staticRoutes = node.routingTable
+    .filter((r) => r.type === 'S')
+    .map((r, idx) => ({
+      ...r,
+      id: r.id || `static-${node.id}-${r.network}-${r.mask}-${r.nextHop}-${idx}`,
+    }));
   const connectedRoutes: RouteEntry[] = [];
 
   for (const iface of node.interfaces) {
@@ -176,16 +435,134 @@ export function syncConnectedRoutes(
     }
   }
 
+  // Switch SVI Connected routes (Vlan10, Vlan20...)
+  if (node.type === 'switch' && Array.isArray(node.sviInterfaces)) {
+    for (const svi of node.sviInterfaces) {
+      if (
+        svi.adminStatus === 'up' &&
+        svi.vlanId >= 1 &&
+        svi.vlanId <= 4094 &&
+        isValidIpv4(svi.ipAddress) &&
+        isValidIpv4(svi.subnetMask)
+      ) {
+        if (allNodes && allLinks && !isSwitchSviLineProtocolUp(node, svi.vlanId, allNodes, allLinks)) {
+          continue;
+        }
+        const network = getNetworkAddress(svi.ipAddress, svi.subnetMask);
+        connectedRoutes.push({
+          id: `conn-svi-${svi.vlanId}`,
+          network,
+          mask: svi.subnetMask,
+          nextHop: 'Directly Connected',
+          interfaceName: `Vlan${svi.vlanId}`,
+          type: 'C',
+          administrativeDistance: 0,
+          metric: 0,
+        });
+      }
+    }
+  }
+
   let dynamicRoutes: RouteEntry[] = [];
   if (node.type === 'router' && allNodes && allLinks) {
+    // 1. Discover subnets across Router Stack Backplane (StackWise / VSS / HA Interconnect)
+    const stackVisited = new Set<string>([node.id]);
+    const stackQueue: {
+      peerRouter: NetworkNode;
+      firstHopPortName: string;
+      firstHopPeerId: string;
+      hops: number;
+    }[] = [];
+
+    for (const iface of node.interfaces) {
+      if (iface.adminStatus !== 'up') continue;
+      const peer = getConnectedPeer(node.id, iface.id, allNodes, allLinks);
+      if (
+        peer &&
+        peer.peerNode.type === 'router' &&
+        isLinkOperational(peer.link, allNodes) &&
+        isStackInterconnectLink(peer.link, allNodes, allLinks) &&
+        !stackVisited.has(peer.peerNode.id)
+      ) {
+        stackVisited.add(peer.peerNode.id);
+        stackQueue.push({
+          peerRouter: peer.peerNode,
+          firstHopPortName: iface.shortName,
+          firstHopPeerId: peer.peerNode.id,
+          hops: 1,
+        });
+      }
+    }
+
+    while (stackQueue.length > 0) {
+      const curr = stackQueue.shift()!;
+      const peerLogical = getRouterLogicalInterfaces(curr.peerRouter);
+      for (const lv of peerLogical) {
+        if (!isValidIpv4(lv.ipAddress) || !isValidIpv4(lv.subnetMask)) continue;
+        const net = getNetworkAddress(lv.ipAddress, lv.subnetMask);
+        const alreadyKnown =
+          connectedRoutes.some((c) => c.network === net && c.mask === lv.subnetMask) ||
+          dynamicRoutes.some((d) => d.network === net && d.mask === lv.subnetMask);
+        if (!alreadyKnown) {
+          dynamicRoutes.push({
+            id: `stack-${node.id}-${curr.peerRouter.id}-${net}`,
+            network: net,
+            mask: lv.subnetMask,
+            nextHop: `Stack:${curr.firstHopPeerId}`,
+            interfaceName: curr.firstHopPortName,
+            type: 'C',
+            administrativeDistance: 1,
+            metric: curr.hops,
+            learnedFromRouterName: `${curr.peerRouter.name} (Stack)`,
+          });
+        }
+      }
+
+      for (const pIface of curr.peerRouter.interfaces) {
+        if (pIface.adminStatus !== 'up') continue;
+        const nextPeer = getConnectedPeer(curr.peerRouter.id, pIface.id, allNodes, allLinks);
+        if (
+          nextPeer &&
+          nextPeer.peerNode.type === 'router' &&
+          isLinkOperational(nextPeer.link, allNodes) &&
+          isStackInterconnectLink(nextPeer.link, allNodes, allLinks) &&
+          !stackVisited.has(nextPeer.peerNode.id)
+        ) {
+          stackVisited.add(nextPeer.peerNode.id);
+          stackQueue.push({
+            peerRouter: nextPeer.peerNode,
+            firstHopPortName: curr.firstHopPortName,
+            firstHopPeerId: curr.firstHopPeerId,
+            hops: curr.hops + 1,
+          });
+        }
+      }
+    }
+
+    const { bestRoutes: bgpRoutes } = computeBgpRoutesForRouter(node, allNodes, allLinks);
     const ospfRoutes = computeDijkstraSpfRoutesForRouter(node, allNodes, allLinks);
     const ripRoutes = computeRipRoutesForRouter(node, allNodes, allLinks);
-    dynamicRoutes = [...ospfRoutes];
+    for (const bgp of bgpRoutes) {
+      const alreadyInStack = dynamicRoutes.some(
+        (d) => d.network === bgp.network && d.mask === bgp.mask
+      );
+      if (!alreadyInStack) {
+        dynamicRoutes.push(bgp);
+      }
+    }
+    for (const ospf of ospfRoutes) {
+      const alreadyInDynamic = dynamicRoutes.some(
+        (d) => d.network === ospf.network && d.mask === ospf.mask
+      );
+      if (!alreadyInDynamic) {
+        dynamicRoutes.push(ospf);
+      }
+    }
     for (const rip of ripRoutes) {
-      const alreadyInOspf = dynamicRoutes.some(
+      const alreadyInDynamic = dynamicRoutes.some(
         (o) => o.network === rip.network && o.mask === rip.mask
       );
-      if (!alreadyInOspf) {
+      if (!alreadyInDynamic) {
         dynamicRoutes.push(rip);
       }
     }
@@ -193,8 +570,10 @@ export function syncConnectedRoutes(
     // Preserve existing dynamic routes if topology context was not passed
     dynamicRoutes = node.routingTable.filter(
       (r) =>
+        (r.type === 'B' && node.bgpConfig?.enabled) ||
         (r.type === 'O' && node.ospfConfig?.enabled) ||
-        (r.type === 'R' && node.ospfConfig?.ripEnabled)
+        (r.type === 'R' && node.ospfConfig?.ripEnabled) ||
+        Boolean(r.nextHop?.startsWith('Stack:'))
     );
   }
 
@@ -202,14 +581,19 @@ export function syncConnectedRoutes(
 }
 
 /**
- * Synchronizes routing tables on all routers in the topology (Connected + Static + OSPF SPF + RIPv2).
+ * Synchronizes routing tables on all routers and L3 switches in the topology.
  */
 export function syncAllRoutersRoutingTables(
   nodes: NetworkNode[],
   links: NetworkLink[]
 ): NetworkNode[] {
   return nodes.map((n) => {
-    if (n.type !== 'router') return n;
+    if (
+      n.type !== 'router' &&
+      !(n.type === 'switch' && (n.ipRoutingEnabled || (n.sviInterfaces?.length ?? 0) > 0))
+    ) {
+      return n;
+    }
     return {
       ...n,
       routingTable: syncConnectedRoutes(n, nodes, links),
@@ -221,12 +605,13 @@ function getRouteAdminDistance(route: RouteEntry): number {
   if (route.administrativeDistance !== undefined) return route.administrativeDistance;
   if (route.type === 'C') return 0;
   if (route.type === 'S') return 1;
+  if (route.type === 'B') return 20;
   if (route.type === 'O') return 110;
   return 120;
 }
 
 /**
- * Longest Prefix Match (LPM) lookup on a router's routing table,
+ * Longest Prefix Match (LPM) lookup on a router's or L3 switch's routing table,
  * breaking ties by Administrative Distance (C=0, S=1, O=110, R=120) and then Metric (Cost).
  */
 export function findBestRoute(
@@ -243,10 +628,19 @@ export function findBestRoute(
   for (const route of routes) {
     if (!isValidIpv4(route.network) || !isValidIpv4(route.mask)) continue;
     const egress = findLogicalInterfaceByName(node, route.interfaceName);
-    if (!egress || egress.physicalPort.adminStatus !== 'up') continue;
-    if (allNodes && allLinks) {
-      const peer = getConnectedPeer(node.id, egress.physicalPort.id, allNodes, allLinks);
-      if (!peer || !isLinkOperational(peer.link, allNodes)) continue;
+    if (!egress) continue;
+
+    if (egress.sviInterface) {
+      if (egress.sviInterface.adminStatus !== 'up') continue;
+      if (allNodes && allLinks && !isSwitchSviLineProtocolUp(node, egress.vlanId, allNodes, allLinks)) {
+        continue;
+      }
+    } else {
+      if (egress.physicalPort.adminStatus !== 'up') continue;
+      if (allNodes && allLinks) {
+        const peer = getConnectedPeer(node.id, egress.physicalPort.id, allNodes, allLinks);
+        if (!peer || !isLinkOperational(peer.link, allNodes)) continue;
+      }
     }
 
     if (isSameSubnet(dstIp, route.network, route.mask)) {
@@ -271,6 +665,38 @@ export function findBestRoute(
 }
 
 /**
+ * Finds all links connected to a specific node and port (supports multiple wireless clients on a SOHO Router's Wlan0).
+ */
+export function getConnectedPeers(
+  nodeId: string,
+  portId: string,
+  nodes: NetworkNode[],
+  links: NetworkLink[]
+): { link: NetworkLink; peerNode: NetworkNode; peerPort: NetworkInterface }[] {
+  const matchedLinks = links.filter(
+    (l) =>
+      (l.sourceNodeId === nodeId && l.sourcePortId === portId) ||
+      (l.targetNodeId === nodeId && l.targetPortId === portId)
+  );
+  const results: { link: NetworkLink; peerNode: NetworkNode; peerPort: NetworkInterface }[] = [];
+
+  for (const link of matchedLinks) {
+    const isSource = link.sourceNodeId === nodeId && link.sourcePortId === portId;
+    const peerNodeId = isSource ? link.targetNodeId : link.sourceNodeId;
+    const peerPortId = isSource ? link.targetPortId : link.sourcePortId;
+
+    const peerNode = nodes.find((n) => n.id === peerNodeId);
+    if (!peerNode) continue;
+    const peerPort = peerNode.interfaces.find((p) => p.id === peerPortId);
+    if (!peerPort) continue;
+
+    results.push({ link, peerNode, peerPort });
+  }
+
+  return results;
+}
+
+/**
  * Finds the active link connected to a specific node and port.
  */
 export function getConnectedPeer(
@@ -279,27 +705,15 @@ export function getConnectedPeer(
   nodes: NetworkNode[],
   links: NetworkLink[]
 ): { link: NetworkLink; peerNode: NetworkNode; peerPort: NetworkInterface } | null {
-  const link = links.find(
-    (l) =>
-      (l.sourceNodeId === nodeId && l.sourcePortId === portId) ||
-      (l.targetNodeId === nodeId && l.targetPortId === portId)
-  );
-  if (!link) return null;
-
-  const isSource = link.sourceNodeId === nodeId && link.sourcePortId === portId;
-  const peerNodeId = isSource ? link.targetNodeId : link.sourceNodeId;
-  const peerPortId = isSource ? link.targetPortId : link.sourcePortId;
-
-  const peerNode = nodes.find((n) => n.id === peerNodeId);
-  if (!peerNode) return null;
-  const peerPort = peerNode.interfaces.find((p) => p.id === peerPortId);
-  if (!peerPort) return null;
-
-  return { link, peerNode, peerPort };
+  const peers = getConnectedPeers(nodeId, portId, nodes, links);
+  if (peers.length === 0) return null;
+  const operationalPeer = peers.find((p) => isLinkOperational(p.link, nodes));
+  return operationalPeer || peers[0];
 }
 
 /**
- * Checks if a link is physically operational (both end ports are administratively UP).
+ * Checks if a link is physically operational (both end ports are administratively UP,
+ * and for 802.11 wireless links, the radio is enabled and the client is within coverageRadius).
  */
 export function isLinkOperational(link: NetworkLink, nodes: NetworkNode[]): boolean {
   const srcNode = nodes.find((n) => n.id === link.sourceNodeId);
@@ -308,13 +722,57 @@ export function isLinkOperational(link: NetworkLink, nodes: NetworkNode[]): bool
   const srcPort = srcNode.interfaces.find((p) => p.id === link.sourcePortId);
   const dstPort = dstNode.interfaces.find((p) => p.id === link.targetPortId);
   if (!srcPort || !dstPort) return false;
-  return srcPort.adminStatus === 'up' && dstPort.adminStatus === 'up';
+  if (srcPort.adminStatus !== 'up' || dstPort.adminStatus !== 'up') return false;
+
+  if (link.cableType === 'wireless') {
+    const apNode = isWifiAccessPointNode(srcNode)
+      ? srcNode
+      : isWifiAccessPointNode(dstNode)
+      ? dstNode
+      : null;
+    const clientNode = apNode?.id === srcNode.id ? dstNode : srcNode;
+    if (apNode && apNode.wifiConfig) {
+      if (!apNode.wifiConfig.enabled) return false;
+      const metrics = computeWifiSignalMetrics(clientNode, apNode);
+      if (!metrics.inRange) return false;
+    }
+    if (clientNode.wifiClientConfig && clientNode.wifiClientConfig.enabled === false) {
+      return false;
+    }
+  }
+
+  // IEEE 802.3af/at PoE check on switch copper links to Powered Devices (IP Phones, IP Cameras & APs)
+  if (
+    srcNode.type === 'switch' &&
+    isPoweredDeviceNode(dstNode) &&
+    !dstNode.voipConfig?.acAdapterConnected &&
+    !dstNode.ipCameraConfig?.acAdapterConnected &&
+    !dstPort.shortName.toLowerCase().includes('pc')
+  ) {
+    if (srcNode.poeConfig?.enabled === false || srcPort.poeEnabled === false) {
+      return false;
+    }
+  }
+  if (
+    dstNode.type === 'switch' &&
+    isPoweredDeviceNode(srcNode) &&
+    !srcNode.voipConfig?.acAdapterConnected &&
+    !srcNode.ipCameraConfig?.acAdapterConnected &&
+    !srcPort.shortName.toLowerCase().includes('pc')
+  ) {
+    if (dstNode.poeConfig?.enabled === false || dstPort.poeEnabled === false) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 /**
  * Computes IEEE 802.1D Spanning Tree Protocol (STP) state for all switches in the topology.
- * Automatically elects a Root Bridge per connected L2 component and places redundant loop links
- * into 'blocking' (BLK) state.
+ * Automatically elects a Root Bridge per connected L2 component, treats IEEE 802.3ad EtherChannel
+ * (Port-channel) bundles as a single logical link with aggregated bandwidth (all member links FWD),
+ * and places non-bundled redundant loop links into 'blocking' (BLK) state.
  */
 export function computeSpanningTreeState(
   nodes: NetworkNode[],
@@ -323,6 +781,14 @@ export function computeSpanningTreeState(
   const switches = nodes.filter((n) => n.type === 'switch');
   const result: Record<string, StpSwitchState> = {};
   if (switches.length === 0) return result;
+
+  const bundles = getEtherChannelBundles(nodes, links);
+  const bundleByLinkId = new Map<string, EtherChannelBundleInfo>();
+  for (const b of bundles) {
+    for (const l of b.memberLinks) {
+      bundleByLinkId.set(l.id, b);
+    }
+  }
 
   const getBridgePriority = (sw: NetworkNode) => sw.stpPriority ?? 32768;
   const getBridgeMac = (sw: NetworkNode) => {
@@ -343,6 +809,13 @@ export function computeSpanningTreeState(
   };
 
   const getPortLinkCost = (port: NetworkInterface, link: NetworkLink): number => {
+    if (isStackInterconnectLink(link, nodes, links)) {
+      return 1; // 480 Gbps StackWise-480 Backplane
+    }
+    const bundle = bundleByLinkId.get(link.id);
+    if (bundle) {
+      return bundle.stpCost;
+    }
     if (
       link.cableType === 'fiber' ||
       port.shortName.toLowerCase().startsWith('gi') ||
@@ -474,6 +947,8 @@ export function computeSpanningTreeState(
     for (const sw of component) {
       const rpId = rootPortIdBySw.get(sw.id) || null;
       const rpPort = rpId ? sw.interfaces.find((i) => i.id === rpId) : null;
+      const rpPeer = rpId ? getConnectedPeer(sw.id, rpId, nodes, links) : null;
+      const rpBundle = rpPeer ? bundleByLinkId.get(rpPeer.link.id) : undefined;
       const portsRecord: Record<string, StpPortStatus> = {};
 
       for (let idx = 0; idx < sw.interfaces.length; idx++) {
@@ -497,6 +972,7 @@ export function computeSpanningTreeState(
         }
 
         const linkCost = getPortLinkCost(port, peer.link);
+        const portBundle = bundleByLinkId.get(peer.link.id);
 
         // Edge port connected to Router, PC, or Server -> Designated Forwarding
         if (peer.peerNode.type !== 'switch') {
@@ -514,10 +990,40 @@ export function computeSpanningTreeState(
         }
 
         // Switch-to-Switch port: determine Root / Designated / Alternate (Blocking)
+        // If this port belongs to the same active EtherChannel bundle as myRootPortId (or peerRootPortId),
+        // all member links in the Port-channel share the same role and remain FORWARDING!
         const myRootPortId = rootPortIdBySw.get(sw.id);
         const peerRootPortId = rootPortIdBySw.get(peer.peerNode.id);
+        const peerRpPeer = peerRootPortId
+          ? getConnectedPeer(peer.peerNode.id, peerRootPortId, nodes, links)
+          : null;
+        const peerRpBundle = peerRpPeer ? bundleByLinkId.get(peerRpPeer.link.id) : undefined;
 
-        if (myRootPortId === port.id) {
+        const isStackLink = isStackInterconnectLink(peer.link, nodes, links);
+        const isMyRootPortOrBundle =
+          myRootPortId === port.id ||
+          (Boolean(portBundle) && Boolean(rpBundle) && portBundle!.bundleKey === rpBundle!.bundleKey);
+
+        const isPeerRootPortOrBundle =
+          peerRootPortId === peer.peerPort.id ||
+          (Boolean(portBundle) &&
+            Boolean(peerRpBundle) &&
+            portBundle!.bundleKey === peerRpBundle!.bundleKey);
+
+        if (isStackLink) {
+          portsRecord[port.id] = {
+            portId: port.id,
+            portShortName: port.shortName,
+            role: isMyRootPortOrBundle ? 'root' : 'designated',
+            state: 'forwarding',
+            pathCost: 1,
+            designatedBridgeId: `${getBridgePriority(sw)}.${getBridgeMac(sw)}`,
+            peerNodeName: peer.peerNode.name,
+            peerPortName: peer.peerPort.shortName,
+            portChannelName: 'StackWise-480',
+            aggregatedBandwidthMbps: 480000,
+          };
+        } else if (isMyRootPortOrBundle) {
           portsRecord[port.id] = {
             portId: port.id,
             portShortName: port.shortName,
@@ -527,9 +1033,12 @@ export function computeSpanningTreeState(
             designatedBridgeId: `${getBridgePriority(peer.peerNode)}.${getBridgeMac(peer.peerNode)}`,
             peerNodeName: peer.peerNode.name,
             peerPortName: peer.peerPort.shortName,
+            channelGroup: portBundle?.channelGroup,
+            portChannelName: portBundle?.portChannelName,
+            aggregatedBandwidthMbps: portBundle?.totalBandwidthMbps,
           };
-        } else if (peerRootPortId === peer.peerPort.id) {
-          // Peer switch uses this link as its Root Port -> we are Designated for this link!
+        } else if (isPeerRootPortOrBundle) {
+          // Peer switch uses this link (or Port-channel bundle) as its Root Port -> we are Designated!
           portsRecord[port.id] = {
             portId: port.id,
             portShortName: port.shortName,
@@ -539,10 +1048,12 @@ export function computeSpanningTreeState(
             designatedBridgeId: `${getBridgePriority(sw)}.${getBridgeMac(sw)}`,
             peerNodeName: peer.peerNode.name,
             peerPortName: peer.peerPort.shortName,
+            channelGroup: portBundle?.channelGroup,
+            portChannelName: portBundle?.portChannelName,
+            aggregatedBandwidthMbps: portBundle?.totalBandwidthMbps,
           };
         } else {
-          // Redundant loop link! Neither end is a Root Port.
-          // Compare (myCostToRoot, myBridgeId, myPortIndex) vs (peerCostToRoot, peerBridgeId, peerPortIndex)
+          // Redundant loop link (not part of the active Root Port bundle)!
           const myCost = costToRoot.get(sw.id) ?? Number.POSITIVE_INFINITY;
           const peerCost = costToRoot.get(peer.peerNode.id) ?? Number.POSITIVE_INFINITY;
           const peerPortIdx = peer.peerNode.interfaces.findIndex(
@@ -572,6 +1083,9 @@ export function computeSpanningTreeState(
               : `${getBridgePriority(peer.peerNode)}.${getBridgeMac(peer.peerNode)}`,
             peerNodeName: peer.peerNode.name,
             peerPortName: peer.peerPort.shortName,
+            channelGroup: portBundle?.channelGroup,
+            portChannelName: portBundle?.portChannelName,
+            aggregatedBandwidthMbps: portBundle?.totalBandwidthMbps,
           };
         }
       }
@@ -583,7 +1097,11 @@ export function computeSpanningTreeState(
         rootBridgeName: rootSwitch.name,
         isRootBridge: sw.id === rootSwitch.id,
         rootPathCost: costToRoot.get(sw.id) ?? 0,
-        rootPortName: rpPort ? rpPort.shortName : null,
+        rootPortName: rpBundle
+          ? `${rpBundle.portChannelName} (${rpPort ? rpPort.shortName : ''})`
+          : rpPort
+          ? rpPort.shortName
+          : null,
         ports: portsRecord,
       };
     }
@@ -763,7 +1281,12 @@ export function selectSourceInterfaceForTarget(
   egressLogical?: LogicalInterfaceView;
   routeFailureReason?: string;
 } {
-  if (originNode.type === 'router' && isValidIpv4(dstIp)) {
+  const isL3SwitchOrRouter =
+    originNode.type === 'router' ||
+    (originNode.type === 'switch' &&
+      (originNode.ipRoutingEnabled || (originNode.sviInterfaces?.length ?? 0) > 0));
+
+  if (isL3SwitchOrRouter && isValidIpv4(dstIp)) {
     const logicalViews = getRouterLogicalInterfaces(originNode);
     const localLogical = logicalViews.find((v) => v.ipAddress === dstIp);
     if (localLogical) {
@@ -777,15 +1300,33 @@ export function selectSourceInterfaceForTarget(
     if (!route) {
       return {
         egressPort: undefined,
-        routeFailureReason: `Маршрутизатор ${originNode.name} не имеет маршрута к сети назначения ${dstIp} (Destination Net Unreachable).`,
+        routeFailureReason: `Устройство L3 ${originNode.name} не имеет маршрута к сети назначения ${dstIp} (Destination Net Unreachable).`,
       };
     }
 
     const routedLogical = findLogicalInterfaceByName(originNode, route.interfaceName);
-    if (!routedLogical || !isValidIpv4(routedLogical.ipAddress)) {
+    if (!routedLogical) {
       return {
         egressPort: undefined,
-        routeFailureReason: `Исходящий интерфейс ${route.interfaceName} на маршрутизаторе ${originNode.name} выключен или не имеет IPv4-адреса.`,
+        routeFailureReason: `Исходящий интерфейс ${route.interfaceName} на устройстве ${originNode.name} выключен.`,
+      };
+    }
+    if (!isValidIpv4(routedLogical.ipAddress)) {
+      // If egress port is an unnumbered Router Stack Interconnect port, borrow the router's primary IPv4 address
+      const fallbackLogical = logicalViews.find((v) => isValidIpv4(v.ipAddress));
+      if (fallbackLogical) {
+        return {
+          egressPort: routedLogical.physicalPort,
+          egressLogical: {
+            ...routedLogical,
+            ipAddress: fallbackLogical.ipAddress,
+            subnetMask: fallbackLogical.subnetMask,
+          },
+        };
+      }
+      return {
+        egressPort: undefined,
+        routeFailureReason: `Исходящий интерфейс ${route.interfaceName} на устройстве ${originNode.name} выключен или не имеет IPv4-адреса.`,
       };
     }
 
@@ -804,6 +1345,10 @@ export function selectSourceInterfaceForTarget(
         isSameSubnet(p.ipAddress, dstIp, p.subnetMask)
     );
     if (sameSubnetPort) {
+      const voiceVlanId =
+        originNode.deviceModel === 'ip_phone' && originNode.voipConfig?.voiceVlan
+          ? originNode.voipConfig.voiceVlan
+          : sameSubnetPort.accessVlan || 1;
       return {
         egressPort: sameSubnetPort,
         egressLogical: {
@@ -812,8 +1357,8 @@ export function selectSourceInterfaceForTarget(
           ipAddress: sameSubnetPort.ipAddress,
           subnetMask: sameSubnetPort.subnetMask,
           macAddress: sameSubnetPort.macAddress,
-          vlanId: sameSubnetPort.accessVlan || 1,
-          isTagged8021Q: sameSubnetPort.vlanMode === 'trunk',
+          vlanId: voiceVlanId,
+          isTagged8021Q: sameSubnetPort.vlanMode === 'trunk' || originNode.deviceModel === 'ip_phone',
         },
       };
     }
@@ -823,7 +1368,7 @@ export function selectSourceInterfaceForTarget(
     (p) => p.adminStatus === 'up' && isValidIpv4(p.ipAddress)
   );
   if (!firstUpPort) {
-    // Also check subinterfaces if router had non-IPv4 target
+    // Also check subinterfaces or SVIs if router/switch had non-IPv4 target
     const firstLogical = getRouterLogicalInterfaces(originNode)[0];
     if (firstLogical) {
       return {
@@ -836,6 +1381,10 @@ export function selectSourceInterfaceForTarget(
       routeFailureReason: `Устройство ${originNode.name} не имеет активного интерфейса с настроенным IPv4-адресом. Запустите DHCP (DORA) или задайте IP вручную.`,
     };
   }
+  const voiceVlanId =
+    originNode.deviceModel === 'ip_phone' && originNode.voipConfig?.voiceVlan
+      ? originNode.voipConfig.voiceVlan
+      : firstUpPort.accessVlan || 1;
   return {
     egressPort: firstUpPort,
     egressLogical: {
@@ -844,8 +1393,8 @@ export function selectSourceInterfaceForTarget(
       ipAddress: firstUpPort.ipAddress,
       subnetMask: firstUpPort.subnetMask,
       macAddress: firstUpPort.macAddress,
-      vlanId: firstUpPort.accessVlan || 1,
-      isTagged8021Q: firstUpPort.vlanMode === 'trunk',
+      vlanId: voiceVlanId,
+      isTagged8021Q: firstUpPort.vlanMode === 'trunk' || originNode.deviceModel === 'ip_phone',
     },
   };
 }
@@ -867,7 +1416,9 @@ function learnMac(switchNode: NetworkNode, mac: string, portName: string, vlan: 
 
 function getL3ProtocolName(proto: ProtocolType, etherType: '0x0806 (ARP)' | '0x0800 (IPv4)'): string {
   if (etherType === '0x0806 (ARP)') return 'ARP (0x0806)';
-  if (proto.startsWith('DHCP') || proto.startsWith('DNS')) return 'UDP (17)';
+  if (proto === 'IPSEC_ESP') return 'ESP (50)';
+  if (proto === 'IKEV2') return 'UDP (17)';
+  if (proto.startsWith('DHCP') || proto.startsWith('DNS') || proto.startsWith('CAPWAP')) return 'UDP (17)';
   if (proto.startsWith('TCP') || proto.startsWith('HTTP')) return 'TCP (6)';
   return 'ICMP (1)';
 }
@@ -891,6 +1442,8 @@ export function getPortNumbers(proto: ProtocolType): { srcPort?: number; dstPort
     case 'TCP_SYN_ACK':
     case 'HTTP_200_OK':
       return { srcPort: 80, dstPort: 49152 };
+    case 'IKEV2':
+      return { srcPort: 500, dstPort: 500 };
     default:
       return {};
   }
@@ -950,6 +1503,7 @@ function buildPduDetails(params: {
 interface FramePropagationItem {
   currentNodeId: string;
   egressPortId: string;
+  originatedFromSvi?: boolean;
   srcMac: string;
   dstMac: string;
   srcIp: string;
@@ -969,14 +1523,18 @@ export interface DeliveredL2FrameInfo {
   port: NetworkInterface;
   logicalPortName: string;
   matchedIp: string;
+  matchedMac?: string;
   vlan: number;
   subinterface?: RouterSubinterface;
+  sviInterface?: SwitchSviInterface;
   helperAddress?: string;
 }
 
 /**
- * Propagates a single L2 frame through switches (enforcing IEEE 802.1D STP Blocking ports and 802.1Q VLANs)
- * until it reaches target L3 interfaces (including Router-on-a-Stick 802.1Q subinterfaces) or gets dropped.
+ * Propagates a single L2 frame through switches (enforcing IEEE 802.1D STP Blocking ports,
+ * IEEE 802.3ad EtherChannel / LACP Port-channel bundles, and 802.1Q VLANs)
+ * until it reaches target L3 interfaces (including Router-on-a-Stick 802.1Q subinterfaces
+ * and Multilayer Switch SVIs `Vlan10`, `Vlan20`) or gets dropped.
  */
 function propagateL2Frame(
   initialItem: FramePropagationItem,
@@ -985,9 +1543,64 @@ function propagateL2Frame(
   steps: SimulationStep[],
   visitedSwitchPorts: Set<string>
 ): { deliveredToNodes: DeliveredL2FrameInfo[] } {
-  const queue: FramePropagationItem[] = [initialItem];
+  const queue: FramePropagationItem[] = [];
   const deliveredToNodes: DeliveredL2FrameInfo[] = [];
   const stpStateMap = computeSpanningTreeState(nodes, links);
+
+  // If the frame is originated directly from a Multilayer Switch SVI (e.g. Vlan10 / Vlan20),
+  // enqueue it across all active STP-forwarding ports on that switch carrying initialItem.vlan
+  // (or just the CAM-matched port if dstMac is unicast and known in macTable).
+  const initialSender = nodes.find((n) => n.id === initialItem.currentNodeId);
+  if (initialSender && initialSender.type === 'switch' && initialItem.originatedFromSvi) {
+    const swStp = stpStateMap[initialSender.id];
+    const camMatch =
+      initialItem.dstMac !== BROADCAST_MAC
+        ? initialSender.macTable.find(
+            (m) => m.macAddress === initialItem.dstMac && m.vlan === initialItem.vlan
+          )
+        : undefined;
+    const usedOriginBundles = new Set<string>();
+
+    for (const swOutPort of initialSender.interfaces) {
+      if (swOutPort.adminStatus !== 'up') continue;
+      if (swStp?.ports[swOutPort.id]?.state === 'blocking') continue;
+
+      const isOutTrunk = swOutPort.vlanMode === 'trunk';
+      if (!isOutTrunk && (swOutPort.accessVlan || 1) !== initialItem.vlan) continue;
+      if (isOutTrunk && !swOutPort.trunkAllowedVlans.includes(initialItem.vlan)) continue;
+
+      const outPeer = getConnectedPeer(initialSender.id, swOutPort.id, nodes, links);
+      if (!outPeer) continue;
+
+      if (camMatch) {
+        const camPort = initialSender.interfaces.find((p) => p.shortName === camMatch.portName);
+        const samePort = swOutPort.shortName === camMatch.portName;
+        const sameChannelGroup =
+          Boolean(camPort?.channelGroup) &&
+          camPort!.channelGroup === swOutPort.channelGroup &&
+          outPeer.peerNode.type === 'switch' &&
+          arePortsInActiveEtherChannel(swOutPort, outPeer.peerPort);
+        if (!samePort && !sameChannelGroup) continue;
+      }
+
+      if (
+        outPeer.peerNode.type === 'switch' &&
+        arePortsInActiveEtherChannel(swOutPort, outPeer.peerPort)
+      ) {
+        const bundleKey = `${outPeer.peerNode.id}:Po${swOutPort.channelGroup}`;
+        if (usedOriginBundles.has(bundleKey)) continue;
+        usedOriginBundles.add(bundleKey);
+      }
+
+      queue.push({
+        ...initialItem,
+        egressPortId: swOutPort.id,
+        isTaggedOnWire: isOutTrunk,
+      });
+    }
+  } else {
+    queue.push(initialItem);
+  }
 
   while (queue.length > 0) {
     const item = queue.shift()!;
@@ -996,64 +1609,205 @@ function propagateL2Frame(
     const senderPort = senderNode.interfaces.find((p) => p.id === item.egressPortId);
     if (!senderPort || senderPort.adminStatus !== 'up') continue;
 
-    const peerInfo = getConnectedPeer(senderNode.id, senderPort.id, nodes, links);
-    if (!peerInfo) continue;
+    const allPeers = getConnectedPeers(senderNode.id, senderPort.id, nodes, links);
+    if (allPeers.length === 0) continue;
 
-    const { link, peerNode, peerPort } = peerInfo;
-    if (visitedSwitchPorts.has(`${link.id}:${senderNode.id}->${peerNode.id}:${item.protocol}`)) continue;
-    visitedSwitchPorts.add(`${link.id}:${senderNode.id}->${peerNode.id}:${item.protocol}`);
+    // On a shared wireless interface (e.g. SOHO Router Wlan0 with multiple associated clients),
+    // direct unicast frames to the matching wireless client if known by MAC or IP.
+    const matchedUnicastPeer =
+      allPeers.length > 1 && item.dstMac !== BROADCAST_MAC
+        ? allPeers.find(
+            (p) =>
+              p.peerPort.macAddress === item.dstMac ||
+              (isValidIpv4(item.dstIp) && p.peerPort.ipAddress === item.dstIp)
+          )
+        : undefined;
+    const targetPeers = matchedUnicastPeer ? [matchedUnicastPeer] : allPeers;
 
-    if (peerPort.adminStatus !== 'up') {
-      const pdu = buildPduDetails({
-        inPort: senderPort.shortName,
-        outPort: peerPort.shortName,
-        cableType: link.cableType,
-        physicalStatus: 'DOWN (Administratively Shutdown)',
-        srcMac: item.srcMac,
-        dstMac: item.dstMac,
-        etherType: item.etherType,
-        vlanTag: item.isTaggedOnWire ? item.vlan : null,
-        srcIp: item.srcIp,
-        dstIp: item.dstIp,
-        ttl: item.ttl,
-        protocol: item.protocol,
-        summary: item.summary,
-        l7: item.l7,
-      });
+    for (const peerInfo of targetPeers) {
+      const { link, peerNode, peerPort } = peerInfo;
+      if (visitedSwitchPorts.has(`${link.id}:${senderNode.id}->${peerNode.id}:${item.protocol}`)) continue;
+      visitedSwitchPorts.add(`${link.id}:${senderNode.id}->${peerNode.id}:${item.protocol}`);
 
-      steps.push({
-        id: `step-${steps.length + 1}`,
-        stepIndex: steps.length + 1,
-        timestampMs: (steps.length + 1) * 180,
-        fromNodeId: senderNode.id,
-        fromNodeName: senderNode.name,
-        fromPortName: senderPort.shortName,
-        toNodeId: peerNode.id,
-        toNodeName: peerNode.name,
-        toPortName: peerPort.shortName,
-        linkId: link.id,
-        protocol: item.protocol,
-        status: 'dropped',
-        vlanTag: item.isTaggedOnWire ? item.vlan : null,
-        inboundPdu: item.inboundPduAtCurrentNode,
-        outboundPdu: pdu,
-        decisionTitle: `Пакет отброшен: порт ${peerNode.name}:${peerPort.shortName} выключен (shutdown)`,
-        osiActions: [
-          {
-            layer: 'L1',
-            title: 'Физический уровень (L1)',
-            detail: `Интерфейс ${peerPort.name} на устройстве ${peerNode.name} находится в состоянии Administratively Down.`,
+      if (peerPort.adminStatus !== 'up' || (link.cableType === 'wireless' && !isLinkOperational(link, nodes))) {
+        const isOutOfWifiRange = link.cableType === 'wireless' && peerPort.adminStatus === 'up';
+        const pdu = buildPduDetails({
+          inPort: senderPort.shortName,
+          outPort: peerPort.shortName,
+          cableType: link.cableType,
+          physicalStatus: isOutOfWifiRange
+            ? 'DOWN (802.11 Out of Coverage / Radio Off)'
+            : 'DOWN (Administratively Shutdown)',
+          srcMac: item.srcMac,
+          dstMac: item.dstMac,
+          etherType: item.etherType,
+          vlanTag: item.isTaggedOnWire ? item.vlan : null,
+          srcIp: item.srcIp,
+          dstIp: item.dstIp,
+          ttl: item.ttl,
+          protocol: item.protocol,
+          summary: item.summary,
+          l7: item.l7,
+        });
+
+        steps.push({
+          id: `step-${steps.length + 1}`,
+          stepIndex: steps.length + 1,
+          timestampMs: (steps.length + 1) * 180,
+          fromNodeId: senderNode.id,
+          fromNodeName: senderNode.name,
+          fromPortName: senderPort.shortName,
+          toNodeId: peerNode.id,
+          toNodeName: peerNode.name,
+          toPortName: peerPort.shortName,
+          linkId: link.id,
+          protocol: item.protocol,
+          status: 'dropped',
+          vlanTag: item.isTaggedOnWire ? item.vlan : null,
+          inboundPdu: item.inboundPduAtCurrentNode,
+          outboundPdu: pdu,
+          decisionTitle: isOutOfWifiRange
+            ? `802.11 Wi-Fi Drop: Устройство ${peerNode.name} находится вне зоны радиопокрытия или радиоканал выключен`
+            : `Пакет отброшен: порт ${peerNode.name}:${peerPort.shortName} выключен (shutdown)`,
+          osiActions: [
+            {
+              layer: 'L1',
+              title: isOutOfWifiRange
+                ? 'Физический радиоканал IEEE 802.11 (No Carrier / Out of Range)'
+                : 'Физический уровень (L1)',
+              detail: isOutOfWifiRange
+                ? `Беспроводной клиент или точка доступа вне радиуса покрытия (RSSI < -90 dBm) либо радиомодуль 802.11 отключён.`
+                : `Интерфейс ${peerPort.name} на устройстве ${peerNode.name} находится в состоянии Administratively Down.`,
+            },
+          ],
+          nodeSnapshotAfter: {
+            arpTable: JSON.parse(JSON.stringify(peerNode.arpTable)),
+            macTable: JSON.parse(JSON.stringify(peerNode.macTable)),
           },
-        ],
-        nodeSnapshotAfter: {
-          arpTable: JSON.parse(JSON.stringify(peerNode.arpTable)),
-          macTable: JSON.parse(JSON.stringify(peerNode.macTable)),
-        },
-      });
-      continue;
-    }
+        });
+        continue;
+      }
 
-    if (peerNode.type === 'switch') {
+      // Check IEEE 802.3af/at PoE power on receiving Powered Device (IP Phone / Wi-Fi AP)
+      if (isPoweredDeviceNode(peerNode)) {
+        const peerPoe = getPoweredDevicePoeState(peerNode, nodes, links);
+        if (!peerPoe.isPowered) {
+          const dropPoePdu = buildPduDetails({
+            inPort: senderPort.shortName,
+            outPort: `${peerPort.shortName} (No PoE Power)`,
+            cableType: link.cableType,
+            physicalStatus: 'DOWN (PoE 802.3af/at Power Off)',
+            srcMac: item.srcMac,
+            dstMac: item.dstMac,
+            etherType: item.etherType,
+            vlanTag: item.isTaggedOnWire ? item.vlan : null,
+            srcIp: item.srcIp,
+            dstIp: item.dstIp,
+            ttl: item.ttl,
+            protocol: item.protocol,
+            summary: item.summary,
+            l7: item.l7,
+          });
+          steps.push({
+            id: `step-${steps.length + 1}`,
+            stepIndex: steps.length + 1,
+            timestampMs: (steps.length + 1) * 180,
+            fromNodeId: senderNode.id,
+            fromNodeName: senderNode.name,
+            fromPortName: senderPort.shortName,
+            toNodeId: peerNode.id,
+            toNodeName: peerNode.name,
+            toPortName: peerPort.shortName,
+            linkId: link.id,
+            protocol: item.protocol,
+            status: 'dropped',
+            vlanTag: item.isTaggedOnWire ? item.vlan : null,
+            inboundPdu: item.inboundPduAtCurrentNode,
+            outboundPdu: dropPoePdu,
+            decisionTitle: `PoE 802.3af/at Drop: Устройство ${peerNode.name} обесточено (${peerPoe.reason || 'нет питания PoE'})`,
+            osiActions: [
+              {
+                layer: 'L1',
+                title: 'Питание Power over Ethernet (IEEE 802.3af/at PoE)',
+                detail:
+                  peerPoe.reason ||
+                  `Устройство ${peerNode.name} не получает питание PoE по витой паре и не может обработать или ретранслировать кадр.`,
+              },
+            ],
+            nodeSnapshotAfter: {
+              arpTable: JSON.parse(JSON.stringify(peerNode.arpTable)),
+              macTable: JSON.parse(JSON.stringify(peerNode.macTable)),
+            },
+          });
+          continue;
+        }
+      }
+
+      // Check GPON Optical Power Budget (1490nm TX / 1310nm RX, LOS < -28.0 dBm) & ONT GPON-SN Authorization
+      const gponEval = evaluateGponLinkTransfer(senderNode, peerNode, nodes, links);
+      if (gponEval.isGponLink && !gponEval.allowed) {
+        const isLosDrop = Boolean(gponEval.ontState?.isLos);
+        const dropGponPdu = buildPduDetails({
+          inPort: senderPort.shortName,
+          outPort: `${peerPort.shortName} (${
+            isLosDrop
+              ? `GPON LOS ${gponEval.ontState?.rxPowerDbm ?? -31} dBm`
+              : `SN UNAUTH ${gponEval.ontState?.gponSn || ''}`
+          })`,
+          cableType: link.cableType,
+          physicalStatus: isLosDrop
+            ? `DOWN (GPON LOS: ${gponEval.ontState?.rxPowerDbm} dBm < ${gponEval.ontState?.losThresholdDbm} dBm)`
+            : `UP / BLOCKED (GPON OMCI SN Unauthorized)`,
+          srcMac: item.srcMac,
+          dstMac: item.dstMac,
+          etherType: item.etherType,
+          vlanTag: item.isTaggedOnWire ? item.vlan : null,
+          srcIp: item.srcIp,
+          dstIp: item.dstIp,
+          ttl: item.ttl,
+          protocol: item.protocol,
+          summary: item.summary,
+          l7: item.l7,
+        });
+        steps.push({
+          id: `step-${steps.length + 1}`,
+          stepIndex: steps.length + 1,
+          timestampMs: (steps.length + 1) * 180,
+          fromNodeId: senderNode.id,
+          fromNodeName: senderNode.name,
+          fromPortName: senderPort.shortName,
+          toNodeId: peerNode.id,
+          toNodeName: peerNode.name,
+          toPortName: peerPort.shortName,
+          linkId: link.id,
+          protocol: item.protocol,
+          status: 'dropped',
+          vlanTag: item.isTaggedOnWire ? item.vlan : null,
+          inboundPdu: item.inboundPduAtCurrentNode,
+          outboundPdu: dropGponPdu,
+          decisionTitle:
+            gponEval.dropTitle ||
+            `GPON Drop: Оптическая линия ${senderNode.name} ↔ ${peerNode.name} недоступна`,
+          osiActions: [
+            {
+              layer: isLosDrop ? 'L1' : 'L2',
+              title: isLosDrop
+                ? `Оптический бюджет GPON ITU-T G.984 (${gponEval.wavelengthNm} нм · LOS Red Alarm)`
+                : `Авторизация терминала GPON PLOAM / OMCI (SN: ${gponEval.ontState?.gponSn})`,
+              detail:
+                gponEval.dropDetail ||
+                `Передача кадра по пассивной оптической сети GPON заблокирована.`,
+            },
+          ],
+          nodeSnapshotAfter: {
+            arpTable: JSON.parse(JSON.stringify(peerNode.arpTable)),
+            macTable: JSON.parse(JSON.stringify(peerNode.macTable)),
+          },
+        });
+        continue;
+      }
+
+      if (peerNode.type === 'switch') {
       const swStp = stpStateMap[peerNode.id];
       const ingressStpPort = swStp?.ports[peerPort.id];
 
@@ -1107,10 +1861,19 @@ function propagateL2Frame(
         continue;
       }
 
+      const isIngressStackLink = isStackInterconnectLink(link, nodes, links);
       let ingressVlan = item.vlan;
-      if (peerPort.vlanMode === 'access') {
-        ingressVlan = peerPort.accessVlan || 1;
-      } else if (peerPort.vlanMode === 'trunk') {
+      if (!isIngressStackLink && peerPort.vlanMode === 'access') {
+        const isVoiceFrameFromPhone =
+          Boolean(peerPort.voiceVlan) &&
+          (item.vlan === peerPort.voiceVlan ||
+            (isVoipPhoneNode(senderNode) && item.srcMac === senderPort.macAddress));
+        if (isVoiceFrameFromPhone && peerPort.voiceVlan) {
+          ingressVlan = peerPort.voiceVlan;
+        } else {
+          ingressVlan = peerPort.accessVlan || 1;
+        }
+      } else if (!isIngressStackLink && peerPort.vlanMode === 'trunk') {
         if (!peerPort.trunkAllowedVlans.includes(item.vlan)) {
           const dropPdu = buildPduDetails({
             inPort: peerPort.shortName,
@@ -1163,6 +1926,107 @@ function propagateL2Frame(
 
       learnMac(peerNode, item.srcMac, peerPort.shortName, ingressVlan);
 
+      // Check if this Multilayer Switch has an active SVI (interface Vlan<ingressVlan>)
+      const matchingSvi = (peerNode.sviInterfaces || []).find(
+        (s) => s.adminStatus === 'up' && s.vlanId === ingressVlan && isValidIpv4(s.ipAddress)
+      );
+
+      if (matchingSvi) {
+        const sviMac = matchingSvi.macAddress || peerPort.macAddress;
+        const sviLogicalName = `Vlan${matchingSvi.vlanId}`;
+
+        const isArpForSvi =
+          item.etherType === '0x0806 (ARP)' &&
+          item.dstIp === matchingSvi.ipAddress &&
+          (item.dstMac === BROADCAST_MAC || item.dstMac === sviMac);
+
+        const isUnicastIpv4ToSvi =
+          item.etherType === '0x0800 (IPv4)' &&
+          (item.dstMac === sviMac || item.dstIp === matchingSvi.ipAddress);
+
+        const isDhcpRelayOnSvi =
+          item.etherType === '0x0800 (IPv4)' &&
+          Boolean(peerNode.ipRoutingEnabled) &&
+          (item.protocol === 'DHCP_DISCOVER' || item.protocol === 'DHCP_REQUEST') &&
+          isValidIpv4(matchingSvi.helperAddress || '');
+
+        if (isArpForSvi || isUnicastIpv4ToSvi || isDhcpRelayOnSvi) {
+          learnArp(peerNode, item.srcIp, item.srcMac, sviLogicalName, ingressVlan);
+          deliveredToNodes.push({
+            node: peerNode,
+            port: peerPort,
+            logicalPortName: sviLogicalName,
+            matchedIp: matchingSvi.ipAddress,
+            matchedMac: sviMac,
+            vlan: ingressVlan,
+            sviInterface: matchingSvi,
+            helperAddress: matchingSvi.helperAddress,
+          });
+
+          // If the frame is unicast to the SVI MAC (e.g., ARP_REPLY or IPv4 packet routed via SVI gateway),
+          // consume it at the SVI L3 engine without flooding to other L2 ports!
+          if (isUnicastIpv4ToSvi || (isArpForSvi && item.dstMac === sviMac)) {
+            const sviInPdu = buildPduDetails({
+              inPort: `${peerPort.shortName} → ${sviLogicalName}`,
+              outPort: peerNode.ipRoutingEnabled
+                ? 'L3 Switch CEF Routing Engine'
+                : `SVI ${sviLogicalName} (${matchingSvi.ipAddress})`,
+              cableType: link.cableType,
+              physicalStatus: 'UP (L3 SVI)',
+              srcMac: item.srcMac,
+              dstMac: item.dstMac,
+              etherType: item.etherType,
+              vlanTag: item.isTaggedOnWire ? ingressVlan : null,
+              srcIp: item.srcIp,
+              dstIp: item.dstIp,
+              ttl: item.ttl,
+              protocol: item.protocol,
+              summary: item.summary,
+              l7: item.l7,
+            });
+
+            steps.push({
+              id: `step-${steps.length + 1}`,
+              stepIndex: steps.length + 1,
+              timestampMs: (steps.length + 1) * 180,
+              fromNodeId: senderNode.id,
+              fromNodeName: senderNode.name,
+              fromPortName: senderPort.shortName,
+              toNodeId: peerNode.id,
+              toNodeName: peerNode.name,
+              toPortName: sviLogicalName,
+              linkId: link.id,
+              protocol: item.protocol,
+              status: 'delivered',
+              vlanTag: item.isTaggedOnWire ? ingressVlan : null,
+              inboundPdu: item.inboundPduAtCurrentNode,
+              outboundPdu: sviInPdu,
+              decisionTitle: `${peerNode.name} (${sviLogicalName}): Принят пакет ${item.protocol} на виртуальный шлюз SVI ${matchingSvi.ipAddress}`,
+              osiActions: [
+                {
+                  layer: 'L2',
+                  title: `Приём кадра на порт ${peerPort.shortName} (VLAN ${ingressVlan})`,
+                  detail: `Обучена CAM-запись ${item.srcMac} → ${peerPort.shortName}. Целевой MAC ${item.dstMac} принадлежит виртуальному интерфейсу коммутатора ${sviLogicalName}.`,
+                },
+                {
+                  layer: 'L3',
+                  title: `Switch Virtual Interface (interface ${sviLogicalName} — ${matchingSvi.ipAddress})`,
+                  detail:
+                    item.dstIp === matchingSvi.ipAddress
+                      ? `Пакет адресован непосредственно IP-интерфейсу ${sviLogicalName} (${matchingSvi.ipAddress}).`
+                      : `Межсетевая маршрутизация L3 Switch (ip routing): декапсуляция кадра VLAN ${ingressVlan} и передача пакета ${item.srcIp} → ${item.dstIp} в матрицу L3-маршрутизации.`,
+                },
+              ],
+              nodeSnapshotAfter: {
+                arpTable: JSON.parse(JSON.stringify(peerNode.arpTable)),
+                macTable: JSON.parse(JSON.stringify(peerNode.macTable)),
+              },
+            });
+            continue;
+          }
+        }
+      }
+
       const camMatch =
         item.dstMac !== BROADCAST_MAC
           ? peerNode.macTable.find((m) => m.macAddress === item.dstMac && m.vlan === ingressVlan)
@@ -1172,11 +2036,17 @@ function propagateL2Frame(
         ? Object.values(swStp.ports).filter((p) => p.state === 'blocking')
         : [];
 
+      const activePoLabel = ingressStpPort?.portChannelName
+        ? ` [${ingressStpPort.portChannelName} · LACP ${ingressStpPort.aggregatedBandwidthMbps || 200}M]`
+        : '';
+
       const inboundAtSwitch = buildPduDetails({
-        inPort: peerPort.shortName,
+        inPort: `${peerPort.shortName}${activePoLabel}`,
         outPort: camMatch ? camMatch.portName : 'Flood (VLAN ' + ingressVlan + ')',
         cableType: link.cableType,
-        physicalStatus: 'UP (1000BASE-T)',
+        physicalStatus: gponEval.isGponLink
+          ? `UP (GPON ${gponEval.wavelengthNm}nm · RX ${gponEval.ontState?.rxPowerDbm} dBm)`
+          : 'UP (1000BASE-T)',
         srcMac: item.srcMac,
         dstMac: item.dstMac,
         etherType: item.etherType,
@@ -1189,13 +2059,27 @@ function propagateL2Frame(
         l7: item.l7,
       });
 
-      const stepStatus: StepStatus = item.dstMac === BROADCAST_MAC || !camMatch ? 'broadcast' : 'forwarded';
+      const sviAnsweredBroadcastArp =
+        Boolean(matchingSvi) &&
+        item.etherType === '0x0806 (ARP)' &&
+        item.dstIp === matchingSvi!.ipAddress &&
+        item.dstMac === BROADCAST_MAC;
+
+      const stepStatus: StepStatus = sviAnsweredBroadcastArp
+        ? 'delivered'
+        : item.dstMac === BROADCAST_MAC || !camMatch
+        ? 'broadcast'
+        : 'forwarded';
 
       const switchOsiActions: SimulationStep['osiActions'] = [
         {
           layer: 'L1',
-          title: `Приём битового потока на порт ${peerPort.shortName}`,
-          detail: `Физический линк ${senderNode.name}:${senderPort.shortName} ↔ ${peerNode.name}:${peerPort.shortName} активен.`,
+          title: gponEval.isGponLink
+            ? gponEval.passSummary || `Оптический канал GPON (${gponEval.wavelengthNm} нм)`
+            : `Приём битового потока на порт ${peerPort.shortName}${activePoLabel}`,
+          detail: gponEval.isGponLink
+            ? gponEval.ontState?.reasonRu || `Оптический сигнал в норме.`
+            : `Физический линк ${senderNode.name}:${senderPort.shortName} ↔ ${peerNode.name}:${peerPort.shortName} активен.`,
         },
         {
           layer: 'L2',
@@ -1210,6 +2094,14 @@ function propagateL2Frame(
             : `Адрес назначения ${item.dstMac} широковещательный или отсутствует в таблице MAC. Кадр дублируется во все активные FWD-порты VLAN ${ingressVlan}, кроме входящего ${peerPort.shortName}.`,
         },
       ];
+
+      if (sviAnsweredBroadcastArp && matchingSvi) {
+        switchOsiActions.push({
+          layer: 'L3',
+          title: `Виртуальный интерфейс SVI Vlan${matchingSvi.vlanId} (${matchingSvi.ipAddress})`,
+          detail: `Коммутатор L3 ${peerNode.name} распознал ARP-запрос к своему шлюзу Vlan${matchingSvi.vlanId} (${matchingSvi.ipAddress}) и формирует ARP Reply с MAC ${matchingSvi.macAddress}.`,
+        });
+      }
 
       if (blockedPortsOnSwitch.length > 0) {
         switchOsiActions.push({
@@ -1232,16 +2124,19 @@ function propagateL2Frame(
         fromPortName: senderPort.shortName,
         toNodeId: peerNode.id,
         toNodeName: peerNode.name,
-        toPortName: peerPort.shortName,
+        toPortName: sviAnsweredBroadcastArp && matchingSvi ? `Vlan${matchingSvi.vlanId}` : peerPort.shortName,
         linkId: link.id,
         protocol: item.protocol,
         status: stepStatus,
         vlanTag: item.isTaggedOnWire ? ingressVlan : null,
         inboundPdu: item.inboundPduAtCurrentNode,
         outboundPdu: inboundAtSwitch,
-        decisionTitle: camMatch
-          ? `${peerNode.name}: Unicast-коммутация по MAC-таблице в порт ${camMatch.portName} (VLAN ${ingressVlan})`
-          : `${peerNode.name}: Лавинная рассылка (Flooding) кадра во все FWD-порты VLAN ${ingressVlan}`,
+        decisionTitle:
+          sviAnsweredBroadcastArp && matchingSvi
+            ? `${peerNode.name} (Vlan${matchingSvi.vlanId}): Принят ARP-запрос к шлюзу SVI ${matchingSvi.ipAddress}`
+            : camMatch
+            ? `${peerNode.name}: Unicast-коммутация по MAC-таблице в порт ${camMatch.portName} (VLAN ${ingressVlan})`
+            : `${peerNode.name}: Лавинная рассылка (Flooding) кадра во все FWD-порты VLAN ${ingressVlan}`,
         osiActions: switchOsiActions,
         nodeSnapshotAfter: {
           arpTable: JSON.parse(JSON.stringify(peerNode.arpTable)),
@@ -1249,18 +2144,84 @@ function propagateL2Frame(
         },
       });
 
+      const ingressChannelGroup =
+        senderNode.type === 'switch' && arePortsInActiveEtherChannel(senderPort, peerPort)
+          ? peerPort.channelGroup
+          : undefined;
+      const arrivedViaStackRing =
+        senderNode.type === 'switch' && isStackInterconnectLink(link, nodes, links);
+      const usedEgressBundles = new Set<string>();
+
       for (const swOutPort of peerNode.interfaces) {
         if (swOutPort.id === peerPort.id || swOutPort.adminStatus !== 'up') continue;
         // STP 802.1D: Do not forward frames out of a port that is in BLOCKING state
         if (swStp?.ports[swOutPort.id]?.state === 'blocking') continue;
-        if (camMatch && swOutPort.shortName !== camMatch.portName) continue;
 
-        const isOutTrunk = swOutPort.vlanMode === 'trunk';
+        const outPeer = getConnectedPeer(peerNode.id, swOutPort.id, nodes, links);
+        if (!outPeer) continue;
+
+        const isOutStackRing =
+          outPeer.peerNode.type === 'switch' &&
+          isStackInterconnectLink(outPeer.link, nodes, links);
+
+        // StackWise Ring Split-Horizon: Never bounce frame back to the same stack member on a redundant stack cable
+        if (arrivedViaStackRing && isOutStackRing && outPeer.peerNode.id === senderNode.id) {
+          continue;
+        }
+
+        // EtherChannel Split-Horizon: If frame arrived on Po<G> from senderNode, never bounce back to senderNode on another link of Po<G>
+        if (
+          ingressChannelGroup !== undefined &&
+          outPeer.peerNode.id === senderNode.id &&
+          arePortsInActiveEtherChannel(swOutPort, outPeer.peerPort) &&
+          swOutPort.channelGroup === ingressChannelGroup
+        ) {
+          continue;
+        }
+
+        if (camMatch) {
+          const camPort = peerNode.interfaces.find((p) => p.shortName === camMatch.portName);
+          const samePort = swOutPort.shortName === camMatch.portName;
+          const sameChannelGroup =
+            Boolean(camPort?.channelGroup) &&
+            camPort!.channelGroup === swOutPort.channelGroup &&
+            outPeer.peerNode.type === 'switch' &&
+            arePortsInActiveEtherChannel(swOutPort, outPeer.peerPort);
+          if (!samePort && !sameChannelGroup) continue;
+        }
+
+        const isVoiceVlanOnAccessPort =
+          swOutPort.vlanMode === 'access' &&
+          Boolean(swOutPort.voiceVlan) &&
+          swOutPort.voiceVlan === ingressVlan;
+        const isOutTrunk =
+          swOutPort.vlanMode === 'trunk' || isOutStackRing || isVoiceVlanOnAccessPort;
         if (!isOutTrunk && (swOutPort.accessVlan || 1) !== ingressVlan) {
           continue;
         }
-        if (isOutTrunk && !swOutPort.trunkAllowedVlans.includes(ingressVlan)) {
+        if (
+          !isOutStackRing &&
+          swOutPort.vlanMode === 'trunk' &&
+          !swOutPort.trunkAllowedVlans.includes(ingressVlan)
+        ) {
           continue;
+        }
+
+        // StackWise Ring Load-Balancing: Only transmit 1 copy of the frame between two stack members
+        if (isOutStackRing) {
+          const stackRingKey = `stackRing:${outPeer.peerNode.id}`;
+          if (usedEgressBundles.has(stackRingKey)) continue;
+          usedEgressBundles.add(stackRingKey);
+        }
+
+        // EtherChannel Load-Balancing: Only transmit 1 copy of the frame across an active Port-channel bundle
+        if (
+          outPeer.peerNode.type === 'switch' &&
+          arePortsInActiveEtherChannel(swOutPort, outPeer.peerPort)
+        ) {
+          const egressBundleKey = `${outPeer.peerNode.id}:Po${swOutPort.channelGroup}`;
+          if (usedEgressBundles.has(egressBundleKey)) continue;
+          usedEgressBundles.add(egressBundleKey);
         }
 
         queue.push({
@@ -1281,7 +2242,101 @@ function propagateL2Frame(
         });
       }
     } else {
-      // Peer is a Router, PC, or Server
+      // Check if peerNode is a Cisco IP Phone acting as a 2-port internal switch (SW <-> PC passthrough)
+      if (isVoipPhoneNode(peerNode)) {
+        const phoneSwPort = peerNode.interfaces[0] || peerPort;
+        const phoneIp = phoneSwPort.ipAddress;
+        const phoneMac = phoneSwPort.macAddress;
+        const phoneVoiceVlan =
+          peerNode.voipConfig?.voiceVlan || phoneSwPort.accessVlan || 20;
+        const isForPhoneItself =
+          item.dstMac === phoneMac ||
+          (item.dstMac === BROADCAST_MAC &&
+            (item.dstIp === phoneIp ||
+              (item.dstIp === BROADCAST_IP && item.vlan === phoneVoiceVlan)));
+
+        if (!isForPhoneItself) {
+          const otherPhonePort = peerNode.interfaces.find(
+            (p) => p.id !== peerPort.id && p.adminStatus === 'up'
+          );
+          const passthroughPeer = otherPhonePort
+            ? getConnectedPeer(peerNode.id, otherPhonePort.id, nodes, links)
+            : null;
+          if (otherPhonePort && passthroughPeer) {
+            const dataVlan =
+              peerNode.voipConfig?.dataVlan || otherPhonePort.accessVlan || item.vlan || 10;
+            const bridgePdu = buildPduDetails({
+              inPort: peerPort.shortName,
+              outPort: `${otherPhonePort.shortName} (PC Passthrough Data VLAN ${dataVlan})`,
+              cableType: link.cableType,
+              physicalStatus: 'UP (IP Phone 2-Port Switch)',
+              srcMac: item.srcMac,
+              dstMac: item.dstMac,
+              etherType: item.etherType,
+              vlanTag: null,
+              srcIp: item.srcIp,
+              dstIp: item.dstIp,
+              ttl: item.ttl,
+              protocol: item.protocol,
+              summary: item.summary,
+              l7: item.l7,
+            });
+            steps.push({
+              id: `step-${steps.length + 1}`,
+              stepIndex: steps.length + 1,
+              timestampMs: (steps.length + 1) * 180,
+              fromNodeId: senderNode.id,
+              fromNodeName: senderNode.name,
+              fromPortName: senderPort.shortName,
+              toNodeId: peerNode.id,
+              toNodeName: peerNode.name,
+              toPortName: `${peerPort.shortName}→${otherPhonePort.shortName}`,
+              linkId: link.id,
+              protocol: item.protocol,
+              status: item.dstMac === BROADCAST_MAC ? 'broadcast' : 'forwarded',
+              vlanTag: null,
+              inboundPdu: item.inboundPduAtCurrentNode,
+              outboundPdu: bridgePdu,
+              decisionTitle: `${peerNode.name} (Встроенный свитч): Сквозная передача кадра Data VLAN ${dataVlan} (${peerPort.shortName} → ${otherPhonePort.shortName})`,
+              osiActions: [
+                {
+                  layer: 'L1',
+                  title: `Сквозной порт IP-телефона (${peerPort.shortName} → ${otherPhonePort.shortName})`,
+                  detail: `Встроенный 2-портовый коммутатор Cisco IP Phone передаёт трафик ПК по одному кабелю с телефоном.`,
+                },
+                {
+                  layer: 'L2',
+                  title: `Разделение Data VLAN ${dataVlan} и Voice VLAN ${phoneVoiceVlan}`,
+                  detail: `Кадр от/к ПК (${item.srcIp} → ${item.dstIp}) передаётся без тега 802.1Q в Data VLAN ${dataVlan}, изолированно от голосового Voice VLAN ${phoneVoiceVlan}.`,
+                },
+              ],
+              nodeSnapshotAfter: {
+                arpTable: JSON.parse(JSON.stringify(peerNode.arpTable)),
+                macTable: JSON.parse(JSON.stringify(peerNode.macTable)),
+              },
+            });
+            queue.push({
+              currentNodeId: peerNode.id,
+              egressPortId: otherPhonePort.id,
+              srcMac: item.srcMac,
+              dstMac: item.dstMac,
+              srcIp: item.srcIp,
+              dstIp: item.dstIp,
+              vlan: dataVlan,
+              isTaggedOnWire: false,
+              etherType: item.etherType,
+              protocol: item.protocol,
+              ttl: item.ttl,
+              summary: item.summary,
+              l7: item.l7,
+              inboundPduAtCurrentNode: bridgePdu,
+            });
+            continue;
+          }
+        }
+      }
+
+      // Peer is a Router, PC, IP Phone (targeting phone itself), or Server
       // Check if peer is a Router with an 802.1Q subinterface matching item.vlan (Router-on-a-Stick)
       const matchedSub =
         peerNode.type === 'router' && Array.isArray(peerPort.subinterfaces)
@@ -1290,11 +2345,46 @@ function propagateL2Frame(
 
       const receiverVlan = matchedSub
         ? matchedSub.vlanId
+        : isVoipPhoneNode(peerNode) && peerNode.voipConfig?.voiceVlan
+        ? peerNode.voipConfig.voiceVlan
         : peerPort.vlanMode === 'access'
         ? peerPort.accessVlan || 1
         : item.vlan;
 
-      const effectivePortIp = matchedSub ? matchedSub.ipAddress : peerPort.ipAddress;
+      // Check if peerNode is part of a Router Stack (HSRP / VSS) answering for a Virtual IP or Virtual MAC
+      const candidateVipForMac =
+        peerNode.stackConfig?.virtualIp &&
+        item.dstMac !== BROADCAST_MAC &&
+        item.dstMac === (peerNode.stackConfig?.virtualMac || '00:00:0C:9F:F0:01')
+          ? peerNode.stackConfig.virtualIp
+          : item.dstIp;
+      const stackVipInfo =
+        peerNode.type === 'router'
+          ? resolveStackVirtualGatewayOnPort(peerNode, peerPort, candidateVipForMac, nodes, links)
+          : null;
+      const isActiveStackVip = Boolean(
+        stackVipInfo?.isVirtualGatewayMatch && stackVipInfo.isActiveResponder
+      );
+      const isStandbyStackVip = Boolean(
+        stackVipInfo?.isVirtualGatewayMatch && !stackVipInfo.isActiveResponder
+      );
+      const isRouterStackBackplaneHop =
+        peerNode.type === 'router' &&
+        senderNode.type === 'router' &&
+        isStackInterconnectLink(link, nodes, links) &&
+        item.dstMac === peerPort.macAddress;
+
+      const effectivePortIp =
+        isActiveStackVip && item.dstIp === stackVipInfo!.virtualIp
+          ? stackVipInfo!.virtualIp
+          : matchedSub
+          ? matchedSub.ipAddress
+          : peerPort.ipAddress;
+      const effectivePortMac =
+        isActiveStackVip &&
+        (item.dstMac === BROADCAST_MAC || item.dstMac === stackVipInfo!.virtualMac)
+          ? stackVipInfo!.virtualMac
+          : peerPort.macAddress;
       const effectiveLogicalName = matchedSub
         ? `${peerPort.shortName}.${matchedSub.vlanId}`
         : peerPort.shortName;
@@ -1309,19 +2399,32 @@ function propagateL2Frame(
       const vlanMismatchOnRoas =
         hasSubinterfaces &&
         !matchedSub &&
+        !isRouterStackBackplaneHop &&
         (!isValidIpv4(peerPort.ipAddress) || (peerPort.accessVlan || 1) !== item.vlan);
 
       const isMacMatch =
         !vlanMismatchOnRoas &&
-        (item.dstMac === BROADCAST_MAC || item.dstMac === peerPort.macAddress);
+        !isStandbyStackVip &&
+        (item.dstMac === BROADCAST_MAC ||
+          item.dstMac === peerPort.macAddress ||
+          (isActiveStackVip && item.dstMac === stackVipInfo!.virtualMac));
       const isTargetIp =
         !vlanMismatchOnRoas &&
+        !isStandbyStackVip &&
         (item.dstIp === effectivePortIp || item.dstIp === BROADCAST_IP);
 
       // RFC 826 ARP cache update discipline:
-      // Update existing entry if srcIp is already known (Merge_flag), or insert new entry ONLY if this port/subinterface IP is the target.
+      // Update existing entry if srcIp is already known (Merge_flag), or insert new entry ONLY if this port/subinterface IP is the target,
+      // and only when srcIp belongs to the receiving interface's local L2 subnet (never overwrite ARP with a transit router's MAC!).
+      const effectivePortMask = matchedSub?.subnetMask || peerPort.subnetMask;
+      const isSrcOnLocalPortSubnet =
+        isValidIpv4(effectivePortIp) &&
+        isValidIpv4(effectivePortMask) &&
+        isSameSubnet(item.srcIp, effectivePortIp, effectivePortMask);
       if (
         isMacMatch &&
+        !isRouterStackBackplaneHop &&
+        isSrcOnLocalPortSubnet &&
         isValidIpv4(item.srcIp) &&
         item.srcIp !== '0.0.0.0' &&
         item.srcIp !== BROADCAST_IP
@@ -1350,12 +2453,26 @@ function propagateL2Frame(
       const isDhcpToClient =
         (item.protocol === 'DHCP_OFFER' || item.protocol === 'DHCP_ACK') && isMacMatch;
 
+      const wanImp = resolveLinkWanImpairment(
+        senderNode,
+        senderPort,
+        peerNode,
+        peerPort,
+        link
+      );
+      const isDroppedByWanImpairment =
+        Boolean(wanImp) &&
+        item.etherType === '0x0800 (IPv4)' &&
+        (wanImp!.packetLossPercent >= 50 || wanImp!.bandwidthLimitMbps <= 0);
+
       const willAccept =
-        isDhcpToServer ||
-        isDhcpToRelayRouter ||
-        isDhcpToClient ||
-        (isMacMatch &&
-          (item.etherType !== '0x0806 (ARP)' || isTargetIp || item.protocol === 'ARP_REPLY'));
+        !isDroppedByWanImpairment &&
+        (isRouterStackBackplaneHop ||
+          isDhcpToServer ||
+          isDhcpToRelayRouter ||
+          isDhcpToClient ||
+          (isMacMatch &&
+            (item.etherType !== '0x0806 (ARP)' || isTargetIp || item.protocol === 'ARP_REPLY')));
 
       const stepStatus: StepStatus = !willAccept
         ? 'dropped'
@@ -1365,9 +2482,17 @@ function propagateL2Frame(
 
       const outPdu = buildPduDetails({
         inPort: effectiveLogicalName,
-        outPort: willAccept ? 'Upper OSI Layers (L3–L7)' : 'Discard (Not for this host)',
+        outPort: isDroppedByWanImpairment
+          ? `WAN Link Drop (Loss ${wanImp!.packetLossPercent}% · BW ${wanImp!.bandwidthLimitMbps}Mbps)`
+          : willAccept
+          ? 'Upper OSI Layers (L3–L7)'
+          : 'Discard (Not for this host)',
         cableType: link.cableType,
-        physicalStatus: 'UP',
+        physicalStatus: isRouterStackBackplaneHop
+          ? 'UP (Stack Backplane)'
+          : wanImp
+          ? `UP (WAN: ${wanImp.latencyMs}ms · Loss ${wanImp.packetLossPercent}% · ${wanImp.bandwidthLimitMbps}Mbps)`
+          : 'UP',
         srcMac: item.srcMac,
         dstMac: item.dstMac,
         etherType: item.etherType,
@@ -1383,32 +2508,58 @@ function propagateL2Frame(
       const osiActions: SimulationStep['osiActions'] = [
         {
           layer: 'L1',
-          title: `Приём кадра на интерфейс ${effectiveLogicalName}`,
-          detail: `Сигнал принят устройством ${peerNode.name} (${effectivePortIp || 'DHCP Client'}).`,
+          title: isDroppedByWanImpairment
+            ? `Потеря пакета на WAN-канале (Packet Loss ${wanImp!.packetLossPercent}% / Эмулятор канала)`
+            : isRouterStackBackplaneHop
+            ? `Приём пакета по стековой шине (${senderNode.name} → ${peerNode.name}:${effectiveLogicalName})`
+            : wanImp
+            ? `Приём кадра по WAN-каналу (${effectiveLogicalName} · +${wanImp.latencyMs} мс)`
+            : `Приём кадра на интерфейс ${effectiveLogicalName}`,
+          detail: isDroppedByWanImpairment
+            ? `Эмулятор канала WAN между ${senderNode.name} и ${peerNode.name} отбросил пакет (${formatWanImpairmentSummary(wanImp!)}).`
+            : isRouterStackBackplaneHop
+            ? `Межшассийный интерконнект стека маршрутизаторов передал кадр напрямую члену стека ${peerNode.name}.`
+            : wanImp
+            ? `Сигнал принят устройством ${peerNode.name} (${effectivePortIp || 'WAN'}). Параметры WAN-канала: ${formatWanImpairmentSummary(wanImp)}.`
+            : `Сигнал принят устройством ${peerNode.name} (${effectivePortIp || 'DHCP Client'}).`,
         },
         {
           layer: 'L2',
           title: matchedSub
             ? `Декапсуляция 802.1Q Subinterface (${effectiveLogicalName}, VLAN ${matchedSub.vlanId})`
+            : isActiveStackVip
+            ? `Виртуальный MAC стека HSRP/VSS (${effectivePortMac})`
             : `Проверка MAC-адреса назначения (${item.dstMac})`,
           detail: matchedSub
             ? `Маршрутизатор ${peerNode.name} распознал тег IEEE 802.1Q VLAN ${matchedSub.vlanId} на подинтерфейсе ${effectiveLogicalName} (${effectivePortIp}).`
+            : isActiveStackVip
+            ? `Узел ${peerNode.name} является активным (MASTER / ACTIVE) шлюзом стека ${stackVipInfo?.stackId} для VIP ${effectivePortIp} (${effectivePortMac}).`
+            : isStandbyStackVip
+            ? `Узел ${peerNode.name} находится в резерве (STANDBY) для VIP ${stackVipInfo?.virtualIp}; запрос обрабатывается активным мастером стека.`
             : isMacMatch
             ? `MAC назначения совпадает с интерфейсом (${peerPort.macAddress}) или является Broadcast. Декапсуляция Ethernet-кадра.`
             : `MAC назначения ${item.dstMac} не принадлежит порту ${peerPort.macAddress} (или отсутствует подинтерфейс для VLAN ${item.vlan}). Кадр отброшен.`,
         },
         {
           layer: 'L3',
-          title: isDhcpToRelayRouter
+          title: isDroppedByWanImpairment
+            ? `Сбой доставки пакета из-за деградации WAN-канала (Packet Loss ${wanImp!.packetLossPercent}%)`
+            : isDhcpToRelayRouter
             ? `DHCP Relay Agent (ip helper-address ${effectiveHelperAddress})`
+            : isRouterStackBackplaneHop
+            ? `Межшассийная маршрутизация стека (Router Stack Backplane)`
             : willAccept
             ? `Обработка пакета (${item.srcIp} → ${item.dstIp}, TTL=${item.ttl})`
             : `Фильтрация пакета на сетевом уровне`,
-          detail: isDhcpToRelayRouter
+          detail: isDroppedByWanImpairment
+            ? `Пакет ${item.protocol} (${item.srcIp} → ${item.dstIp}) уничтожен эмулятором потерь на канале связи (${formatWanImpairmentSummary(wanImp!)}).`
+            : isDhcpToRelayRouter
             ? `Интерфейс ${effectiveLogicalName} (${effectivePortIp}) перехватил широковещательный ${item.protocol} и готовит Unicast-ретрансляцию (giaddr=${effectivePortIp}) к DHCP-серверу ${effectiveHelperAddress}.`
+            : isRouterStackBackplaneHop
+            ? `Член стека ${peerNode.name} принял транзитный пакет от ${senderNode.name} по шине стека для дальнейшей L3-маршрутизации к ${item.dstIp}.`
             : willAccept
             ? `Пакет принят сетевым стеком ${peerNode.name} (${effectiveLogicalName}) и передан обработчику протокола ${item.protocol}.`
-            : `Устройство ${peerNode.name} не является получателем ${item.dstIp} или не обслуживает данный широковещательный запрос.`,
+            : `Устройство ${peerNode.name} не является получателем ${item.dstIp} или находится в режиме Standby.`,
         },
       ];
 
@@ -1422,10 +2573,13 @@ function propagateL2Frame(
         });
       }
 
+      const prevTimestamp = steps.length > 0 ? steps[steps.length - 1].timestampMs : 0;
+      const stepDelayMs = 180 + (wanImp ? wanImp.latencyMs : 0);
+
       steps.push({
         id: `step-${steps.length + 1}`,
         stepIndex: steps.length + 1,
-        timestampMs: (steps.length + 1) * 180,
+        timestampMs: prevTimestamp + stepDelayMs,
         fromNodeId: senderNode.id,
         fromNodeName: senderNode.name,
         fromPortName: senderPort.shortName,
@@ -1438,10 +2592,18 @@ function propagateL2Frame(
         vlanTag: item.isTaggedOnWire ? item.vlan : null,
         inboundPdu: item.inboundPduAtCurrentNode,
         outboundPdu: outPdu,
-        decisionTitle: isDhcpToRelayRouter
+        decisionTitle: isDroppedByWanImpairment
+          ? `${peerNode.name} (${effectiveLogicalName}): Пакет ${item.protocol} потерян на WAN-канале (Packet Loss ${wanImp!.packetLossPercent}% · Задержка ${wanImp!.latencyMs} мс · Полоса ${wanImp!.bandwidthLimitMbps} Мбит/с)`
+          : isDhcpToRelayRouter
           ? `${peerNode.name} (${effectiveLogicalName}): Перехват ${item.protocol} через ip helper-address ${effectiveHelperAddress}`
+          : isRouterStackBackplaneHop
+          ? `${peerNode.name} (${effectiveLogicalName}): Принят транзитный пакет ${item.protocol} по стековой шине от ${senderNode.name}`
+          : isActiveStackVip
+          ? `${peerNode.name} [STACK MASTER]: Обработан запрос ${item.protocol} на виртуальный шлюз VIP ${effectivePortIp}`
           : willAccept
-          ? `${peerNode.name} (${effectiveLogicalName}) обработал пакет ${item.protocol}`
+          ? `${peerNode.name} (${effectiveLogicalName}) обработал пакет ${item.protocol}${wanImp ? ` [WAN +${wanImp.latencyMs}ms]` : ''}`
+          : isStandbyStackVip
+          ? `${peerNode.name} [STACK STANDBY]: Игнорирует запрос к VIP ${stackVipInfo?.virtualIp} (отвечает Master)`
           : `${peerNode.name} (${effectiveLogicalName}) отбросил кадр ${item.protocol} (адресован другому узлу)`,
         osiActions,
         nodeSnapshotAfter: {
@@ -1455,12 +2617,40 @@ function propagateL2Frame(
           node: peerNode,
           port: peerPort,
           logicalPortName: effectiveLogicalName,
-          matchedIp: effectivePortIp,
+          matchedIp: effectivePortIp || item.dstIp,
+          matchedMac: effectivePortMac,
           vlan: receiverVlan,
           subinterface: matchedSub,
           helperAddress: effectiveHelperAddress,
         });
       }
+
+      // If peerNode is a SOHO Wi-Fi Router with multiple wireless clients on peerPort (Wlan0),
+      // bridge frames between wireless clients in the same BSS when needed.
+      if (peerNode.type === 'router' && peerPort.isWireless) {
+        const siblingPeers = getConnectedPeers(peerNode.id, peerPort.id, nodes, links).filter(
+          (p) => p.peerNode.id !== senderNode.id
+        );
+        if (siblingPeers.length > 0 && !isTargetIp) {
+          queue.push({
+            currentNodeId: peerNode.id,
+            egressPortId: peerPort.id,
+            srcMac: item.srcMac,
+            dstMac: item.dstMac,
+            srcIp: item.srcIp,
+            dstIp: item.dstIp,
+            vlan: receiverVlan,
+            isTaggedOnWire: false,
+            etherType: item.etherType,
+            protocol: item.protocol,
+            ttl: item.ttl,
+            summary: item.summary,
+            l7: item.l7,
+            inboundPduAtCurrentNode: outPdu,
+          });
+        }
+      }
+    }
     }
   }
 
@@ -1469,7 +2659,7 @@ function propagateL2Frame(
 
 /**
  * Resolves next-hop IPv4 to MAC via ARP table or generates ARP Request + ARP Reply steps,
- * supporting both standard physical interfaces and 802.1Q router subinterfaces.
+ * supporting physical interfaces, 802.1Q router subinterfaces, and Multilayer Switch SVIs.
  */
 function resolveNextHopArp(
   senderNode: NetworkNode,
@@ -1479,12 +2669,21 @@ function resolveNextHopArp(
   links: NetworkLink[],
   steps: SimulationStep[]
 ): string | null {
+  if (nextHopIp.startsWith('Stack:')) {
+    const peer = getConnectedPeer(senderNode.id, senderLogical.physicalPort.id, nodes, links);
+    if (peer && isLinkOperational(peer.link, nodes)) {
+      return peer.peerPort.macAddress;
+    }
+    return null;
+  }
+
   const existingArp = senderNode.arpTable.find((a) => a.ipAddress === nextHopIp);
   if (existingArp) {
     return existingArp.macAddress;
   }
 
   const senderPort = senderLogical.physicalPort;
+  const senderMac = senderLogical.macAddress || senderPort.macAddress;
   const vlan = senderLogical.vlanId;
   const isTagged = senderLogical.isTagged8021Q;
   const arpReqSummary = `Who has ${nextHopIp}? Tell ${senderLogical.ipAddress}`;
@@ -1494,7 +2693,7 @@ function resolveNextHopArp(
     outPort: senderLogical.logicalName,
     cableType: 'straight',
     physicalStatus: 'UP',
-    srcMac: senderPort.macAddress,
+    srcMac: senderMac,
     dstMac: BROADCAST_MAC,
     etherType: '0x0806 (ARP)',
     vlanTag: isTagged ? vlan : null,
@@ -1509,7 +2708,8 @@ function resolveNextHopArp(
     {
       currentNodeId: senderNode.id,
       egressPortId: senderPort.id,
-      srcMac: senderPort.macAddress,
+      originatedFromSvi: Boolean(senderLogical.sviInterface),
+      srcMac: senderMac,
       dstMac: BROADCAST_MAC,
       srcIp: senderLogical.ipAddress,
       dstIp: nextHopIp,
@@ -1532,15 +2732,20 @@ function resolveNextHopArp(
     return null;
   }
 
-  const replyTagged = Boolean(targetMatch.subinterface) || targetMatch.port.vlanMode === 'trunk';
-  const replySummary = `${nextHopIp} is at ${targetMatch.port.macAddress}`;
+  const targetMac =
+    targetMatch.matchedMac || targetMatch.sviInterface?.macAddress || targetMatch.port.macAddress;
+  const replyTagged =
+    Boolean(targetMatch.subinterface) ||
+    targetMatch.port.vlanMode === 'trunk' ||
+    isVoipPhoneNode(targetMatch.node);
+  const replySummary = `${nextHopIp} is at ${targetMac}`;
   const initialArpReplyPdu = buildPduDetails({
     inPort: 'Internal ARP Stack',
     outPort: targetMatch.logicalPortName,
     cableType: 'straight',
     physicalStatus: 'UP',
-    srcMac: targetMatch.port.macAddress,
-    dstMac: senderPort.macAddress,
+    srcMac: targetMac,
+    dstMac: senderMac,
     etherType: '0x0806 (ARP)',
     vlanTag: replyTagged ? targetMatch.vlan : null,
     srcIp: nextHopIp,
@@ -1554,8 +2759,9 @@ function resolveNextHopArp(
     {
       currentNodeId: targetMatch.node.id,
       egressPortId: targetMatch.port.id,
-      srcMac: targetMatch.port.macAddress,
-      dstMac: senderPort.macAddress,
+      originatedFromSvi: Boolean(targetMatch.sviInterface),
+      srcMac: targetMac,
+      dstMac: senderMac,
       srcIp: nextHopIp,
       dstIp: senderLogical.ipAddress,
       vlan: targetMatch.vlan,
@@ -1572,14 +2778,15 @@ function resolveNextHopArp(
     new Set()
   );
 
-  learnArp(senderNode, nextHopIp, targetMatch.port.macAddress, senderLogical.logicalName, vlan);
-  return targetMatch.port.macAddress;
+  learnArp(senderNode, nextHopIp, targetMac, senderLogical.logicalName, vlan);
+  return targetMac;
 }
 
 /**
- * Transmits an L3 IPv4 packet from originNode to dstIp across L2 switches and L3 routers,
- * supporting:
+ * Transmits an L3 IPv4 packet from originNode to dstIp across L2 switches, Multilayer L3 switches (SVI),
+ * and L3 routers, supporting:
  * - Router-on-a-Stick (802.1Q subinterfaces Fa0/0.10, Fa0/0.20)
+ * - Multilayer Switch SVI Routing (`ip routing` + `interface Vlan10`, `interface Vlan20`)
  * - Router Firewall ACLs (permit / deny with explicit ACL Drop step visualization)
  * - NAT / PAT (Inside -> Outside Source IP translation and Outside -> Inside Destination IP translation)
  * - Custom initial TTL for Traceroute
@@ -1605,6 +2812,17 @@ function transmitIpPacket(
 } {
   let currentL3Node = originNode;
   let currentDstIp = dstIp;
+  if (isPoweredDeviceNode(originNode)) {
+    const originPoe = getPoweredDevicePoeState(originNode, nodes, links);
+    if (!originPoe.isPowered) {
+      return {
+        reachedTargetNode: null,
+        failureReason: `Устройство ${originNode.name} обесточено: ${
+          originPoe.reason || 'отключено питание PoE 802.3af/at'
+        }.`,
+      };
+    }
+  }
   const originSelection = selectSourceInterfaceForTarget(
     originNode,
     currentDstIp,
@@ -1620,6 +2838,8 @@ function transmitIpPacket(
   const activeOriginLogical = originSelection.egressLogical;
   let currentSrcIp = activeOriginLogical.ipAddress;
   let lastIngressLogicalOnRouter: LogicalInterfaceView | undefined = undefined;
+  let activePortForwardOnHop: FirewallPortForwardRule | undefined = undefined;
+  let preDnatDstIpOnHop: string | undefined = undefined;
 
   let ttl = options?.initialTtl ?? 64;
   const maxHops = 8;
@@ -1634,7 +2854,6 @@ function transmitIpPacket(
       });
       if (!aclCheck.allowed && aclCheck.matchedRule) {
         const rule = aclCheck.matchedRule;
-        // If there is a previous step that delivered the packet to this router, mark or append an explicit ACL Drop step
         const dropPortName = lastIngressLogicalOnRouter?.logicalName || activeOriginLogical.logicalName;
         const dropPdu = buildPduDetails({
           inPort: dropPortName,
@@ -1694,11 +2913,15 @@ function transmitIpPacket(
       }
     }
 
-    // Check if currentL3Node owns currentDstIp (after any NAT return translation)
+    // Check if currentL3Node owns currentDstIp (after any NAT/DNAT translation or HSRP Virtual IP)
     const localLogicalMatch = getRouterLogicalInterfaces(currentL3Node).find(
       (v) => v.ipAddress === currentDstIp
     );
-    if (localLogicalMatch && hop > 0) {
+    const isStackVipOwned =
+      currentL3Node.type === 'router' &&
+      Boolean(currentL3Node.stackConfig?.enabled) &&
+      currentL3Node.stackConfig?.virtualIp === currentDstIp;
+    if ((localLogicalMatch || isStackVipOwned) && hop > 0) {
       return {
         reachedTargetNode: currentL3Node,
         usedSourceIp: currentSrcIp,
@@ -1708,22 +2931,25 @@ function transmitIpPacket(
 
     let egressLogical: LogicalInterfaceView | undefined;
     let nextHopIp = currentDstIp;
+    let selectedL3Route: RouteEntry | null = null;
 
-    if (currentL3Node.type === 'router') {
+    if (isL3RoutingNode(currentL3Node)) {
       const route = findBestRoute(currentL3Node, currentDstIp, nodes, links);
       if (!route) {
         return {
           reachedTargetNode: null,
           usedSourceIp: currentSrcIp,
           finalDstIp: currentDstIp,
-          failureReason: `Маршрутизатор ${currentL3Node.name} не имеет маршрута к сети назначения ${currentDstIp} (Destination Net Unreachable).`,
+          failureReason: `Устройство L3 ${currentL3Node.name} не имеет маршрута к сети назначения ${currentDstIp} (Destination Net Unreachable).`,
         };
       }
+      selectedL3Route = route;
       egressLogical = findLogicalInterfaceByName(currentL3Node, route.interfaceName);
-      nextHopIp =
-        route.type === 'C' || route.nextHop === 'Directly Connected'
-          ? currentDstIp
-          : route.nextHop;
+      nextHopIp = route.nextHop?.startsWith('Stack:')
+        ? route.nextHop
+        : route.type === 'C' || route.nextHop === 'Directly Connected'
+        ? currentDstIp
+        : route.nextHop;
     } else {
       egressLogical = activeOriginLogical;
       if (!isSameSubnet(egressLogical.ipAddress, currentDstIp, egressLogical.subnetMask)) {
@@ -1762,13 +2988,108 @@ function transmitIpPacket(
       };
     }
 
-    // 2. NAT / PAT Outbound Translation (Inside -> Outside) on Router
+    // 1b. Check Firewall Security Zones, Stateful Packet Inspection (SPI), Port Forwarding (DNAT), and Site-to-Site IPsec VPN
+    const matchedIpsecTunnel = isFirewallNode(currentL3Node)
+      ? findMatchingIpsecTunnel(currentL3Node, currentSrcIp, currentDstIp, nodes)
+      : undefined;
+    let firewallActionOnHop: { title: string; detail: string; decisionTitle: string } | null = null;
+
+    if (isFirewallNode(currentL3Node) && hop > 0) {
+      const ports = getPortNumbers(protocol);
+      const fwEval = evaluateFirewallZonePolicyAndSpi(
+        currentL3Node,
+        lastIngressLogicalOnRouter?.physicalPort,
+        lastIngressLogicalOnRouter?.subinterface,
+        egressLogical.physicalPort,
+        egressLogical.subinterface,
+        {
+          protocol,
+          srcIp: currentSrcIp,
+          dstIp: currentDstIp,
+          originalDstIp: preDnatDstIpOnHop,
+          srcPort: ports.srcPort,
+          dstPort: ports.dstPort,
+          matchedPortForward: activePortForwardOnHop,
+          matchedIpsecTunnel,
+        }
+      );
+
+      activePortForwardOnHop = undefined;
+      preDnatDstIpOnHop = undefined;
+
+      if (!fwEval.allowed) {
+        const dropPortName =
+          lastIngressLogicalOnRouter?.logicalName || activeOriginLogical.logicalName;
+        const dropPdu = buildPduDetails({
+          inPort: dropPortName,
+          outPort: `ASA ZONE DROP (${fwEval.fromZone.toUpperCase()}:${fwEval.fromLevel} → ${fwEval.toZone.toUpperCase()}:${fwEval.toLevel})`,
+          cableType: 'straight',
+          physicalStatus: 'UP',
+          srcMac: lastIngressLogicalOnRouter?.macAddress || activeOriginLogical.macAddress,
+          dstMac: egressLogical.macAddress,
+          etherType: '0x0800 (IPv4)',
+          vlanTag: null,
+          srcIp: currentSrcIp,
+          dstIp: currentDstIp,
+          ttl,
+          protocol,
+          summary: fwEval.decisionTitle,
+          l7: options?.l7,
+        });
+
+        steps.push({
+          id: `step-${steps.length + 1}`,
+          stepIndex: steps.length + 1,
+          timestampMs: (steps.length + 1) * 180,
+          fromNodeId: currentL3Node.id,
+          fromNodeName: currentL3Node.name,
+          fromPortName: dropPortName,
+          toNodeId: currentL3Node.id,
+          toNodeName: currentL3Node.name,
+          toPortName: 'ASA Stateful Firewall Engine',
+          linkId: '',
+          protocol,
+          status: 'dropped',
+          vlanTag: null,
+          inboundPdu: dropPdu,
+          outboundPdu: dropPdu,
+          decisionTitle: fwEval.decisionTitle,
+          osiActions: [
+            {
+              layer: 'L4',
+              title: fwEval.osiActionTitle,
+              detail: fwEval.osiActionDetail,
+            },
+          ],
+          nodeSnapshotAfter: {
+            arpTable: JSON.parse(JSON.stringify(currentL3Node.arpTable)),
+            macTable: JSON.parse(JSON.stringify(currentL3Node.macTable)),
+          },
+        });
+
+        return {
+          reachedTargetNode: null,
+          usedSourceIp: currentSrcIp,
+          finalDstIp: currentDstIp,
+          failureReason: fwEval.decisionTitle,
+        };
+      }
+
+      firewallActionOnHop = {
+        title: fwEval.osiActionTitle,
+        detail: fwEval.osiActionDetail,
+        decisionTitle: fwEval.decisionTitle,
+      };
+    }
+
+    // 2. NAT / PAT Outbound Translation (Inside -> Outside) on Router / Firewall (with IPsec VPN NAT Exemption)
     const preNatSrcIp = currentSrcIp;
     let natActionDetail: string | null = null;
 
     if (
       currentL3Node.type === 'router' &&
       currentL3Node.natEnabled !== false &&
+      !matchedIpsecTunnel &&
       egressLogical.natRole === 'outside' &&
       isValidIpv4(egressLogical.ipAddress)
     ) {
@@ -1842,9 +3163,15 @@ function transmitIpPacket(
 
     const vlan = egressLogical.vlanId;
     const isTagged = egressLogical.isTagged8021Q;
-    const summaryText =
-      options?.customSummary ||
-      `${protocol} (${currentSrcIp} → ${currentDstIp}, TTL=${ttl})`;
+    const isEnteringIpsecWan =
+      Boolean(matchedIpsecTunnel) &&
+      (egressLogical.natRole === 'outside' ||
+        egressLogical.physicalPort.securityZone === 'outside');
+    const effectiveHopProtocol: ProtocolType = isEnteringIpsecWan ? 'IPSEC_ESP' : protocol;
+    const summaryText = isEnteringIpsecWan && matchedIpsecTunnel
+      ? `IPsec ESP [${matchedIpsecTunnel.cryptoSuite}] Outer(${matchedIpsecTunnel.localPublicIp} → ${matchedIpsecTunnel.peerPublicIp}) | Inner ${protocol}(${currentSrcIp} → ${currentDstIp})`
+      : options?.customSummary ||
+        `${protocol} (${currentSrcIp} → ${currentDstIp}, TTL=${ttl})`;
 
     const initialIpPdu = buildPduDetails({
       inPort:
@@ -1861,7 +3188,7 @@ function transmitIpPacket(
       srcIp: preNatSrcIp,
       dstIp: currentDstIp,
       ttl,
-      protocol,
+      protocol: effectiveHopProtocol,
       summary: summaryText,
       l7: options?.l7,
     });
@@ -1871,6 +3198,7 @@ function transmitIpPacket(
       {
         currentNodeId: currentL3Node.id,
         egressPortId: egressLogical.physicalPort.id,
+        originatedFromSvi: Boolean(egressLogical.sviInterface),
         srcMac: egressLogical.macAddress,
         dstIp: currentDstIp,
         dstMac: nextHopMac,
@@ -1878,7 +3206,7 @@ function transmitIpPacket(
         vlan,
         isTaggedOnWire: isTagged,
         etherType: '0x0800 (IPv4)',
-        protocol,
+        protocol: effectiveHopProtocol,
         ttl,
         summary: summaryText,
         l7: options?.l7,
@@ -1890,6 +3218,16 @@ function transmitIpPacket(
       new Set()
     );
 
+    // If Firewall SPI / Zone / IPsec evaluation occurred on currentL3Node, annotate the step
+    if (firewallActionOnHop && steps.length > stepCountBefore) {
+      const firstNewStep = steps[stepCountBefore];
+      firstNewStep.osiActions.unshift({
+        layer: 'L4',
+        title: firewallActionOnHop.title,
+        detail: firewallActionOnHop.detail,
+      });
+    }
+
     // If NAT translation occurred on currentL3Node, annotate the step that left currentL3Node
     if (natActionDetail && steps.length > stepCountBefore) {
       const firstNewStep = steps[stepCountBefore];
@@ -1900,13 +3238,35 @@ function transmitIpPacket(
       });
     }
 
-    const nextL3Receiver = deliveredToNodes.find((d) => d.port.macAddress === nextHopMac);
+    // If eBGP route was chosen on currentL3Node, annotate the step with AS_PATH and BGP attributes
+    if (selectedL3Route?.type === 'B' && steps.length > stepCountBefore) {
+      const firstNewStep = steps[stepCountBefore];
+      const asPathStr = selectedL3Route.bgpAsPath?.join(' ') || '';
+      firstNewStep.osiActions.unshift({
+        layer: 'L3',
+        title: `Маршрутизация eBGP [AD 20 · AS ${currentL3Node.bgpConfig?.asn || 65000}] (${currentL3Node.name})`,
+        detail: `Выбран лучший путь BGP (*>) к префиксу ${selectedL3Route.network}/${maskToCidr(selectedL3Route.mask)} через Next-Hop ${selectedL3Route.nextHop} (${selectedL3Route.learnedFromRouterName || 'ISP'}): AS_PATH [${asPathStr} i], Weight=${selectedL3Route.bgpWeight ?? 100}, LOCAL_PREF=${selectedL3Route.bgpLocalPref ?? 100}.`,
+      });
+    }
+
+    const nextL3Receiver = deliveredToNodes.find(
+      (d) => (d.matchedMac || d.sviInterface?.macAddress || d.port.macAddress) === nextHopMac
+    );
     if (!nextL3Receiver) {
+      const lastStep = steps[steps.length - 1];
+      const wanLossReason =
+        lastStep &&
+        lastStep.status === 'dropped' &&
+        lastStep.decisionTitle.includes('Packet Loss')
+          ? lastStep.decisionTitle
+          : null;
       return {
         reachedTargetNode: null,
         usedSourceIp: currentSrcIp,
         finalDstIp: currentDstIp,
-        failureReason: `Пакет ${protocol} не достиг следующего L3-узла (${nextHopIp}).`,
+        failureReason:
+          wanLossReason ||
+          `Пакет ${protocol} не достиг следующего L3-узла (${nextHopIp}).`,
       };
     }
 
@@ -1915,20 +3275,59 @@ function transmitIpPacket(
       findLogicalInterfaceByName(receiverNode, nextL3Receiver.logicalPortName) || {
         physicalPort: nextL3Receiver.port,
         subinterface: nextL3Receiver.subinterface,
+        sviInterface: nextL3Receiver.sviInterface,
         logicalName: nextL3Receiver.logicalPortName,
         ipAddress: nextL3Receiver.matchedIp,
-        subnetMask: nextL3Receiver.subinterface?.subnetMask || nextL3Receiver.port.subnetMask,
-        macAddress: nextL3Receiver.port.macAddress,
+        subnetMask:
+          nextL3Receiver.sviInterface?.subnetMask ||
+          nextL3Receiver.subinterface?.subnetMask ||
+          nextL3Receiver.port.subnetMask,
+        macAddress:
+          nextL3Receiver.matchedMac ||
+          nextL3Receiver.sviInterface?.macAddress ||
+          nextL3Receiver.port.macAddress,
         vlanId: nextL3Receiver.vlan,
         isTagged8021Q: Boolean(nextL3Receiver.subinterface) || nextL3Receiver.port.vlanMode === 'trunk',
         helperAddress: nextL3Receiver.helperAddress,
         natRole: nextL3Receiver.subinterface?.natRole || nextL3Receiver.port.natRole,
       };
 
-    // 3. Check Inbound NAT (Outside -> Inside) on receiverNode if it is a router with NAT table
+    // 3a. Check Inbound Port Forwarding (Static NAT / DNAT: Outside -> DMZ/Inside) on Firewall
+    if (isFirewallNode(receiverNode)) {
+      const ports = getPortNumbers(protocol);
+      const dnatRes = evaluateFirewallInboundDnat(
+        receiverNode,
+        receiverLogical.physicalPort,
+        receiverLogical.subinterface,
+        {
+          protocol,
+          srcIp: currentSrcIp,
+          dstIp: currentDstIp,
+          dstPort: ports.dstPort,
+        }
+      );
+      if (dnatRes.translatedDstIp && dnatRes.matchedRule) {
+        preDnatDstIpOnHop = currentDstIp;
+        activePortForwardOnHop = dnatRes.matchedRule;
+        currentDstIp = dnatRes.translatedDstIp;
+        const lastStep = steps[steps.length - 1];
+        if (lastStep && lastStep.toNodeId === receiverNode.id) {
+          lastStep.outboundPdu.l3.dstIp = currentDstIp;
+          lastStep.decisionTitle = `${receiverNode.name} (${receiverLogical.logicalName}): ${dnatRes.osiActionTitle}`;
+          lastStep.osiActions.push({
+            layer: 'L4',
+            title: dnatRes.osiActionTitle || 'Port Forwarding (DNAT)',
+            detail: dnatRes.osiActionDetail || '',
+          });
+        }
+      }
+    }
+
+    // 3b. Check Inbound NAT (Outside -> Inside) on receiverNode if it is a router with NAT table
     if (
       receiverNode.type === 'router' &&
       receiverNode.natEnabled !== false &&
+      !activePortForwardOnHop &&
       receiverLogical.natRole === 'outside' &&
       Array.isArray(receiverNode.natTranslations) &&
       receiverNode.natTranslations.length > 0
@@ -1957,6 +3356,48 @@ function transmitIpPacket(
       (v) => v.ipAddress === currentDstIp
     );
     if (ownsDstIp) {
+      // If receiverNode is a Firewall and traffic targets a higher-security interface on the firewall itself, enforce Zone/SPI policy
+      if (isFirewallNode(receiverNode)) {
+        const targetLogicalOnFw = getRouterLogicalInterfaces(receiverNode).find(
+          (v) => v.ipAddress === currentDstIp
+        );
+        if (targetLogicalOnFw && targetLogicalOnFw.logicalName !== receiverLogical.logicalName) {
+          const ports = getPortNumbers(protocol);
+          const fwSelfCheck = evaluateFirewallZonePolicyAndSpi(
+            receiverNode,
+            receiverLogical.physicalPort,
+            receiverLogical.subinterface,
+            targetLogicalOnFw.physicalPort,
+            targetLogicalOnFw.subinterface,
+            {
+              protocol,
+              srcIp: currentSrcIp,
+              dstIp: currentDstIp,
+              srcPort: ports.srcPort,
+              dstPort: ports.dstPort,
+            }
+          );
+          if (!fwSelfCheck.allowed) {
+            const lastStep = steps[steps.length - 1];
+            if (lastStep && lastStep.toNodeId === receiverNode.id) {
+              lastStep.status = 'dropped';
+              lastStep.decisionTitle = fwSelfCheck.decisionTitle;
+              lastStep.osiActions.push({
+                layer: 'L4',
+                title: fwSelfCheck.osiActionTitle,
+                detail: fwSelfCheck.osiActionDetail,
+              });
+            }
+            return {
+              reachedTargetNode: null,
+              usedSourceIp: currentSrcIp,
+              finalDstIp: currentDstIp,
+              failureReason: fwSelfCheck.decisionTitle,
+            };
+          }
+        }
+      }
+
       // Final check: if the destination itself is a router with ACLs, check ACL before accepting
       if (receiverNode.type === 'router') {
         const aclAtTarget = evaluateRouterAcl(receiverNode, {
@@ -1991,7 +3432,7 @@ function transmitIpPacket(
       };
     }
 
-    if (receiverNode.type === 'router') {
+    if (isL3RoutingNode(receiverNode)) {
       ttl -= 1;
       if (ttl <= 0) {
         return {
@@ -2003,7 +3444,7 @@ function transmitIpPacket(
             ingressPort: nextL3Receiver.port,
             ingressIp: receiverLogical.ipAddress,
           },
-          failureReason: `TTL expired in transit на маршрутизаторе ${receiverNode.name} (${receiverLogical.ipAddress}).`,
+          failureReason: `TTL expired in transit на L3-узле ${receiverNode.name} (${receiverLogical.ipAddress}).`,
         };
       }
       currentL3Node = receiverNode;
@@ -2013,7 +3454,10 @@ function transmitIpPacket(
         reachedTargetNode: null,
         usedSourceIp: currentSrcIp,
         finalDstIp: currentDstIp,
-        failureReason: `Узел ${receiverNode.name} получил пакет для ${currentDstIp}, но не является маршрутизатором.`,
+        failureReason:
+          receiverNode.type === 'switch'
+            ? `Коммутатор ${receiverNode.name} получил пакет для другой подсети (${currentDstIp}), но маршрутизация L3 (ip routing) на нём выключена.`
+            : `Узел ${receiverNode.name} получил пакет для ${currentDstIp}, но не является маршрутизатором.`,
       };
     }
   }
@@ -2038,7 +3482,10 @@ export function runPacketSimulation(
 ): SimulationRunResult {
   const nodes = cloneNodes(nodesInput);
   for (const n of nodes) {
-    if (n.type === 'router') {
+    if (
+      n.type === 'router' ||
+      (n.type === 'switch' && (n.ipRoutingEnabled || (n.sviInterfaces?.length ?? 0) > 0))
+    ) {
       n.routingTable = syncConnectedRoutes(n, nodes, links);
     }
   }
@@ -2152,7 +3599,7 @@ export function runPacketSimulation(
 
 /**
  * 2. DHCP DORA Simulation (Discover -> Offer -> Request -> Ack),
- * supporting both local L2 DHCP servers and Router DHCP Relay (`ip helper-address`).
+ * supporting both local L2 DHCP servers and Router/L3-Switch DHCP Relay (`ip helper-address`).
  */
 export function runDhcpDoraSimulation(
   nodesInput: NetworkNode[],
@@ -2161,7 +3608,10 @@ export function runDhcpDoraSimulation(
 ): SimulationRunResult {
   const nodes = cloneNodes(nodesInput);
   for (const n of nodes) {
-    if (n.type === 'router') {
+    if (
+      n.type === 'router' ||
+      (n.type === 'switch' && (n.ipRoutingEnabled || (n.sviInterfaces?.length ?? 0) > 0))
+    ) {
       n.routingTable = syncConnectedRoutes(n, nodes, links);
     }
   }
@@ -2247,7 +3697,7 @@ export function runDhcpDoraSimulation(
     (d) => d.node.services?.dhcpEnabled && (d.node.services.dhcpPools?.length ?? 0) > 0
   );
 
-  // Check for a DHCP Relay Router (ip helper-address) if no direct DHCP server answered in this VLAN
+  // Check for a DHCP Relay Router or L3 Switch SVI (ip helper-address) if no direct DHCP server answered in this VLAN
   let relayAgent: DeliveredL2FrameInfo | undefined;
   let serverNode: NetworkNode | undefined;
   let serverPort: NetworkInterface | undefined;
@@ -2260,7 +3710,7 @@ export function runDhcpDoraSimulation(
   } else {
     relayAgent = deliveredToNodes.find(
       (d) =>
-        d.node.type === 'router' &&
+        isL3RoutingNode(d.node) &&
         isValidIpv4(d.helperAddress || '') &&
         isValidIpv4(d.matchedIp)
     );
@@ -2330,7 +3780,7 @@ export function runDhcpDoraSimulation(
       (p) => isValidIpv4(poolLookupIp) && isSameSubnet(poolLookupIp, p.network, p.mask)
     ) || serverServices.dhcpPools[0];
 
-  // Allocate an unused IP from pool range (checking all interfaces + subinterfaces on other nodes and active leases)
+  // Allocate an unused IP from pool range (checking all interfaces + subinterfaces + SVIs on other nodes and active leases)
   const usedIps = new Set<string>(
     nodes
       .filter((n) => n.id !== clientNode.id)
@@ -2367,7 +3817,7 @@ export function runDhcpDoraSimulation(
     matchedPool.defaultRouter ||
     '192.168.1.1';
 
-  // Step 2: DHCP OFFER (Server -> Client, or Server -> Relay Router -> Client)
+  // Step 2: DHCP OFFER (Server -> Client, or Server -> Relay Router/L3Switch -> Client)
   const offerL7: OsiPduDetails['l7'] = {
     appProtocol: 'DHCP',
     headline: `DHCP Offer (Message Type 2) — Сервер ${serverNode.name} предлагает адрес ${offeredIp}`,
@@ -2388,13 +3838,15 @@ export function runDhcpDoraSimulation(
       l7: offerL7,
     });
 
+    const relayMac =
+      relayAgent.matchedMac || relayAgent.sviInterface?.macAddress || relayAgent.port.macAddress;
     const relayTagged = Boolean(relayAgent.subinterface) || relayAgent.port.vlanMode === 'trunk';
     const relayOfferPdu = buildPduDetails({
       inPort: 'DHCP Relay Agent',
       outPort: relayAgent.logicalPortName,
       cableType: 'straight',
       physicalStatus: 'UP',
-      srcMac: relayAgent.port.macAddress,
+      srcMac: relayMac,
       dstMac: clientPort.macAddress,
       etherType: '0x0800 (IPv4)',
       vlanTag: relayTagged ? relayAgent.vlan : null,
@@ -2410,7 +3862,8 @@ export function runDhcpDoraSimulation(
       {
         currentNodeId: relayAgent.node.id,
         egressPortId: relayAgent.port.id,
-        srcMac: relayAgent.port.macAddress,
+        originatedFromSvi: Boolean(relayAgent.sviInterface),
+        srcMac: relayMac,
         dstMac: clientPort.macAddress,
         srcIp: relayGiaddr,
         dstIp: offeredIp,
@@ -2539,7 +3992,7 @@ export function runDhcpDoraSimulation(
     );
   }
 
-  // Step 4: DHCP ACK (Server -> Client, or Server -> Relay Router -> Client)
+  // Step 4: DHCP ACK (Server -> Client, or Server -> Relay Router/L3Switch -> Client)
   const ackL7: OsiPduDetails['l7'] = {
     appProtocol: 'DHCP',
     headline: `DHCP ACK (Message Type 5) — Подтверждение аренды ${offeredIp} для ${clientNode.name}`,
@@ -2559,13 +4012,15 @@ export function runDhcpDoraSimulation(
       l7: ackL7,
     });
 
+    const relayMac =
+      relayAgent.matchedMac || relayAgent.sviInterface?.macAddress || relayAgent.port.macAddress;
     const relayTagged = Boolean(relayAgent.subinterface) || relayAgent.port.vlanMode === 'trunk';
     const relayAckPdu = buildPduDetails({
       inPort: 'DHCP Relay Agent',
       outPort: relayAgent.logicalPortName,
       cableType: 'straight',
       physicalStatus: 'UP',
-      srcMac: relayAgent.port.macAddress,
+      srcMac: relayMac,
       dstMac: clientPort.macAddress,
       etherType: '0x0800 (IPv4)',
       vlanTag: relayTagged ? relayAgent.vlan : null,
@@ -2581,7 +4036,8 @@ export function runDhcpDoraSimulation(
       {
         currentNodeId: relayAgent.node.id,
         egressPortId: relayAgent.port.id,
-        srcMac: relayAgent.port.macAddress,
+        originatedFromSvi: Boolean(relayAgent.sviInterface),
+        srcMac: relayMac,
         dstMac: clientPort.macAddress,
         srcIp: relayGiaddr,
         dstIp: offeredIp,
@@ -2650,6 +4106,9 @@ export function runDhcpDoraSimulation(
   clientNode.dnsServer = matchedPool.dnsServer;
   clientNode.ipAssignmentMode = 'dhcp';
 
+  if (!serverServices.dhcpLeases) {
+    serverServices.dhcpLeases = [];
+  }
   const existingLease = serverServices.dhcpLeases.find((l) => l.macAddress === clientPort.macAddress);
   if (existingLease) {
     existingLease.ipAddress = offeredIp;
@@ -2692,7 +4151,10 @@ export function runTracerouteSimulation(
 ): SimulationRunResult {
   const nodes = cloneNodes(nodesInput);
   for (const n of nodes) {
-    if (n.type === 'router') {
+    if (
+      n.type === 'router' ||
+      (n.type === 'switch' && (n.ipRoutingEnabled || (n.sviInterfaces?.length ?? 0) > 0))
+    ) {
       n.routingTable = syncConnectedRoutes(n, nodes, links);
     }
   }
@@ -2885,7 +4347,7 @@ function performDnsLookupTransaction(
   }
 
   const clientIp =
-    selectSourceInterfaceForTarget(clientNode, dnsServerIp).egressLogical?.ipAddress ||
+    selectSourceInterfaceForTarget(clientNode, dnsServerIp, nodes, links).egressLogical?.ipAddress ||
     getRouterLogicalInterfaces(clientNode)[0]?.ipAddress ||
     '';
 
@@ -2965,7 +4427,10 @@ export function runHttpBrowserSimulation(
 ): SimulationRunResult {
   const nodes = cloneNodes(nodesInput);
   for (const n of nodes) {
-    if (n.type === 'router') {
+    if (
+      n.type === 'router' ||
+      (n.type === 'switch' && (n.ipRoutingEnabled || (n.sviInterfaces?.length ?? 0) > 0))
+    ) {
       n.routingTable = syncConnectedRoutes(n, nodes, links);
     }
   }
@@ -3117,3 +4582,294 @@ export function runHttpBrowserSimulation(
     },
   };
 }
+
+/**
+ * 5. VoIP SIP Call (SIP INVITE -> SIP 200 OK -> RTP Audio Stream) Simulation over Voice VLAN & PoE.
+ */
+export function runVoipSipCallSimulation(
+  nodesInput: NetworkNode[],
+  links: NetworkLink[],
+  callerNodeId: string,
+  dialedExtensionOrIp: string
+): SimulationRunResult {
+  const nodes = cloneNodes(nodesInput);
+  for (const n of nodes) {
+    if (
+      n.type === 'router' ||
+      (n.type === 'switch' && (n.ipRoutingEnabled || (n.sviInterfaces?.length ?? 0) > 0))
+    ) {
+      n.routingTable = syncConnectedRoutes(n, nodes, links);
+    }
+  }
+
+  const callerNode = nodes.find((n) => n.id === callerNodeId);
+  if (!callerNode) {
+    return {
+      steps: [],
+      updatedNodes: nodes,
+      success: false,
+      summaryMessage: 'Вызывающий IP-телефон не найден в топологии.',
+    };
+  }
+
+  const callerPoe = getPoweredDevicePoeState(callerNode, nodes, links);
+  if (!callerPoe.isPowered) {
+    return {
+      steps: [],
+      updatedNodes: recordVoipCallHistory(
+        nodes,
+        callerNode.id,
+        undefined,
+        dialedExtensionOrIp,
+        '',
+        false
+      ),
+      success: false,
+      summaryMessage: `Звонок VoIP невозможен: телефон ${callerNode.name} обесточен (${callerPoe.reason}). Включите PoE на порту коммутатора.`,
+    };
+  }
+
+  const { targetPhoneNode, targetIp, extension, sipRegistrarNode } = resolveSipExtensionTarget(
+    dialedExtensionOrIp,
+    nodes
+  );
+
+  if (!targetIp || !isValidIpv4(targetIp)) {
+    return {
+      steps: [],
+      updatedNodes: recordVoipCallHistory(
+        nodes,
+        callerNode.id,
+        undefined,
+        dialedExtensionOrIp,
+        '',
+        false
+      ),
+      success: false,
+      summaryMessage: `Абонент SIP с номером «${dialedExtensionOrIp}» не найден в телефонном справочнике сети.`,
+    };
+  }
+
+  const baseSim = runPacketSimulation(nodes, links, callerNode.id, targetIp, 'ICMP');
+  if (!baseSim.success || !targetPhoneNode) {
+    const updatedWithFail = recordVoipCallHistory(
+      baseSim.updatedNodes,
+      callerNode.id,
+      targetPhoneNode?.id,
+      extension || dialedExtensionOrIp,
+      targetIp,
+      false
+    );
+    return {
+      steps: baseSim.steps,
+      updatedNodes: updatedWithFail,
+      success: false,
+      resolvedIp: targetIp,
+      summaryMessage:
+        baseSim.summaryMessage ||
+        `Вызов SIP к абоненту ${dialedExtensionOrIp} (${targetIp}) не удался.`,
+    };
+  }
+
+  const voipSteps = buildVoipCallStepsFromPath(
+    callerNode,
+    targetPhoneNode,
+    baseSim.steps,
+    sipRegistrarNode
+  );
+  const updatedWithHistory = recordVoipCallHistory(
+    baseSim.updatedNodes,
+    callerNode.id,
+    targetPhoneNode.id,
+    extension || dialedExtensionOrIp,
+    targetIp,
+    true
+  );
+
+  const callerExt = callerNode.voipConfig?.extension || callerNode.name;
+  const calleeExt = targetPhoneNode.voipConfig?.extension || extension || dialedExtensionOrIp;
+  const voiceVlan = callerNode.voipConfig?.voiceVlan || 20;
+  const codec = callerNode.voipConfig?.codec || 'G.711u (64 kbps)';
+
+  return {
+    steps: voipSteps,
+    updatedNodes: updatedWithHistory,
+    success: true,
+    resolvedIp: targetIp,
+    summaryMessage: `Вызов VoIP SIP установлен (${callerNode.name} [Ext ${callerExt}] ↔ ${targetPhoneNode.name} [Ext ${calleeExt}], Voice VLAN ${voiceVlan}, ${codec}, QoS DSCP EF): ${voipSteps.length} шагов (SIP INVITE → 200 OK → RTP Audio).`,
+  };
+}
+
+/**
+ * 6. IP Surveillance RTSP / RTP Video Stream (RTSP SETUP/PLAY -> RTSP 200 OK -> RTP Video Stream Unicast/Multicast) Simulation over Surveillance VLAN & PoE.
+ */
+export function runRtspVideoStreamSimulation(
+  nodesInput: NetworkNode[],
+  links: NetworkLink[],
+  cameraNodeId: string,
+  targetNvrOrMulticast?: string,
+  streamModeOverride?: 'unicast' | 'multicast'
+): SimulationRunResult {
+  const nodes = cloneNodes(nodesInput);
+  for (const n of nodes) {
+    if (
+      n.type === 'router' ||
+      (n.type === 'switch' && (n.ipRoutingEnabled || (n.sviInterfaces?.length ?? 0) > 0))
+    ) {
+      n.routingTable = syncConnectedRoutes(n, nodes, links);
+    }
+  }
+
+  const cameraNode = nodes.find((n) => n.id === cameraNodeId);
+  if (!cameraNode || !isIpCameraNode(cameraNode)) {
+    return {
+      steps: [],
+      updatedNodes: nodes,
+      success: false,
+      summaryMessage: 'PoE IP-камера не найдена в топологии.',
+    };
+  }
+
+  const camPoe = getPoweredDevicePoeState(cameraNode, nodes, links);
+  if (!camPoe.isPowered) {
+    const updatedUnpowered = nodes.map((n) =>
+      n.id === cameraNode.id && n.ipCameraConfig
+        ? {
+            ...n,
+            ipCameraConfig: {
+              ...n.ipCameraConfig,
+              lastStreamStatus: 'blocked' as const,
+            },
+          }
+        : n
+    );
+    return {
+      steps: [],
+      updatedNodes: updatedUnpowered,
+      success: false,
+      summaryMessage: `Трансляция RTSP невозможна: IP-камера ${cameraNode.name} обесточена (${camPoe.reason}). Включите PoE 802.3af/at на порту коммутатора.`,
+    };
+  }
+
+  const resolved = resolveRtspNvrTarget(targetNvrOrMulticast, cameraNode, nodes);
+  const effectiveMode = streamModeOverride || resolved.streamMode;
+  const nvrIp = resolved.nvrIp;
+
+  if (!nvrIp || !isValidIpv4(nvrIp)) {
+    return {
+      steps: [],
+      updatedNodes: nodes,
+      success: false,
+      summaryMessage: `Не найден видеорегистратор NVR для приёма потока RTSP от камеры ${cameraNode.name}.`,
+    };
+  }
+
+  const baseSim = runPacketSimulation(nodes, links, cameraNode.id, nvrIp, 'ICMP');
+  if (!baseSim.success || !resolved.nvrNode) {
+    const updatedFail = baseSim.updatedNodes.map((n) =>
+      n.id === cameraNode.id && n.ipCameraConfig
+        ? {
+            ...n,
+            ipCameraConfig: {
+              ...n.ipCameraConfig,
+              lastStreamStatus: 'blocked' as const,
+              lastStreamTarget: nvrIp,
+            },
+          }
+        : n
+    );
+    return {
+      steps: baseSim.steps,
+      updatedNodes: updatedFail,
+      success: false,
+      resolvedIp: nvrIp,
+      summaryMessage:
+        baseSim.summaryMessage ||
+        `Передача потока RTSP от ${cameraNode.name} к видеорегистратору (${nvrIp}) заблокирована или недоступна.`,
+    };
+  }
+
+  const rtspSteps = buildRtspStreamStepsFromPath(
+    cameraNode,
+    resolved.nvrNode,
+    baseSim.steps,
+    effectiveMode
+  );
+
+  const updatedSuccess = baseSim.updatedNodes.map((n) =>
+    n.id === cameraNode.id && n.ipCameraConfig
+      ? {
+          ...n,
+          ipCameraConfig: {
+            ...n.ipCameraConfig,
+            streamMode: effectiveMode,
+            lastStreamStatus: 'streaming' as const,
+            lastStreamTarget:
+              effectiveMode === 'multicast' ? resolved.multicastGroupIp : nvrIp,
+          },
+        }
+      : n
+  );
+
+  const ch = cameraNode.ipCameraConfig?.channelNumber || 1;
+  const survVlan =
+    cameraNode.ipCameraConfig?.surveillanceVlan ||
+    cameraNode.interfaces[0]?.accessVlan ||
+    30;
+  const codec = cameraNode.ipCameraConfig?.videoCodec || 'H.265 (HEVC 4K · 6 Mbps)';
+  const streamBadge =
+    effectiveMode === 'multicast'
+      ? `IGMP Multicast ${resolved.multicastGroupIp}:5004`
+      : `Unicast RTP ${nvrIp}:5004`;
+
+  return {
+    steps: rtspSteps,
+    updatedNodes: updatedSuccess,
+    success: true,
+    resolvedIp: nvrIp,
+    summaryMessage: `Видеопоток RTSP/RTP активен (${cameraNode.name} [CH-0${ch}] → ${resolved.nvrNode.name}, VLAN ${survVlan}, ${codec}, ${streamBadge}, PoE ${camPoe.watts}W): ${rtspSteps.length} шагов (RTSP PLAY → 200 OK → RTP Video).`,
+  };
+}
+
+/**
+ * 7. eBGP Autonomous System Peering & NLRI Route Exchange Simulation (BGP_OPEN -> BGP_KEEPALIVE -> BGP_UPDATE on TCP 179).
+ */
+export function runBgpPeeringSimulation(
+  nodesInput: NetworkNode[],
+  links: NetworkLink[],
+  routerNodeId: string
+): SimulationRunResult {
+  const nodes = cloneNodes(nodesInput);
+  for (const n of nodes) {
+    if (
+      n.type === 'router' ||
+      (n.type === 'switch' && (n.ipRoutingEnabled || (n.sviInterfaces?.length ?? 0) > 0))
+    ) {
+      n.routingTable = syncConnectedRoutes(n, nodes, links);
+    }
+  }
+
+  const routerNode =
+    nodes.find((n) => n.id === routerNodeId) ||
+    nodes.find((n) => n.type === 'router' && n.bgpConfig?.enabled);
+
+  if (!routerNode) {
+    return {
+      steps: [],
+      updatedNodes: nodes,
+      success: false,
+      summaryMessage: 'Маршрутизатор с поддержкой eBGP не найден в топологии.',
+    };
+  }
+
+  const bgpSim = buildBgpSessionSimulationSteps(routerNode, nodes, links);
+  return {
+    steps: bgpSim.steps,
+    updatedNodes: nodes,
+    success: bgpSim.success,
+    summaryMessage: bgpSim.summaryMessage,
+  };
+}
+
+
+

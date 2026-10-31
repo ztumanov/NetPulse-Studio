@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import {
   CableType,
+  DeviceModel,
   DeviceType,
   HttpResponseResult,
   NetworkLink,
@@ -14,12 +15,21 @@ import {
 import { TOPOLOGY_PRESETS, createDeviceNode } from './network/presets';
 import {
   getRouterLogicalInterfaces,
+  runBgpPeeringSimulation,
   runDhcpDoraSimulation,
   runHttpBrowserSimulation,
   runPacketSimulation,
+  runRtspVideoStreamSimulation,
   runTracerouteSimulation,
+  runVoipSipCallSimulation,
   syncAllRoutersRoutingTables,
 } from './network/simulator';
+import {
+  syncWirelessAssociations,
+  synthesizeCapwapTunnelSteps,
+} from './network/wifiEngine';
+import { synthesizeIpsecVpnSteps } from './network/firewallEngine';
+import { buildJoinedStackNodes } from './network/stackEngine';
 import { synthesizeOspfHelloSteps } from './network/ospfEngine';
 import {
   CoreDiagnosticsReport,
@@ -36,10 +46,19 @@ import {
 } from './network/packetStreamEngine';
 import { isValidIpv4 } from './network/ipMath';
 import { closeChassisWindow, openChassisWindow } from './network/hardwareChassis';
+import {
+  NetworkTroubleDiagnostic,
+  analyzeNetworkTroubles,
+} from './network/networkTroubleshooter';
 import { DeviceToolbar } from './components/DeviceToolbar';
-import { TopologyCanvas, WorkspaceTool } from './components/TopologyCanvas';
+import {
+  PendingCanvasPlacement,
+  TopologyCanvas,
+  WorkspaceTool,
+} from './components/TopologyCanvas';
 import { SimulationTimelineBar } from './components/SimulationTimelineBar';
 import { PduInspectorModal } from './components/PduInspectorModal';
+import { WiresharkAnalyzerModal } from './components/WiresharkAnalyzerModal';
 import { FloatingCliWindow } from './components/FloatingCliWindow';
 import { FloatingPcMonitor } from './components/FloatingPcMonitor';
 import { CheckCircle2, Play, RefreshCw, X } from 'lucide-react';
@@ -101,6 +120,18 @@ export default function App() {
 
   const [activeTool, setActiveTool] = useState<WorkspaceTool>('select');
   const [selectedCableType, setSelectedCableType] = useState<CableType>('straight');
+  const [pendingPlacement, setPendingPlacement] = useState<PendingCanvasPlacement | null>(null);
+
+  // Escape key cancels pending device/zone placement
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && pendingPlacement) {
+        setPendingPlacement(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [pendingPlacement]);
 
   // Collapsible Workspace Panel States
   const [isLeftCollapsed, setIsLeftCollapsed] = useState<boolean>(false);
@@ -170,7 +201,13 @@ export default function App() {
     'Стенд готов. Доступны протоколы L2–L7: ARP, VLAN, STP, OSPF, RIPv2, ICMP Ping, Traceroute, DHCP, DNS и HTTP.'
   );
   const [inspectedStep, setInspectedStep] = useState<SimulationStep | null>(null);
+  const [isWiresharkOpen, setIsWiresharkOpen] = useState<boolean>(false);
   const [diagnosticsReport, setDiagnosticsReport] = useState<CoreDiagnosticsReport | null>(null);
+  const [lastSimRequest, setLastSimRequest] = useState<{
+    sourceNodeId: string;
+    targetIp: string;
+    mode: 'ICMP' | 'TCP';
+  } | null>(null);
 
   // Save topology to localStorage
   useEffect(() => {
@@ -244,26 +281,48 @@ export default function App() {
     setSummaryMessage(`Загружен стенд: «${preset.name}»`);
   };
 
-  const handleAddDevice = (type: DeviceType, switchPortCount: number = 6) => {
-    const countOfType = nodes.filter((n) => n.type === type).length + 1;
-    const offsetX = 320 + ((nodes.length * 60) % 360);
-    const offsetY = 220 + ((nodes.length * 45) % 240);
+  const handleAddDevice = (
+    type: DeviceType,
+    switchPortCount: number = 6,
+    deviceModel?: DeviceModel,
+    customX?: number,
+    customY?: number
+  ) => {
+    const effectiveModel = deviceModel || type;
+    const countOfType =
+      nodes.filter((n) => (n.deviceModel || n.type) === effectiveModel).length + 1;
+    const offsetX =
+      typeof customX === 'number' ? customX : 320 + ((nodes.length * 60) % 360);
+    const offsetY =
+      typeof customY === 'number' ? customY : 220 + ((nodes.length * 45) % 240);
     const newNode = createDeviceNode(
       type,
       countOfType,
       offsetX,
       offsetY,
       undefined,
-      switchPortCount
+      switchPortCount,
+      deviceModel
     );
-    setNodes((prev) => [...prev, newNode]);
+    const synced = syncWirelessAssociations([...nodes, newNode], links);
+    setNodes(syncAllRoutersRoutingTables(synced.nodes, synced.links));
+    setLinks(synced.links);
     setSelectedNodeId(newNode.id);
     setSelectedZoneId(null);
     setActiveTool('select');
-    setSummaryMessage(`Добавлено устройство ${newNode.name} (${newNode.interfaces.length} портов). Настройте порты в плавающем окне или подключите кабель.`);
+    setPendingPlacement(null);
+    if (synced.roamingEvents.length > 0) {
+      setSummaryMessage(
+        `Добавлено устройство ${newNode.name}. ${synced.roamingEvents[synced.roamingEvents.length - 1]}`
+      );
+    } else {
+      setSummaryMessage(
+        `Добавлено устройство ${newNode.name} (${newNode.interfaces.length} портов). Настройте порты или Wi-Fi в плавающем окне.`
+      );
+    }
   };
 
-  const handleAddZone = () => {
+  const handleAddZone = (customX?: number, customY?: number) => {
     const colors: ZoneColor[] = ['sky', 'emerald', 'amber', 'indigo', 'purple', 'rose'];
     const color = colors[zones.length % colors.length];
     const index = zones.length + 1;
@@ -271,8 +330,8 @@ export default function App() {
       id: `zone-${Date.now()}`,
       title: `VLAN ${index * 10} — Subnet Zone ${index}`,
       subnetLabel: `192.168.${index}0.0/24`,
-      x: 180 + ((zones.length * 50) % 300),
-      y: 120 + ((zones.length * 40) % 200),
+      x: typeof customX === 'number' ? Math.max(20, customX - 150) : 180 + ((zones.length * 50) % 300),
+      y: typeof customY === 'number' ? Math.max(20, customY - 110) : 120 + ((zones.length * 40) % 200),
       width: 300,
       height: 220,
       color,
@@ -281,11 +340,102 @@ export default function App() {
     setSelectedNodeId(null);
     setSelectedZoneId(newZone.id);
     setActiveTool('select');
+    setPendingPlacement(null);
     setSummaryMessage(`Добавлена визуальная зона «${newZone.title}». Перетащите заголовок или нажмите значок карандаша для настройки.`);
   };
 
+  const getDevicePlacementLabel = (
+    type: DeviceType,
+    switchPortCount: number = 6,
+    deviceModel?: DeviceModel
+  ): string => {
+    if (deviceModel === 'firewall') return 'Firewall (ASA)';
+    if (deviceModel === 'isp_cloud') return 'WAN / Облако ISP';
+    if (deviceModel === 'gpon_olt') return 'GPON OLT';
+    if (deviceModel === 'gpon_ont') return 'ONT / ONU';
+    if (deviceModel === 'wlc') return 'WLC 5520';
+    if (deviceModel === 'wifi_ap') return 'Wi-Fi AP';
+    if (deviceModel === 'soho_wifi_router') return 'Wi-Fi Роутер';
+    if (deviceModel === 'ip_phone') return 'IP-Телефон';
+    if (deviceModel === 'ip_camera') return 'IP-Камера (PoE)';
+    if (deviceModel === 'nvr') return 'Видеорегистратор NVR';
+    if (deviceModel === 'laptop') return 'Ноутбук';
+    if (deviceModel === 'smartphone') return 'Смартфон';
+    if (type === 'router') return 'Router (L3)';
+    if (type === 'switch') return `Switch ${switchPortCount}p`;
+    if (type === 'server') return 'Сервер (L7)';
+    return 'Хост (PC)';
+  };
+
+  const handleArmDevicePlacement = (
+    type: DeviceType,
+    switchPortCount: number = 6,
+    deviceModel?: DeviceModel
+  ) => {
+    if (
+      pendingPlacement &&
+      pendingPlacement.kind === 'device' &&
+      pendingPlacement.type === type &&
+      (pendingPlacement.switchPortCount ?? 6) === switchPortCount &&
+      pendingPlacement.deviceModel === deviceModel
+    ) {
+      setPendingPlacement(null);
+      return;
+    }
+    const label = getDevicePlacementLabel(type, switchPortCount, deviceModel);
+    setActiveTool('select');
+    setPendingPlacement({
+      kind: 'device',
+      type,
+      switchPortCount,
+      deviceModel,
+      label,
+    });
+    setSummaryMessage(
+      `Выбрано оборудование «${label}» — кликните крестиком в нужную точку области, чтобы разместить его.`
+    );
+  };
+
+  const handleArmZonePlacement = () => {
+    if (pendingPlacement?.kind === 'zone') {
+      setPendingPlacement(null);
+      return;
+    }
+    setActiveTool('select');
+    setPendingPlacement({
+      kind: 'zone',
+      label: 'Зона подсети / VLAN',
+    });
+    setSummaryMessage(
+      'Выбрана «Зона подсети» — кликните крестиком в нужную точку области, чтобы разместить её.'
+    );
+  };
+
+  const handlePlacePendingAt = (x: number, y: number) => {
+    if (!pendingPlacement) return;
+    if (pendingPlacement.kind === 'zone') {
+      handleAddZone(x, y);
+    } else if (pendingPlacement.type) {
+      handleAddDevice(
+        pendingPlacement.type,
+        pendingPlacement.switchPortCount ?? 6,
+        pendingPlacement.deviceModel,
+        x,
+        y
+      );
+    }
+  };
+
   const handleMoveNode = (nodeId: string, x: number, y: number) => {
-    setNodes((prev) => prev.map((n) => (n.id === nodeId ? { ...n, x, y } : n)));
+    const movedNodes = nodes.map((n) => (n.id === nodeId ? { ...n, x, y } : n));
+    const synced = syncWirelessAssociations(movedNodes, links);
+    setNodes(synced.nodes);
+    if (synced.links.length !== links.length || synced.roamingEvents.length > 0) {
+      setLinks(synced.links);
+      if (synced.roamingEvents.length > 0) {
+        setSummaryMessage(synced.roamingEvents[synced.roamingEvents.length - 1]);
+      }
+    }
   };
 
   const handleMoveZone = (zoneId: string, x: number, y: number) => {
@@ -304,10 +454,13 @@ export default function App() {
   };
 
   const handleUpdateNode = (updatedNode: NetworkNode) => {
-    setNodes((prev) => {
-      const next = prev.map((n) => (n.id === updatedNode.id ? updatedNode : n));
-      return syncAllRoutersRoutingTables(next, links);
-    });
+    const replaced = nodes.map((n) => (n.id === updatedNode.id ? updatedNode : n));
+    const synced = syncWirelessAssociations(replaced, links);
+    setLinks(synced.links);
+    setNodes(syncAllRoutersRoutingTables(synced.nodes, synced.links));
+    if (synced.roamingEvents.length > 0) {
+      setSummaryMessage(synced.roamingEvents[synced.roamingEvents.length - 1]);
+    }
   };
 
   const handleCreateLink = (
@@ -326,13 +479,39 @@ export default function App() {
       cableType,
     };
     const nextLinks = [...links, newLink];
-    setLinks(nextLinks);
-    setNodes((prev) => syncAllRoutersRoutingTables(prev, nextLinks));
-    setActiveTool('select');
     const srcNode = nodes.find((n) => n.id === sourceNodeId);
     const dstNode = nodes.find((n) => n.id === targetNodeId);
+
+    let nextNodes = nodes;
+    let stackMsg = '';
+    if (
+      cableType === 'stack' &&
+      srcNode &&
+      dstNode &&
+      srcNode.type === dstNode.type &&
+      (srcNode.type === 'switch' || srcNode.type === 'router')
+    ) {
+      const joined = buildJoinedStackNodes(
+        sourceNodeId,
+        targetNodeId,
+        sourcePortId,
+        targetPortId,
+        nodes
+      );
+      nextNodes = joined.updatedNodes;
+      stackMsg =
+        srcNode.type === 'switch'
+          ? ` Устройства объединены в стек коммутаторов ${joined.stackId} (StackWise-480 · 480 Gbps).`
+          : ` Устройства объединены в стек маршрутизаторов ${joined.stackId} (HSRP / VSS · 80 Gbps).`;
+    }
+
+    setLinks(nextLinks);
+    setNodes(syncAllRoutersRoutingTables(nextNodes, nextLinks));
+    setActiveTool('select');
     setSummaryMessage(
-      `Подключён патч-корд (${cableType}) между ${srcNode?.name || ''} и ${dstNode?.name || ''} (OSPF SPF пересчитан).`
+      `Подключён патч-корд (${cableType === 'stack' ? 'Стек StackWise/HA' : cableType}) между ${
+        srcNode?.name || ''
+      } и ${dstNode?.name || ''}.${stackMsg}`
     );
   };
 
@@ -437,6 +616,7 @@ export default function App() {
     targetIp: string,
     mode: 'ICMP' | 'TCP' = 'ICMP'
   ) => {
+    setLastSimRequest({ sourceNodeId, targetIp, mode });
     const result = runPacketSimulation(nodes, links, sourceNodeId, targetIp, mode);
     setNodes(result.updatedNodes);
     handleLoadSimulationSteps(result.steps, result.summaryMessage);
@@ -528,10 +708,92 @@ export default function App() {
       return;
     }
 
+    if (scenario.actionType === 'capwap_join') {
+      const synced = syncWirelessAssociations(nodes, links);
+      setNodes(synced.nodes);
+      setLinks(synced.links);
+      const capwapSteps = synthesizeCapwapTunnelSteps(synced.nodes, synced.links, 1, 0);
+      if (capwapSteps.length > 0) {
+        handleLoadSimulationSteps(
+          capwapSteps,
+          `Тест «${scenario.title}»: сгенерировано ${capwapSteps.length} пакетов CAPWAP Control (UDP 5246) и CAPWAP Data (UDP 5247).`
+        );
+      } else {
+        setSummaryMessage(
+          'На текущем стенде нет подключённых точек Lightweight AP с активными туннелями CAPWAP.'
+        );
+      }
+      return;
+    }
+
+    if (scenario.actionType === 'ipsec_vpn') {
+      const srcId = scenario.sourceNodeId || 'fw-pc-corp';
+      const dst = scenario.targetIpOrHost || '10.200.1.10';
+      const ikeSteps = synthesizeIpsecVpnSteps(nodes, links, 1, 0);
+      const pingSim = runPacketSimulation(nodes, links, srcId, dst, 'ICMP');
+      setNodes(pingSim.updatedNodes);
+      const combinedSteps = [
+        ...ikeSteps,
+        ...pingSim.steps.map((s, idx) => ({
+          ...s,
+          id: `step-${ikeSteps.length + idx + 1}`,
+          stepIndex: ikeSteps.length + idx + 1,
+          timestampMs: (ikeSteps.length + idx + 1) * 180,
+        })),
+      ];
+      handleLoadSimulationSteps(
+        combinedSteps,
+        `Тест «${scenario.title}»: согласован туннель IKEv2 SA (UDP 500) и передан шифрованный трафик IPsec ESP (AES-256-GCM) между 192.168.100.10 и ${dst}.`
+      );
+      return;
+    }
+
     if (scenario.actionType === 'multi_flow') {
       const batch = generateMultiFlowTrafficSteps(nodes, links, 1);
       setNodes(batch.updatedNodes);
       handleLoadSimulationSteps(batch.steps, batch.summaryMessage);
+      return;
+    }
+
+    if (scenario.actionType === 'voip_call') {
+      const callerId =
+        scenario.sourceNodeId ||
+        nodes.find((n) => n.deviceModel === 'ip_phone')?.id ||
+        '';
+      const targetExt = scenario.targetIpOrHost || '102';
+      if (callerId) {
+        const res = runVoipSipCallSimulation(nodes, links, callerId, targetExt);
+        setNodes(res.updatedNodes);
+        handleLoadSimulationSteps(res.steps, res.summaryMessage);
+      }
+      return;
+    }
+
+    if (scenario.actionType === 'rtsp_stream') {
+      const camId =
+        scenario.sourceNodeId ||
+        nodes.find((n) => n.deviceModel === 'ip_camera')?.id ||
+        '';
+      const targetNvrOrMcast = scenario.targetIpOrHost || '192.168.30.100';
+      if (camId) {
+        const res = runRtspVideoStreamSimulation(nodes, links, camId, targetNvrOrMcast);
+        setNodes(res.updatedNodes);
+        handleLoadSimulationSteps(res.steps, res.summaryMessage);
+      }
+      return;
+    }
+
+    if (scenario.actionType === 'bgp_peering') {
+      const rtrId =
+        scenario.sourceNodeId ||
+        nodes.find((n) => n.type === 'router' && n.bgpConfig?.enabled)?.id ||
+        nodes.find((n) => n.type === 'router')?.id ||
+        '';
+      if (rtrId) {
+        const res = runBgpPeeringSimulation(nodes, links, rtrId);
+        setNodes(res.updatedNodes);
+        handleLoadSimulationSteps(res.steps, res.summaryMessage);
+      }
       return;
     }
 
@@ -607,6 +869,48 @@ export default function App() {
   };
 
   const activeStep = simulationSteps[currentStepIndex] || null;
+  const troubleDiagnostics = React.useMemo(
+    () =>
+      analyzeNetworkTroubles({
+        nodes,
+        links,
+        steps: simulationSteps,
+        summaryMessage,
+        sourceNodeId: lastSimRequest?.sourceNodeId,
+        targetIp: lastSimRequest?.targetIp,
+      }),
+    [nodes, links, simulationSteps, summaryMessage, lastSimRequest]
+  );
+
+  const handleApplyTroubleFix = (diag: NetworkTroubleDiagnostic) => {
+    const fixResult = diag.applyFix(nodes, links);
+    const syncedNodes = syncAllRoutersRoutingTables(
+      fixResult.updatedNodes,
+      fixResult.updatedLinks
+    );
+    setLinks(fixResult.updatedLinks);
+
+    // If there was a recent failed ping/simulation or dropped step, automatically re-verify after applying the fix
+    const hadDroppedSteps = simulationSteps.some((s) => s.status === 'dropped');
+    if (lastSimRequest && (hadDroppedSteps || simulationSteps.length === 0)) {
+      const rerun = runPacketSimulation(
+        syncedNodes,
+        fixResult.updatedLinks,
+        lastSimRequest.sourceNodeId,
+        lastSimRequest.targetIp,
+        lastSimRequest.mode
+      );
+      setNodes(rerun.updatedNodes);
+      handleLoadSimulationSteps(
+        rerun.steps,
+        `[Исправлено в 1 клик] ${fixResult.fixedMessage} → ${rerun.summaryMessage}`
+      );
+    } else {
+      setNodes(syncedNodes);
+      setSummaryMessage(`[Исправлено в 1 клик] ${fixResult.fixedMessage}`);
+    }
+  };
+
   const packetSquares = React.useMemo(
     () =>
       buildCanvasPacketSquares({
@@ -715,11 +1019,15 @@ export default function App() {
           selectedCableType={selectedCableType}
           activePresetId={activePresetId}
           isCollapsed={isLeftCollapsed}
+          pendingPlacement={pendingPlacement}
           onToggleCollapse={() => setIsLeftCollapsed((c) => !c)}
-          onSelectTool={setActiveTool}
+          onSelectTool={(tool) => {
+            setPendingPlacement(null);
+            setActiveTool(tool);
+          }}
           onSelectCableType={setSelectedCableType}
-          onAddDevice={handleAddDevice}
-          onAddZone={handleAddZone}
+          onAddDevice={handleArmDevicePlacement}
+          onAddZone={handleArmZonePlacement}
           onLoadPreset={handleLoadPreset}
           onRunPresetTest={handleRunPresetTest}
           onOpenCoreDiagnostics={handleOpenCoreDiagnostics}
@@ -738,6 +1046,9 @@ export default function App() {
             selectedZoneId={selectedZoneId}
             activeTool={activeTool}
             selectedCableType={selectedCableType}
+            pendingPlacement={pendingPlacement}
+            onPlacePendingAt={handlePlacePendingAt}
+            onCancelPendingPlacement={() => setPendingPlacement(null)}
             activeStep={activeStep}
             packetSquares={packetSquares}
             onSelectNode={setSelectedNodeId}
@@ -793,6 +1104,12 @@ export default function App() {
             filterOptions={filterOptions}
             summaryMessage={summaryMessage}
             isExpanded={isBottomLogExpanded}
+            troubleDiagnostics={troubleDiagnostics}
+            onApplyTroubleFix={handleApplyTroubleFix}
+            onSelectNodeFromTrouble={(nodeId) => {
+              setSelectedZoneId(null);
+              setSelectedNodeId(nodeId);
+            }}
             onToggleExpand={() => setIsBottomLogExpanded((e) => !e)}
             onPlayPause={() => {
               if (!isPlaying && simulationSteps.length === 0) {
@@ -856,6 +1173,10 @@ export default function App() {
             onChangeSearchQuery={(query) =>
               setFilterOptions((prev) => ({ ...prev, searchQuery: query }))
             }
+            onOpenWireshark={() => {
+              setIsPlaying(false);
+              setIsWiresharkOpen(true);
+            }}
           />
         </div>
       </main>
@@ -875,6 +1196,10 @@ export default function App() {
             onFocus={() => setFocusedPcMonitorId(pcNode.id)}
             onUpdateNode={handleUpdateNode}
             onUpdateAllNodes={setNodes}
+            onUpdateLinks={(nextLinks, msg) => {
+              setLinks(nextLinks);
+              if (msg) setSummaryMessage(msg);
+            }}
             onTriggerPingSimulation={handleTriggerPingSimulation}
             onTriggerDhcpSimulation={handleTriggerDhcpSimulation}
             onTriggerTracerouteSimulation={handleTriggerTracerouteSimulation}
@@ -907,6 +1232,26 @@ export default function App() {
       <PduInspectorModal
         step={inspectedStep}
         onClose={() => setInspectedStep(null)}
+        onOpenWireshark={() => {
+          setIsPlaying(false);
+          setIsWiresharkOpen(true);
+        }}
+      />
+
+      {/* Full 3-Pane Wireshark Deep Packet Inspection & Hex Dump Analyzer Modal */}
+      <WiresharkAnalyzerModal
+        isOpen={isWiresharkOpen}
+        steps={simulationSteps}
+        nodes={nodes}
+        currentStepIndex={currentStepIndex}
+        onSelectStepIndex={(idx) => {
+          setIsPlaying(false);
+          setLiveTrafficActive(false);
+          setCurrentStepIndex(idx);
+          setStepProgress(0.58);
+        }}
+        onRunDemoCapture={handleRunDefaultDemoSimulation}
+        onClose={() => setIsWiresharkOpen(false)}
       />
 
       {/* Modal for Core & Multi-Preset L1-L7 Self-Diagnostics Report */}
@@ -921,7 +1266,7 @@ export default function App() {
                 <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
                 <div>
                   <h2 className="text-sm font-bold text-slate-100">
-                    Отчёт самопроверки сетевого ядра и всех 7 лабораторных стендов (L1–L7)
+                    Отчёт самопроверки сетевого ядра и всех {TOPOLOGY_PRESETS.length} лабораторных стендов (L1–L7)
                   </h2>
                   <p className="text-xs text-slate-400 font-mono">
                     Пройдено: {diagnosticsReport.passedChecks} из {diagnosticsReport.totalChecks} проверок · Время выполнения: {diagnosticsReport.totalDurationMs} мс

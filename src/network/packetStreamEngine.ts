@@ -8,6 +8,7 @@ import {
   runHttpBrowserSimulation,
   runPacketSimulation,
 } from './simulator';
+import { synthesizeCapwapTunnelSteps } from './wifiEngine';
 import {
   NetworkLink,
   NetworkNode,
@@ -114,7 +115,7 @@ export function createDefaultEnabledCategories(): Record<ProtocolFilterCategory,
 export function getProtocolCategory(protocol: ProtocolType): ProtocolFilterCategory {
   if (protocol.startsWith('ARP')) return 'ARP';
   if (protocol.startsWith('ICMP')) return 'ICMP';
-  if (protocol.startsWith('DHCP')) return 'DHCP';
+  if (protocol.startsWith('DHCP') || protocol.startsWith('CAPWAP')) return 'DHCP';
   if (protocol.startsWith('DNS')) return 'DNS';
   if (protocol === 'STP_BPDU') return 'STP';
   if (protocol === 'OSPF_HELLO' || protocol === 'OSPF_LSA') return 'OSPF';
@@ -144,11 +145,106 @@ export function getProtocolVisualMeta(
     };
   }
 
+  if (protocol === 'CAPWAP_CONTROL' || protocol === 'CAPWAP_DATA') {
+    return {
+      category,
+      shortLabel: protocol === 'CAPWAP_CONTROL' ? 'CAPWAP' : 'CW-DATA',
+      microGlyph: 'W',
+      fillHex: '#06b6d4',
+      borderHex: '#a5f3fc',
+      glowHex: 'rgba(6, 182, 212, 0.85)',
+      trailHex: '#22d3ee',
+      badgeClass: 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50',
+      squareClass:
+        'bg-cyan-500 border-cyan-200 text-slate-950 shadow-[0_0_11px_rgba(6,182,212,0.88)]',
+      isDropped: false,
+    };
+  }
+
+  if (protocol === 'IKEV2' || protocol === 'IPSEC_ESP') {
+    return {
+      category,
+      shortLabel: protocol === 'IKEV2' ? 'IKEv2' : 'ESP',
+      microGlyph: '🔒',
+      fillHex: '#10b981',
+      borderHex: '#a7f3d0',
+      glowHex: 'rgba(16, 185, 129, 0.85)',
+      trailHex: '#34d399',
+      badgeClass: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50',
+      squareClass:
+        'bg-emerald-500 border-emerald-200 text-slate-950 shadow-[0_0_11px_rgba(16,185,129,0.88)]',
+      isDropped: false,
+    };
+  }
+
+  if (protocol === 'SIP_INVITE' || protocol === 'SIP_200_OK' || protocol === 'RTP_AUDIO') {
+    return {
+      category,
+      shortLabel:
+        protocol === 'SIP_INVITE'
+          ? 'SIP INV'
+          : protocol === 'SIP_200_OK'
+          ? 'SIP 200'
+          : 'RTP VOIP',
+      microGlyph: protocol === 'RTP_AUDIO' ? '♪' : '☎',
+      fillHex: '#d946ef',
+      borderHex: '#f5d0fe',
+      glowHex: 'rgba(217, 70, 239, 0.85)',
+      trailHex: '#e879f9',
+      badgeClass: 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/50',
+      squareClass:
+        'bg-fuchsia-500 border-fuchsia-200 text-slate-950 shadow-[0_0_11px_rgba(217,70,239,0.88)]',
+      isDropped: false,
+    };
+  }
+
+  if (protocol === 'RTSP_SETUP' || protocol === 'RTSP_200_OK' || protocol === 'RTP_VIDEO') {
+    return {
+      category,
+      shortLabel:
+        protocol === 'RTSP_SETUP'
+          ? 'RTSP PLAY'
+          : protocol === 'RTSP_200_OK'
+          ? 'RTSP 200'
+          : 'RTP VIDEO',
+      microGlyph: 'V',
+      fillHex: '#14b8a6',
+      borderHex: '#99f6e4',
+      glowHex: 'rgba(20, 184, 166, 0.88)',
+      trailHex: '#2dd4bf',
+      badgeClass: 'bg-teal-500/20 text-teal-300 border-teal-500/50',
+      squareClass:
+        'bg-teal-500 border-teal-200 text-slate-950 shadow-[0_0_11px_rgba(20,184,166,0.88)]',
+      isDropped: false,
+    };
+  }
+
+  if (protocol === 'BGP_OPEN' || protocol === 'BGP_KEEPALIVE' || protocol === 'BGP_UPDATE') {
+    return {
+      category,
+      shortLabel:
+        protocol === 'BGP_OPEN'
+          ? 'BGP OPEN'
+          : protocol === 'BGP_KEEPALIVE'
+          ? 'BGP KEEP'
+          : 'BGP UPD',
+      microGlyph: 'B',
+      fillHex: '#0284c7',
+      borderHex: '#bae6fd',
+      glowHex: 'rgba(2, 132, 199, 0.88)',
+      trailHex: '#38bdf8',
+      badgeClass: 'bg-sky-500/20 text-sky-300 border-sky-500/50',
+      squareClass:
+        'bg-sky-500 border-sky-200 text-slate-950 shadow-[0_0_11px_rgba(56,189,248,0.88)]',
+      isDropped: false,
+    };
+  }
+
   switch (category) {
     case 'ARP':
       return {
         category,
-        shortLabel: protocol === 'ARP_Request' || protocol === 'ARP_REQUEST' ? 'ARP?' : 'ARP!',
+        shortLabel: protocol === 'ARP_REQUEST' ? 'ARP?' : 'ARP!',
         microGlyph: 'A',
         fillHex: '#f59e0b',
         borderHex: '#fde68a',
@@ -497,6 +593,10 @@ export function generateMultiFlowTrafficSteps(
   // 1b. Add OSPFv2 Hello (224.0.0.5) & LSA Link-State Update packets between routers
   const ospfSteps = synthesizeOspfHelloSteps(workingNodes, links, nextStepIndex, 0);
   appendSteps(ospfSteps);
+
+  // 1c. Add WLC CAPWAP Control (UDP 5246) & Data (UDP 5247) packets between Lightweight APs and WLC
+  const capwapSteps = synthesizeCapwapTunnelSteps(workingNodes, links, nextStepIndex, 0);
+  appendSteps(capwapSteps);
 
   // 2. Check if any PC in DHCP mode lacks an IP -> run DHCP DORA
   const dhcpClient = workingNodes.find(

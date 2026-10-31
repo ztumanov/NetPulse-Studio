@@ -1,6 +1,7 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import {
   CableType,
+  DeviceModel,
   DeviceType,
   NetworkInterface,
   NetworkLink,
@@ -12,13 +13,39 @@ import {
 import { formatCidr } from '../network/ipMath';
 import {
   computeSpanningTreeState,
+  getEtherChannelBundles,
   getRouterLogicalInterfaces,
   isLinkOperational,
 } from '../network/simulator';
+import {
+  computeWifiSignalMetrics,
+  isWifiAccessPointNode,
+} from '../network/wifiEngine';
+import {
+  getNodeStackStatus,
+  isStackInterconnectLink,
+} from '../network/stackEngine';
+import {
+  computeSwitchPoeStatus,
+  getPoweredDevicePoeState,
+  isIpCameraNode,
+  isNvrServerNode,
+  isVoipPhoneNode,
+} from '../network/poeAndVoipEngine';
+import {
+  computeGponOntOpticalState,
+  isGponLinkPair,
+  isGponOltNode,
+  isGponOntNode,
+} from '../network/gponEngine';
 import { HardwareFrontPanel } from './HardwareFrontPanel';
 import { FloatingSwitchWebGui } from './FloatingSwitchWebGui';
 import { FloatingRouterGui } from './FloatingRouterGui';
 import { CanvasPacketSquareDescriptor } from '../network/packetStreamEngine';
+import {
+  CableDisplayMode,
+  computeTopologyLinkHeatmap,
+} from '../network/linkHeatmapEngine';
 import {
   Router,
   Network,
@@ -32,17 +59,37 @@ import {
   Trash2,
   Layers,
   Pencil,
-  PanelRightOpen,
   Tag,
   HelpCircle,
   Cpu,
   Terminal,
-  Settings2,
   Plus,
   Globe,
+  Wifi,
+  Radio,
+  Laptop,
+  Smartphone,
+  Shield,
+  PhoneCall,
+  Camera,
+  Video,
+  Zap,
+  Cloud,
+  ChevronDown,
+  ChevronRight,
+  Activity,
+  Gauge,
 } from 'lucide-react';
 
 export type WorkspaceTool = 'select' | 'cable' | 'pdu' | 'delete';
+
+export interface PendingCanvasPlacement {
+  kind: 'device' | 'zone';
+  type?: DeviceType;
+  switchPortCount?: number;
+  deviceModel?: DeviceModel;
+  label: string;
+}
 
 interface TopologyCanvasProps {
   nodes: NetworkNode[];
@@ -52,6 +99,9 @@ interface TopologyCanvasProps {
   selectedZoneId: string | null;
   activeTool: WorkspaceTool;
   selectedCableType: CableType;
+  pendingPlacement?: PendingCanvasPlacement | null;
+  onPlacePendingAt?: (x: number, y: number) => void;
+  onCancelPendingPlacement?: () => void;
   activeStep: SimulationStep | null;
   packetSquares: CanvasPacketSquareDescriptor[];
   onSelectNode: (nodeId: string | null) => void;
@@ -87,8 +137,14 @@ interface TopologyCanvasProps {
   onSendPduBetweenNodes: (sourceNodeId: string, targetNodeId: string) => void;
   onInspectActiveStep: (step: SimulationStep) => void;
   onSelectAndInspectPacketSquare: (step: SimulationStep, stepIndexZeroBased: number) => void;
-  onAddDeviceAtCenter: (type: DeviceType, switchPortCount?: number) => void;
-  onAddZone: () => void;
+  onAddDeviceAtCenter: (
+    type: DeviceType,
+    switchPortCount?: number,
+    deviceModel?: DeviceModel,
+    customX?: number,
+    customY?: number
+  ) => void;
+  onAddZone: (customX?: number, customY?: number) => void;
 }
 
 type ContextMenuState =
@@ -166,6 +222,9 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   selectedZoneId,
   activeTool,
   selectedCableType,
+  pendingPlacement,
+  onPlacePendingAt,
+  onCancelPendingPlacement,
   activeStep,
   packetSquares,
   onSelectNode,
@@ -206,17 +265,35 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+  const [hoverCanvasPos, setHoverCanvasPos] = useState<{ x: number; y: number } | null>(null);
 
   // Declutter & Hardware Front Panel view options
   const [showZones, setShowZones] = useState(true);
+  const [showWifiCoverage, setShowWifiCoverage] = useState(true);
   const [showPortLabels, setShowPortLabels] = useState(true);
   const [showLegend, setShowLegend] = useState(false);
+  const [cableDisplayMode, setCableDisplayMode] = useState<CableDisplayMode>('standard');
   const [hoveredLinkId, setHoveredLinkId] = useState<string | null>(null);
   const [focusedChassisId, setFocusedChassisId] = useState<string | null>(null);
   const [editingZoneId, setEditingZoneId] = useState<string | null>(null);
 
   // Right-click Context Menu state
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [ctxCategories, setCtxCategories] = useState<{
+    routing: boolean;
+    switching: boolean;
+    wireless: boolean;
+    endpoints: boolean;
+  }>({
+    routing: true,
+    switching: true,
+    wireless: true,
+    endpoints: true,
+  });
+
+  const toggleCtxCategory = (key: keyof typeof ctxCategories) => {
+    setCtxCategories((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
 
   // Cable connection wizard state (shared between Canvas and 1U Front Panel)
   const [cableStart, setCableStart] = useState<{
@@ -240,9 +317,33 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
     );
   };
 
+  const computeSnappedCanvasCoords = (clientX: number, clientY: number) => {
+    if (!containerRef.current) return { x: 360, y: 240 };
+    const rect = containerRef.current.getBoundingClientRect();
+    const rawX = (clientX - rect.left - pan.x) / zoom;
+    const rawY = (clientY - rect.top - pan.y) / zoom;
+    return {
+      x: Math.max(40, Math.round(rawX / 10) * 10),
+      y: Math.max(40, Math.round(rawY / 10) * 10),
+    };
+  };
+
   const handleCanvasMouseDown = (e: React.MouseEvent) => {
-    if (e.button === 2) return; // Right-click is handled by onContextMenu
+    if (e.button === 2) {
+      if (pendingPlacement && onCancelPendingPlacement) {
+        onCancelPendingPlacement();
+      }
+      return; // Right-click is handled by onContextMenu
+    }
     setContextMenu(null);
+
+    // If a device or zone from the left toolbar is armed for placement, place it at the clicked coordinates!
+    if (pendingPlacement && onPlacePendingAt && containerRef.current) {
+      const coords = computeSnappedCanvasCoords(e.clientX, e.clientY);
+      onPlacePendingAt(coords.x, coords.y);
+      return;
+    }
+
     const target = e.target as HTMLElement;
     if (
       target === e.currentTarget ||
@@ -259,6 +360,10 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
 
   const handleCanvasContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
+    if (pendingPlacement && onCancelPendingPlacement) {
+      onCancelPendingPlacement();
+      return;
+    }
     if (!containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
     const x = Math.min(rect.width - 230, Math.max(12, e.clientX - rect.left));
@@ -291,6 +396,9 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
   };
 
   const handleCanvasMouseMove = (e: React.MouseEvent) => {
+    if (pendingPlacement && containerRef.current) {
+      setHoverCanvasPos(computeSnappedCanvasCoords(e.clientX, e.clientY));
+    }
     if (draggingNodeId && containerRef.current) {
       const rect = containerRef.current.getBoundingClientRect();
       const canvasX = (e.clientX - rect.left - pan.x) / zoom - dragOffset.x;
@@ -388,6 +496,12 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
 
   const handleNodeMouseDown = (e: React.MouseEvent, node: NetworkNode) => {
     if (e.button === 2) return;
+    if (pendingPlacement && onPlacePendingAt && containerRef.current) {
+      e.stopPropagation();
+      const coords = computeSnappedCanvasCoords(e.clientX, e.clientY);
+      onPlacePendingAt(coords.x, coords.y);
+      return;
+    }
     if (activeTool !== 'select' || cableStart) return;
     e.stopPropagation();
     setContextMenu(null);
@@ -405,6 +519,11 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
     if (e.button === 2) return;
     e.stopPropagation();
     setContextMenu(null);
+    if (pendingPlacement && onPlacePendingAt && containerRef.current) {
+      const coords = computeSnappedCanvasCoords(e.clientX, e.clientY);
+      onPlacePendingAt(coords.x, coords.y);
+      return;
+    }
     if (activeTool === 'delete') {
       onDeleteZone(zone.id);
       return;
@@ -419,8 +538,44 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
     setDragOffset({ x: mouseCanvasX - zone.x, y: mouseCanvasY - zone.y });
   };
 
-  const renderDeviceIcon = (type: DeviceType) => {
-    switch (type) {
+  const renderDeviceIcon = (node: NetworkNode) => {
+    if (node.deviceModel === 'firewall') {
+      return <Shield className="w-6 h-6 text-rose-400" />;
+    }
+    if (node.deviceModel === 'isp_cloud') {
+      return <Cloud className="w-6 h-6 text-orange-400" />;
+    }
+    if (node.deviceModel === 'wlc') {
+      return <Server className="w-6 h-6 text-cyan-300" />;
+    }
+    if (node.deviceModel === 'wifi_ap') {
+      return <Wifi className="w-6 h-6 text-cyan-400" />;
+    }
+    if (node.deviceModel === 'soho_wifi_router') {
+      return <Radio className="w-6 h-6 text-cyan-400" />;
+    }
+    if (node.deviceModel === 'laptop') {
+      return <Laptop className="w-6 h-6 text-violet-300" />;
+    }
+    if (node.deviceModel === 'smartphone') {
+      return <Smartphone className="w-6 h-6 text-violet-300" />;
+    }
+    if (node.deviceModel === 'ip_phone') {
+      return <PhoneCall className="w-6 h-6 text-fuchsia-400" />;
+    }
+    if (node.deviceModel === 'ip_camera') {
+      return <Camera className="w-6 h-6 text-teal-400" />;
+    }
+    if (node.deviceModel === 'nvr') {
+      return <Video className="w-6 h-6 text-teal-300" />;
+    }
+    if (node.deviceModel === 'gpon_olt') {
+      return <Zap className="w-6 h-6 text-emerald-400" />;
+    }
+    if (node.deviceModel === 'gpon_ont') {
+      return <Cpu className="w-6 h-6 text-teal-400" />;
+    }
+    switch (node.type) {
       case 'router':
         return <Router className="w-6 h-6 text-sky-400" />;
       case 'switch':
@@ -447,6 +602,17 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
 
   const packetPos = getPacketVisualPosition();
   const stpStateMap = computeSpanningTreeState(nodes, links);
+  const etherChannelBundles = getEtherChannelBundles(nodes, links);
+  const linkHeatmapMap = useMemo(
+    () =>
+      computeTopologyLinkHeatmap({
+        nodes,
+        links,
+        activeStep,
+        activeLinkIds: packetSquares.map((p) => p.linkId),
+      }),
+    [nodes, links, activeStep, packetSquares]
+  );
   const selectedNode = nodes.find((n) => n.id === selectedNodeId) || null;
   const openChassisNodes = openChassisNodeIds
     .map((id) => nodes.find((n) => n.id === id))
@@ -497,7 +663,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
         />
       ))}
 
-      {/* Router GUI (Routes / 802.1Q / NAT / ACL) or Switch Web Management Interface (Ports & VLAN Database) */}
+      {/* Router GUI (Routes / 802.1Q / NAT / ACL / Stack) or Switch Web Management Interface (Ports & VLAN & StackWise) */}
       {webGuiNode &&
         (webGuiNode.type === 'router' ? (
           <FloatingRouterGui
@@ -512,6 +678,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
             }}
             onUpdateNode={onUpdateNode}
             onUpdateAllNodes={onUpdateAllNodes}
+            onCreateLink={onCreateLink}
             onLoadSimulationSteps={onLoadSimulationSteps}
             onOpenChassis={(nodeId) => onOpenChassis(nodeId)}
             onOpenFloatingCli={onOpenFloatingCli}
@@ -529,6 +696,9 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
               onOpenWebGui(nodeId);
             }}
             onUpdateNode={onUpdateNode}
+            onUpdateAllNodes={onUpdateAllNodes}
+            onCreateLink={onCreateLink}
+            onLoadSimulationSteps={onLoadSimulationSteps}
             onOpenChassis={(nodeId) => onOpenChassis(nodeId)}
             onOpenFloatingCli={onOpenFloatingCli}
             onCreateZoneFromVlan={onCreateZone}
@@ -543,8 +713,14 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
         onMouseDown={handleCanvasMouseDown}
         onMouseMove={handleCanvasMouseMove}
         onMouseUp={handleCanvasMouseUp}
+        onMouseLeave={() => setHoverCanvasPos(null)}
         onContextMenu={handleCanvasContextMenu}
-        className="relative flex-1 min-h-0 overflow-hidden select-none cursor-grab active:cursor-grabbing"
+        style={pendingPlacement ? { cursor: 'crosshair' } : undefined}
+        className={`relative flex-1 min-h-0 overflow-hidden select-none ${
+          pendingPlacement
+            ? 'cursor-crosshair'
+            : 'cursor-grab active:cursor-grabbing'
+        }`}
       >
         {/* Right-Click Context Menu Overlay */}
         {contextMenu && (
@@ -696,6 +872,22 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                   <span>Подключить патч-корд...</span>
                 </button>
 
+                {(contextMenuNode.type === 'switch' || contextMenuNode.type === 'router') && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      onSelectCableType('stack');
+                      setPortPickerNodeId(contextMenuNode.id);
+                      setContextMenu(null);
+                    }}
+                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-amber-950/80 text-amber-300 font-medium text-left transition-colors cursor-pointer"
+                  >
+                    <Layers className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>Объединить в стек (StackWise / HA)...</span>
+                  </button>
+                )}
+
                 {contextMenuNode.type !== 'switch' && (
                   <button
                     type="button"
@@ -764,69 +956,335 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
 
             {contextMenu.kind === 'canvas' && (
               <>
-                <div className="px-2.5 py-1.5 border-b border-slate-800 text-[11px] font-semibold text-slate-400">
-                  Добавить на холст
+                <div className="px-2.5 py-1.5 border-b border-slate-800 text-[11px] font-semibold text-slate-300 flex items-center justify-between">
+                  <span>Добавить устройство на холст</span>
+                  <span className="text-[9px] font-mono text-slate-500">4 категории</span>
                 </div>
+
+                {/* Category 1: Routing & Security */}
                 <button
                   type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    onAddDeviceAtCenter('router');
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                  onClick={() => toggleCtxCategory('routing')}
+                  className="w-full flex items-center justify-between px-2.5 py-1 mt-0.5 rounded bg-slate-950/70 hover:bg-slate-800/80 text-[11px] font-semibold text-slate-300 transition-colors cursor-pointer"
                 >
-                  <Router className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                  <span>+ Маршрутизатор (Router L3)</span>
+                  <span className="flex items-center gap-1.5">
+                    <Router className="w-3 h-3 text-sky-400 shrink-0" />
+                    <span>Маршрутизация и NGFW</span>
+                  </span>
+                  {ctxCategories.routing ? (
+                    <ChevronDown className="w-3 h-3 text-slate-400" />
+                  ) : (
+                    <ChevronRight className="w-3 h-3 text-slate-400" />
+                  )}
                 </button>
+                {ctxCategories.routing && (
+                  <div className="pl-2 space-y-0.5">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('router');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Router className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                        <span>Router (L3)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">3 порта</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('router', 3, 'firewall');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Shield className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                        <span>Firewall (ASA)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">SPI · VPN</span>
+                    </button>
+                  </div>
+                )}
+
+                {/* Category 2: Switching */}
                 <button
                   type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    onAddDeviceAtCenter('switch', 6);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                  onClick={() => toggleCtxCategory('switching')}
+                  className="w-full flex items-center justify-between px-2.5 py-1 mt-0.5 rounded bg-slate-950/70 hover:bg-slate-800/80 text-[11px] font-semibold text-slate-300 transition-colors cursor-pointer"
                 >
-                  <Network className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                  <span>+ Коммутатор 6 портов (Switch L2)</span>
+                  <span className="flex items-center gap-1.5">
+                    <Network className="w-3 h-3 text-indigo-400 shrink-0" />
+                    <span>Коммутация L2 / L3</span>
+                  </span>
+                  {ctxCategories.switching ? (
+                    <ChevronDown className="w-3 h-3 text-slate-400" />
+                  ) : (
+                    <ChevronRight className="w-3 h-3 text-slate-400" />
+                  )}
                 </button>
+                {ctxCategories.switching && (
+                  <div className="pl-2 space-y-0.5">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('switch', 6);
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Network className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                        <span>Switch 6p (L2)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">6 портов</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('switch', 24);
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Network className="w-3.5 h-3.5 text-indigo-300 shrink-0" />
+                        <span>Switch 24p (L2)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">24 порта</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('switch', 6, 'gpon_olt');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Zap className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        <span>GPON OLT</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-emerald-300">1490/1310нм</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('switch', 4, 'gpon_ont');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Cpu className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                        <span>ONT / ONU Модем</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-teal-300">FTTH · dBm</span>
+                    </button>
+                  </div>
+                )}
+
+                {/* Category 3: Wireless Wi-Fi */}
                 <button
                   type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    onAddDeviceAtCenter('switch', 24);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                  onClick={() => toggleCtxCategory('wireless')}
+                  className="w-full flex items-center justify-between px-2.5 py-1 mt-0.5 rounded bg-slate-950/70 hover:bg-slate-800/80 text-[11px] font-semibold text-slate-300 transition-colors cursor-pointer"
                 >
-                  <Network className="w-3.5 h-3.5 text-indigo-300 shrink-0" />
-                  <span>+ Коммутатор 24 порта (Switch 24p L2)</span>
+                  <span className="flex items-center gap-1.5">
+                    <Wifi className="w-3 h-3 text-cyan-400 shrink-0" />
+                    <span>Беспроводные сети Wi-Fi</span>
+                  </span>
+                  {ctxCategories.wireless ? (
+                    <ChevronDown className="w-3 h-3 text-slate-400" />
+                  ) : (
+                    <ChevronRight className="w-3 h-3 text-slate-400" />
+                  )}
                 </button>
+                {ctxCategories.wireless && (
+                  <div className="pl-2 space-y-0.5">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('switch', 4, 'wlc');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Server className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                        <span>WLC Контроллер</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">CAPWAP</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('switch', 6, 'wifi_ap');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Wifi className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                        <span>Точка доступа AP</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">802.11 AP</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('router', 6, 'soho_wifi_router');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Radio className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                        <span>Wi-Fi Роутер</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">NAT+Wlan0</span>
+                    </button>
+                  </div>
+                )}
+
+                {/* Category 4: Endpoints */}
                 <button
                   type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    onAddDeviceAtCenter('pc');
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                  onClick={() => toggleCtxCategory('endpoints')}
+                  className="w-full flex items-center justify-between px-2.5 py-1 mt-0.5 rounded bg-slate-950/70 hover:bg-slate-800/80 text-[11px] font-semibold text-slate-300 transition-colors cursor-pointer"
                 >
-                  <Monitor className="w-3.5 h-3.5 text-slate-200 shrink-0" />
-                  <span>+ Рабочая станция (PC)</span>
+                  <span className="flex items-center gap-1.5">
+                    <Monitor className="w-3 h-3 text-emerald-400 shrink-0" />
+                    <span>Конечные устройства</span>
+                  </span>
+                  {ctxCategories.endpoints ? (
+                    <ChevronDown className="w-3 h-3 text-slate-400" />
+                  ) : (
+                    <ChevronRight className="w-3 h-3 text-slate-400" />
+                  )}
                 </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    onAddDeviceAtCenter('server');
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
-                >
-                  <Server className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <span>+ Сервер (HTTP / DNS / DHCP)</span>
-                </button>
+                {ctxCategories.endpoints && (
+                  <div className="pl-2 space-y-0.5">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('pc');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Monitor className="w-3.5 h-3.5 text-slate-200 shrink-0" />
+                        <span>Хост (PC)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">Eth0</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('server');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Server className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        <span>Сервер (L7)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">HTTP/DNS</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('pc', 6, 'laptop');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Laptop className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                        <span>Ноутбук</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">Wlan0</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('pc', 6, 'smartphone');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Smartphone className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                        <span>Смартфон</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">Wlan0</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('pc', 2, 'ip_phone');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <PhoneCall className="w-3.5 h-3.5 text-fuchsia-400 shrink-0" />
+                        <span>IP-Телефон (VoIP)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">PoE · SIP</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('pc', 1, 'ip_camera');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Camera className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                        <span>IP-Камера (PoE)</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">RTSP · 9.5W</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        onAddDeviceAtCenter('server', 1, 'nvr');
+                        setContextMenu(null);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Video className="w-3.5 h-3.5 text-teal-300 shrink-0" />
+                        <span>Видеорегистратор NVR</span>
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">NVR · 16TB</span>
+                    </button>
+                  </div>
+                )}
+
                 <div className="my-1 border-t border-slate-800" />
                 <button
                   type="button"
@@ -835,10 +1293,13 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                     onAddZone();
                     setContextMenu(null);
                   }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded hover:bg-slate-800 text-sky-300 text-left transition-colors cursor-pointer"
+                  className="w-full flex items-center justify-between gap-2 px-2.5 py-1 rounded hover:bg-slate-800 text-slate-200 text-left transition-colors cursor-pointer"
                 >
-                  <Plus className="w-3.5 h-3.5 shrink-0" />
-                  <span>+ Зона подсети / VLAN</span>
+                  <span className="flex items-center gap-2">
+                    <Layers className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                    <span>Зона подсети</span>
+                  </span>
+                  <span className="text-[10px] font-mono text-slate-400">+VLAN</span>
                 </button>
               </>
             )}
@@ -947,9 +1408,37 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
         )}
 
         {/* Contextual Mode Banner at Top of Canvas */}
-        {(activeTool !== 'select' || (cableStart && openChassisNodes.length === 0) || pduSourceNodeId) && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-30 px-4 py-1.5 rounded-md bg-slate-900/95 border border-sky-500/40 shadow-lg flex items-center gap-3 text-xs text-slate-200">
-            {(activeTool === 'cable' || (cableStart && openChassisNodes.length === 0)) && (
+        {(pendingPlacement ||
+          activeTool !== 'select' ||
+          (cableStart && openChassisNodes.length === 0) ||
+          pduSourceNodeId) && (
+          <div
+            data-testid="canvas-mode-banner"
+            className="absolute top-3 left-1/2 -translate-x-1/2 z-30 px-4 py-1.5 rounded-md bg-slate-900/95 border border-sky-500/50 shadow-lg flex items-center gap-3 text-xs text-slate-200"
+          >
+            {pendingPlacement && (
+              <>
+                <Plus className="w-4 h-4 text-sky-400 shrink-0" />
+                <span>
+                  Режим установки: <strong className="text-sky-300">«{pendingPlacement.label}»</strong> — кликните крестиком в нужную точку рабочей области для создания
+                </span>
+                {onCancelPendingPlacement && (
+                  <button
+                    type="button"
+                    data-testid="cancel-pending-placement-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCancelPendingPlacement();
+                    }}
+                    className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white cursor-pointer shrink-0"
+                  >
+                    Отмена (Esc)
+                  </button>
+                )}
+              </>
+            )}
+            {!pendingPlacement &&
+              (activeTool === 'cable' || (cableStart && openChassisNodes.length === 0)) && (
               <>
                 <Cable className="w-4 h-4 text-sky-400" />
                 <span>
@@ -967,7 +1456,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                 )}
               </>
             )}
-            {activeTool === 'pdu' && !cableStart && (
+            {!pendingPlacement && activeTool === 'pdu' && !cableStart && (
               <>
                 <Mail className="w-4 h-4 text-emerald-400" />
                 <span>
@@ -985,7 +1474,7 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                 )}
               </>
             )}
-            {activeTool === 'delete' && !cableStart && (
+            {!pendingPlacement && activeTool === 'delete' && !cableStart && (
               <>
                 <Trash2 className="w-4 h-4 text-red-400" />
                 <span>
@@ -1097,6 +1586,21 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
 
             <button
               type="button"
+              data-testid="toggle-wifi-coverage-btn"
+              onClick={() => setShowWifiCoverage((v) => !v)}
+              className={`flex items-center gap-1 px-2 py-0.5 rounded transition-colors cursor-pointer ${
+                showWifiCoverage
+                  ? 'bg-cyan-500/20 text-cyan-300 font-medium'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Показать или скрыть радиус радиопокрытия точек доступа Wi-Fi 802.11"
+            >
+              <Wifi className="w-3 h-3" />
+              <span>Wi-Fi зоны</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setShowZones((v) => !v)}
               className={`flex items-center gap-1 px-2 py-0.5 rounded transition-colors ${
                 showZones
@@ -1123,6 +1627,58 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
               <span>Порты</span>
             </button>
 
+            <div className="h-3.5 w-px bg-slate-800 mx-0.5" />
+
+            {/* Cable Display Mode Switcher: Standard / Bandwidth & Load / QoS DSCP Queues */}
+            <div
+              data-testid="cable-heatmap-switcher"
+              className="flex items-center gap-0.5 bg-slate-950/80 border border-slate-800 rounded p-0.5"
+            >
+              <button
+                type="button"
+                data-testid="cable-mode-standard"
+                onClick={() => setCableDisplayMode('standard')}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors cursor-pointer ${
+                  cableDisplayMode === 'standard'
+                    ? 'bg-slate-800 text-white font-semibold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+                title="Стандартный режим отображения кабелей (Trunk / STP / Fiber)"
+              >
+                Кабели
+              </button>
+
+              <button
+                type="button"
+                data-testid="cable-mode-bandwidth"
+                onClick={() => setCableDisplayMode('bandwidth')}
+                className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors cursor-pointer ${
+                  cableDisplayMode === 'bandwidth'
+                    ? 'bg-emerald-600/30 border border-emerald-500/50 text-emerald-200 font-semibold'
+                    : 'text-slate-400 hover:text-emerald-300'
+                }`}
+                title="Карта полосы пропускания (100M / 1G / 10G / 480G), загрузки (%) и задержки (ms)"
+              >
+                <Gauge className="w-2.5 h-2.5" />
+                <span>BW / Load</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="cable-mode-qos"
+                onClick={() => setCableDisplayMode('qos')}
+                className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors cursor-pointer ${
+                  cableDisplayMode === 'qos'
+                    ? 'bg-fuchsia-600/30 border border-fuchsia-500/50 text-fuchsia-200 font-semibold'
+                    : 'text-slate-400 hover:text-fuchsia-300'
+                }`}
+                title="Карта приоритетных очередей QoS (DSCP EF Голос / AF41 Видео / CS6 Control / BE Данные)"
+              >
+                <Activity className="w-2.5 h-2.5" />
+                <span>QoS DSCP</span>
+              </button>
+            </div>
+
             <button
               type="button"
               onClick={() => setShowLegend((v) => !v)}
@@ -1137,6 +1693,39 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
               <span className="hidden sm:inline">Легенда</span>
             </button>
           </div>
+
+          {/* Active Cable Heatmap Legend Strip */}
+          {cableDisplayMode === 'bandwidth' && (
+            <div
+              data-testid="cable-bandwidth-legend"
+              className="flex flex-wrap items-center gap-2.5 px-3 py-1 bg-slate-900/95 border border-emerald-500/40 rounded-md text-[10px] font-mono text-slate-200 shadow-lg"
+            >
+              <span className="text-emerald-300 font-bold">КАРТА КАНАЛОВ (BW / LOAD):</span>
+              <span className="text-sky-400">━ 100M FastEth</span>
+              <span>·</span>
+              <span className="text-emerald-400">━ 1G Gigabit</span>
+              <span>·</span>
+              <span className="text-cyan-300">━ 2G–4G LACP (Po#)</span>
+              <span>·</span>
+              <span className="text-amber-400">━ 10G Fiber / 480G Stack</span>
+            </div>
+          )}
+
+          {cableDisplayMode === 'qos' && (
+            <div
+              data-testid="cable-qos-legend"
+              className="flex flex-wrap items-center gap-2.5 px-3 py-1 bg-slate-900/95 border border-fuchsia-500/40 rounded-md text-[10px] font-mono text-slate-200 shadow-lg"
+            >
+              <span className="text-fuchsia-300 font-bold">ОЧЕРЕДИ QoS (DiffServ DSCP):</span>
+              <span className="text-fuchsia-400">━ EF (DSCP 46 · VoIP RTP/SIP)</span>
+              <span>·</span>
+              <span className="text-purple-400">━ AF41 (DSCP 34 · CCTV RTSP)</span>
+              <span>·</span>
+              <span className="text-amber-400">━ CS6 (DSCP 48 · OSPF/BGP/STP)</span>
+              <span>·</span>
+              <span className="text-sky-400">━ BE (DSCP 0 · Data)</span>
+            </div>
+          )}
 
           {/* On-Demand Legend Popover */}
           {showLegend && (
@@ -1268,6 +1857,71 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
               </marker>
             </defs>
 
+            {/* IEEE 802.11 Wi-Fi Radial Coverage Zones */}
+            {showWifiCoverage &&
+              nodes
+                .filter((n) => n.wifiConfig && n.wifiConfig.enabled)
+                .map((apNode) => {
+                  const cfg = apNode.wifiConfig!;
+                  const r = Math.max(80, cfg.coverageRadius || 235);
+                  const is5G = cfg.band === '5GHz';
+                  const strokeColor = is5G ? '#a855f7' : '#06b6d4';
+                  const fillColor = is5G
+                    ? 'rgba(168, 85, 247, 0.065)'
+                    : 'rgba(6, 182, 212, 0.065)';
+
+                  return (
+                    <g
+                      key={`wifi-coverage-${apNode.id}`}
+                      data-testid={`wifi-coverage-circle-${apNode.id}`}
+                    >
+                      <circle
+                        cx={apNode.x}
+                        cy={apNode.y}
+                        r={r}
+                        fill={fillColor}
+                        stroke={strokeColor}
+                        strokeWidth={1.6}
+                        strokeDasharray="8 6"
+                        strokeOpacity={0.65}
+                      />
+                      <circle
+                        cx={apNode.x}
+                        cy={apNode.y}
+                        r={Math.round(r * 0.55)}
+                        fill="none"
+                        stroke={strokeColor}
+                        strokeWidth={1}
+                        strokeDasharray="3 6"
+                        strokeOpacity={0.28}
+                      />
+                      <g transform={`translate(${apNode.x}, ${apNode.y - r + 14})`}>
+                        <rect
+                          x={-98}
+                          y={-10}
+                          width={196}
+                          height={18}
+                          rx={9}
+                          fill="#020617"
+                          fillOpacity={0.9}
+                          stroke={strokeColor}
+                          strokeWidth={1}
+                          strokeOpacity={0.75}
+                        />
+                        <text
+                          x={0}
+                          y={2}
+                          textAnchor="middle"
+                          className="text-[9.5px] font-mono font-semibold fill-cyan-200 select-none"
+                        >
+                          Wi-Fi «{cfg.ssid}» · Ch {cfg.channel} ({cfg.band}) ·{' '}
+                          {cfg.security === 'wpa2' ? 'WPA2' : 'Open'}
+                        </text>
+                      </g>
+                    </g>
+                  );
+                })}
+
             {links.map((link) => {
               const srcNode = nodes.find((n) => n.id === link.sourceNodeId);
               const dstNode = nodes.find((n) => n.id === link.targetNodeId);
@@ -1276,9 +1930,16 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
               const srcPort = srcNode.interfaces.find((p) => p.id === link.sourcePortId);
               const dstPort = dstNode.interfaces.find((p) => p.id === link.targetPortId);
               const isUp = isLinkOperational(link, nodes);
-              const isTrunk = srcPort?.vlanMode === 'trunk' || dstPort?.vlanMode === 'trunk';
-              const srcStpState = stpStateMap[srcNode.id]?.ports[link.sourcePortId]?.state;
-              const dstStpState = stpStateMap[dstNode.id]?.ports[link.targetPortId]?.state;
+              const isWireless = link.cableType === 'wireless';
+              const isTrunk =
+                !isWireless &&
+                (srcPort?.vlanMode === 'trunk' || dstPort?.vlanMode === 'trunk');
+              const srcStpState = !isWireless
+                ? stpStateMap[srcNode.id]?.ports[link.sourcePortId]?.state
+                : undefined;
+              const dstStpState = !isWireless
+                ? stpStateMap[dstNode.id]?.ports[link.targetPortId]?.state
+                : undefined;
               const isStpBlocked = srcStpState === 'blocking' || dstStpState === 'blocking';
               const hasMovingPacketOnLink = packetSquares.some((p) => p.linkId === link.id);
               const isActiveStepLink =
@@ -1286,16 +1947,93 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                 hoveredLinkId === link.id ||
                 hasMovingPacketOnLink;
 
-              const dx = dstNode.x - srcNode.x;
-              const dy = dstNode.y - srcNode.y;
-              const srcDotX = srcNode.x + dx * 0.24;
-              const srcDotY = srcNode.y + dy * 0.24;
-              const dstDotX = srcNode.x + dx * 0.76;
-              const dstDotY = srcNode.y + dy * 0.76;
+              // Check if there are multiple parallel links between the same unordered node pair
+              const pairA =
+                link.sourceNodeId < link.targetNodeId ? link.sourceNodeId : link.targetNodeId;
+              const pairB =
+                link.sourceNodeId < link.targetNodeId ? link.targetNodeId : link.sourceNodeId;
+              const siblingLinks = links.filter((l) => {
+                const lA = l.sourceNodeId < l.targetNodeId ? l.sourceNodeId : l.targetNodeId;
+                const lB = l.sourceNodeId < l.targetNodeId ? l.targetNodeId : l.sourceNodeId;
+                return lA === pairA && lB === pairB;
+              });
+              const siblingIdx = siblingLinks.findIndex((l) => l.id === link.id);
+
+              // Canonical normal vector from pairA -> pairB so parallel links never cross
+              const canonNodeA = srcNode.id === pairA ? srcNode : dstNode;
+              const canonNodeB = srcNode.id === pairA ? dstNode : srcNode;
+              const canonDx = canonNodeB.x - canonNodeA.x;
+              const canonDy = canonNodeB.y - canonNodeA.y;
+              const canonLen = Math.max(1, Math.hypot(canonDx, canonDy));
+              const normX = -canonDy / canonLen;
+              const normY = canonDx / canonLen;
+              const parallelOffsetPx =
+                siblingLinks.length > 1
+                  ? (siblingIdx - (siblingLinks.length - 1) / 2) * 20
+                  : 0;
+
+              const x1 = srcNode.x + normX * parallelOffsetPx;
+              const y1 = srcNode.y + normY * parallelOffsetPx;
+              const x2 = dstNode.x + normX * parallelOffsetPx;
+              const y2 = dstNode.y + normY * parallelOffsetPx;
+
+              const dx = x2 - x1;
+              const dy = y2 - y1;
+              const srcDotX = x1 + dx * 0.24;
+              const srcDotY = y1 + dy * 0.24;
+              const dstDotX = x1 + dx * 0.76;
+              const dstDotY = y1 + dy * 0.76;
+
+              const isBundledInPo = etherChannelBundles.some((b) =>
+                b.memberLinkIds.includes(link.id)
+              );
+              const isStackLink =
+                link.cableType === 'stack' || isStackInterconnectLink(link, nodes, links);
+
+              const wifiMetrics = (() => {
+                if (!isWireless) return null;
+                const ap = isWifiAccessPointNode(srcNode) ? srcNode : dstNode;
+                const cl = ap.id === srcNode.id ? dstNode : srcNode;
+                return computeWifiSignalMetrics(cl, ap);
+              })();
+
+              const gponOpticalLink = (() => {
+                if (!isGponLinkPair(srcNode, dstNode)) return null;
+                const ont = isGponOntNode(srcNode) ? srcNode : dstNode;
+                return computeGponOntOpticalState(ont, nodes, links);
+              })();
+
+              const linkHeatmap = linkHeatmapMap[link.id];
+
+              const effectiveStrokeColor =
+                !isUp || (gponOpticalLink && !gponOpticalLink.isPonUp)
+                  ? '#ef4444'
+                  : cableDisplayMode === 'bandwidth' && linkHeatmap
+                  ? linkHeatmap.bandwidthStrokeHex
+                  : cableDisplayMode === 'qos' && linkHeatmap
+                  ? linkHeatmap.qosStrokeHex
+                  : isActiveStepLink
+                  ? '#38bdf8'
+                  : gponOpticalLink
+                  ? '#10b981'
+                  : isWireless
+                  ? '#06b6d4'
+                  : isStackLink
+                  ? '#fbbf24'
+                  : isStpBlocked
+                  ? '#f97316'
+                  : isBundledInPo
+                  ? '#22d3ee'
+                  : link.cableType === 'fiber'
+                  ? '#f59e0b'
+                  : isTrunk
+                  ? '#818cf8'
+                  : '#64748b';
 
               return (
                 <g
                   key={link.id}
+                  data-testid={`canvas-link-${link.id}`}
                   onClick={(e) => {
                     if (activeTool === 'delete') {
                       e.stopPropagation();
@@ -1308,40 +2046,54 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                       : 'pointer-events-none'
                   }
                 >
-                  {isActiveStepLink && (
+                  {(isActiveStepLink ||
+                    (isStackLink && isUp) ||
+                    (cableDisplayMode !== 'standard' && isUp)) && (
                     <line
-                      x1={srcNode.x}
-                      y1={srcNode.y}
-                      x2={dstNode.x}
-                      y2={dstNode.y}
-                      stroke="#0ea5e9"
-                      strokeWidth={8}
-                      strokeOpacity={0.32}
+                      x1={x1}
+                      y1={y1}
+                      x2={x2}
+                      y2={y2}
+                      stroke={
+                        cableDisplayMode !== 'standard'
+                          ? effectiveStrokeColor
+                          : isActiveStepLink
+                          ? '#0ea5e9'
+                          : '#f59e0b'
+                      }
+                      strokeWidth={isActiveStepLink ? 8 : 6}
+                      strokeOpacity={
+                        isActiveStepLink ? 0.34 : cableDisplayMode !== 'standard' ? 0.22 : 0.2
+                      }
                       strokeLinecap="round"
                     />
                   )}
 
                   <line
-                    x1={srcNode.x}
-                    y1={srcNode.y}
-                    x2={dstNode.x}
-                    y2={dstNode.y}
-                    stroke={
-                      !isUp
-                        ? '#ef4444'
-                        : isActiveStepLink
-                        ? '#38bdf8'
-                        : isStpBlocked
-                        ? '#f97316'
-                        : link.cableType === 'fiber'
-                        ? '#f59e0b'
-                        : isTrunk
-                        ? '#818cf8'
-                        : '#64748b'
+                    x1={x1}
+                    y1={y1}
+                    x2={x2}
+                    y2={y2}
+                    stroke={effectiveStrokeColor}
+                    strokeWidth={
+                      isActiveStepLink
+                        ? 3.2
+                        : cableDisplayMode !== 'standard'
+                        ? 2.8
+                        : isStackLink
+                        ? 3
+                        : isWireless
+                        ? 2.2
+                        : isBundledInPo
+                        ? 2.5
+                        : 2.2
                     }
-                    strokeWidth={isActiveStepLink ? 3 : 2.2}
                     strokeDasharray={
-                      isStpBlocked
+                      isWireless
+                        ? '4 5'
+                        : isStackLink
+                        ? undefined
+                        : isStpBlocked
                         ? '4 4'
                         : link.cableType === 'crossover' || isTrunk
                         ? '6 4'
@@ -1349,39 +2101,122 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                     }
                   />
 
-                  {srcPort?.adminStatus === 'up' ? (
-                    <circle
-                      cx={srcDotX}
-                      cy={srcDotY}
-                      r={srcStpState === 'blocking' ? 5 : 4}
-                      fill={srcStpState === 'blocking' ? '#f97316' : '#10b981'}
-                      stroke="#090d16"
-                      strokeWidth={1.5}
-                    />
-                  ) : (
-                    <polygon
-                      points={`${srcDotX},${srcDotY - 5} ${srcDotX - 5},${srcDotY + 4} ${srcDotX + 5},${srcDotY + 4}`}
-                      fill="#ef4444"
-                    />
+                  {!isWireless &&
+                    (srcPort?.adminStatus === 'up' ? (
+                      <circle
+                        cx={srcDotX}
+                        cy={srcDotY}
+                        r={srcStpState === 'blocking' ? 5 : 4}
+                        fill={srcStpState === 'blocking' ? '#f97316' : '#10b981'}
+                        stroke="#090d16"
+                        strokeWidth={1.5}
+                      />
+                    ) : (
+                      <polygon
+                        points={`${srcDotX},${srcDotY - 5} ${srcDotX - 5},${srcDotY + 4} ${srcDotX + 5},${srcDotY + 4}`}
+                        fill="#ef4444"
+                      />
+                    ))}
+
+                  {!isWireless &&
+                    (dstPort?.adminStatus === 'up' ? (
+                      <circle
+                        cx={dstDotX}
+                        cy={dstDotY}
+                        r={dstStpState === 'blocking' ? 5 : 4}
+                        fill={dstStpState === 'blocking' ? '#f97316' : '#10b981'}
+                        stroke="#090d16"
+                        strokeWidth={1.5}
+                      />
+                    ) : (
+                      <polygon
+                        points={`${dstDotX},${dstDotY - 5} ${dstDotX - 5},${dstDotY + 4} ${dstDotX + 5},${dstDotY + 4}`}
+                        fill="#ef4444"
+                      />
+                    ))}
+
+                  {isWireless && showPortLabels && wifiMetrics && cableDisplayMode === 'standard' && (
+                    <g transform={`translate(${(x1 + x2) / 2}, ${(y1 + y2) / 2})`}>
+                      <rect
+                        x={-48}
+                        y={-9}
+                        width={96}
+                        height={16}
+                        rx={8}
+                        fill="#083344"
+                        stroke={isUp ? '#06b6d4' : '#ef4444'}
+                        strokeWidth={1}
+                      />
+                      <text
+                        x={0}
+                        y={2}
+                        textAnchor="middle"
+                        className="text-[9px] font-mono font-bold fill-cyan-200 select-none"
+                      >
+                        {isUp ? `802.11 · ${wifiMetrics.rssiDbm} dBm` : 'Вне зоны Wi-Fi'}
+                      </text>
+                    </g>
                   )}
 
-                  {dstPort?.adminStatus === 'up' ? (
-                    <circle
-                      cx={dstDotX}
-                      cy={dstDotY}
-                      r={dstStpState === 'blocking' ? 5 : 4}
-                      fill={dstStpState === 'blocking' ? '#f97316' : '#10b981'}
-                      stroke="#090d16"
-                      strokeWidth={1.5}
-                    />
-                  ) : (
-                    <polygon
-                      points={`${dstDotX},${dstDotY - 5} ${dstDotX - 5},${dstDotY + 4} ${dstDotX + 5},${dstDotY + 4}`}
-                      fill="#ef4444"
-                    />
+                  {/* Bandwidth / Utilization / Latency Heatmap Midpoint Pill */}
+                  {cableDisplayMode === 'bandwidth' && linkHeatmap && (
+                    <g
+                      data-testid={`link-bw-badge-${link.id}`}
+                      transform={`translate(${(x1 + x2) / 2}, ${(y1 + y2) / 2})`}
+                    >
+                      <rect
+                        x={-60}
+                        y={-9}
+                        width={120}
+                        height={16}
+                        rx={8}
+                        fill="#090d16"
+                        stroke={effectiveStrokeColor}
+                        strokeWidth={1.2}
+                      />
+                      <text
+                        x={0}
+                        y={2.5}
+                        textAnchor="middle"
+                        className="text-[8.5px] font-mono font-bold fill-slate-100 select-none"
+                      >
+                        {!isUp
+                          ? 'LINK DOWN'
+                          : `${linkHeatmap.bandwidthLabel} · ${linkHeatmap.utilizationPercent}% · ${linkHeatmap.latencyMs}ms`}
+                      </text>
+                    </g>
                   )}
 
-                  {showPortLabels && (
+                  {/* QoS DSCP Queue Midpoint Pill */}
+                  {cableDisplayMode === 'qos' && linkHeatmap && (
+                    <g
+                      data-testid={`link-qos-badge-${link.id}`}
+                      transform={`translate(${(x1 + x2) / 2}, ${(y1 + y2) / 2})`}
+                    >
+                      <rect
+                        x={-62}
+                        y={-9}
+                        width={124}
+                        height={16}
+                        rx={8}
+                        fill="#090d16"
+                        stroke={effectiveStrokeColor}
+                        strokeWidth={1.2}
+                      />
+                      <text
+                        x={0}
+                        y={2.5}
+                        textAnchor="middle"
+                        className="text-[8.5px] font-mono font-bold fill-slate-100 select-none"
+                      >
+                        {!isUp
+                          ? 'LINK DOWN'
+                          : `${linkHeatmap.qosBadgeLabel} · ${linkHeatmap.qosDscpCode}`}
+                      </text>
+                    </g>
+                  )}
+
+                  {!isWireless && showPortLabels && (
                     <>
                       <text
                         x={srcDotX}
@@ -1390,6 +2225,8 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                         className={`text-[10px] font-mono select-none ${
                           srcStpState === 'blocking'
                             ? 'fill-orange-400 font-bold'
+                            : isBundledInPo
+                            ? 'fill-cyan-300'
                             : 'fill-slate-400'
                         }`}
                       >
@@ -1403,6 +2240,8 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                         className={`text-[10px] font-mono select-none ${
                           dstStpState === 'blocking'
                             ? 'fill-orange-400 font-bold'
+                            : isBundledInPo
+                            ? 'fill-cyan-300'
                             : 'fill-slate-400'
                         }`}
                       >
@@ -1412,10 +2251,74 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                     </>
                   )}
 
-                  {(isTrunk || isStpBlocked) && showPortLabels && (
+                  {isStackLink &&
+                    showPortLabels &&
+                    siblingIdx === 0 &&
+                    cableDisplayMode === 'standard' && (
+                    <g transform={`translate(${(x1 + x2) / 2}, ${(y1 + y2) / 2 - 9})`}>
+                      <rect
+                        x={-54}
+                        y={-9}
+                        width={108}
+                        height={15}
+                        rx={7}
+                        fill="#451a03"
+                        stroke="#fbbf24"
+                        strokeWidth={1}
+                      />
+                      <text
+                        x={0}
+                        y={1.5}
+                        textAnchor="middle"
+                        className="text-[9px] font-mono font-bold fill-amber-200 select-none"
+                      >
+                        {srcNode.type === 'switch' ? 'StackWise 480G' : 'HA Stack · 80G'}
+                      </text>
+                    </g>
+                  )}
+
+                  {gponOpticalLink && showPortLabels && cableDisplayMode === 'standard' && (
+                    <g
+                      data-testid={`gpon-link-badge-${link.id}`}
+                      transform={`translate(${(x1 + x2) / 2}, ${(y1 + y2) / 2 - 9})`}
+                    >
+                      <rect
+                        x={-68}
+                        y={-9}
+                        width={136}
+                        height={15}
+                        rx={7}
+                        fill={gponOpticalLink.isPonUp ? '#022c22' : '#450a0a'}
+                        stroke={gponOpticalLink.isPonUp ? '#10b981' : '#ef4444'}
+                        strokeWidth={1}
+                      />
+                      <text
+                        x={0}
+                        y={1.5}
+                        textAnchor="middle"
+                        className={`text-[9px] font-mono font-bold select-none ${
+                          gponOpticalLink.isPonUp ? 'fill-emerald-200' : 'fill-red-200'
+                        }`}
+                      >
+                        {gponOpticalLink.isLos
+                          ? `GPON LOS (${gponOpticalLink.rxPowerDbm.toFixed(1)} dBm)`
+                          : !gponOpticalLink.isSnAuthorized
+                          ? 'GPON SN UNAUTH'
+                          : `1490/1310nm · ${gponOpticalLink.rxPowerDbm.toFixed(1)} dBm`}
+                      </text>
+                    </g>
+                  )}
+
+                  {(isTrunk || isStpBlocked) &&
+                    !isStackLink &&
+                    !gponOpticalLink &&
+                    !isBundledInPo &&
+                    !isWireless &&
+                    showPortLabels &&
+                    cableDisplayMode === 'standard' && (
                     <text
-                      x={(srcNode.x + dstNode.x) / 2}
-                      y={(srcNode.y + dstNode.y) / 2 - 7}
+                      x={(x1 + x2) / 2}
+                      y={(y1 + y2) / 2 - 7}
                       textAnchor="middle"
                       className={`text-[10px] font-mono font-semibold ${
                         isStpBlocked ? 'fill-orange-400' : 'fill-indigo-300'
@@ -1423,6 +2326,62 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                     >
                       {isStpBlocked ? 'STP 802.1D BLK' : '802.1Q Trunk'}
                     </text>
+                  )}
+                </g>
+              );
+            })}
+
+            {/* Cisco Packet Tracer Style EtherChannel / LACP Oval Ring Overlay (Po1..Po6) */}
+            {etherChannelBundles.map((bundle) => {
+              const nodeA = nodes.find((n) => n.id === bundle.nodeAId);
+              const nodeB = nodes.find((n) => n.id === bundle.nodeBId);
+              if (!nodeA || !nodeB) return null;
+
+              const midX = (nodeA.x + nodeB.x) / 2;
+              const midY = (nodeA.y + nodeB.y) / 2;
+              const angleDeg =
+                (Math.atan2(nodeB.y - nodeA.y, nodeB.x - nodeA.x) * 180) / Math.PI;
+              const ry = Math.max(18, bundle.memberLinkIds.length * 11);
+
+              return (
+                <g
+                  key={`etherchannel-ring-${bundle.bundleKey}`}
+                  data-testid={`etherchannel-oval-ring-${bundle.portChannelName}`}
+                >
+                  <ellipse
+                    cx={midX}
+                    cy={midY}
+                    rx={12}
+                    ry={ry}
+                    transform={`rotate(${angleDeg} ${midX} ${midY})`}
+                    fill="rgba(6, 182, 212, 0.14)"
+                    stroke="#22d3ee"
+                    strokeWidth={2.2}
+                  />
+                  {showPortLabels && (
+                    <g transform={`translate(${midX}, ${midY - ry - 11})`}>
+                      <rect
+                        x={-58}
+                        y={-10}
+                        width={116}
+                        height={16}
+                        rx={4}
+                        fill="#083344"
+                        stroke="#22d3ee"
+                        strokeWidth={1}
+                      />
+                      <text
+                        x={0}
+                        y={1}
+                        textAnchor="middle"
+                        className="text-[9px] font-mono font-bold fill-cyan-200 select-none"
+                      >
+                        {bundle.portChannelName} · {bundle.protocol}{' '}
+                        {bundle.aggregatedBandwidthMbps >= 1000
+                          ? `${bundle.aggregatedBandwidthMbps / 1000}G`
+                          : `${bundle.aggregatedBandwidthMbps}M`}
+                      </text>
+                    </g>
                   )}
                 </g>
               );
@@ -1499,8 +2458,20 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                   {node.type === 'pc' ? (
                     <button
                       type="button"
-                      aria-label={`Открыть монитор ПК ${node.name}`}
-                      title={`Открыть монитор ПК (${node.name}): сетевые настройки IP/маски и консоль CMD`}
+                      aria-label={
+                        isVoipPhoneNode(node)
+                          ? `Открыть панель IP-телефона ${node.name}`
+                          : isIpCameraNode(node)
+                          ? `Открыть панель IP-камеры ${node.name}`
+                          : `Открыть монитор ПК ${node.name}`
+                      }
+                      title={
+                        isVoipPhoneNode(node)
+                          ? `Открыть IP-телефон (${node.name}): набор SIP-номера, Voice/Data VLAN и PoE`
+                          : isIpCameraNode(node)
+                          ? `Открыть IP-камеру (${node.name}): видеопоток RTSP / Multicast, PoE 802.3af и CCTV VLAN`
+                          : `Открыть монитор ПК (${node.name}): сетевые настройки IP/маски и консоль CMD`
+                      }
                       onClick={(e) => {
                         e.stopPropagation();
                         onSelectZone(null);
@@ -1509,19 +2480,39 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                       }}
                       className={`px-2 py-0.5 rounded-full border text-[9px] font-mono font-bold shadow-md flex items-center gap-1 cursor-pointer transition-colors ${
                         isPcMonitorOpen
-                          ? 'bg-sky-600 border-sky-300 text-white'
+                          ? isVoipPhoneNode(node)
+                            ? 'bg-fuchsia-600 border-fuchsia-300 text-white'
+                            : isIpCameraNode(node)
+                            ? 'bg-teal-600 border-teal-300 text-white'
+                            : 'bg-sky-600 border-sky-300 text-white'
+                          : isVoipPhoneNode(node)
+                          ? 'bg-fuchsia-950 border-fuchsia-400/90 text-fuchsia-200 hover:bg-fuchsia-600 hover:text-white'
+                          : isIpCameraNode(node)
+                          ? 'bg-teal-950 border-teal-400/90 text-teal-200 hover:bg-teal-600 hover:text-white'
                           : 'bg-sky-950 border-sky-400/90 text-sky-200 hover:bg-sky-600 hover:text-white'
                       }`}
                     >
-                      <Monitor className="w-2.5 h-2.5" />
-                      <span>Экран ПК</span>
+                      {isVoipPhoneNode(node) ? (
+                        <PhoneCall className="w-2.5 h-2.5" />
+                      ) : isIpCameraNode(node) ? (
+                        <Camera className="w-2.5 h-2.5" />
+                      ) : (
+                        <Monitor className="w-2.5 h-2.5" />
+                      )}
+                      <span>
+                        {isVoipPhoneNode(node)
+                          ? 'SIP Вызов'
+                          : isIpCameraNode(node)
+                          ? 'RTSP Камера'
+                          : 'Экран ПК'}
+                      </span>
                     </button>
                   ) : node.type === 'server' ? (
                     <>
                       <button
                         type="button"
                         aria-label={`Открыть панель сервера ${node.name}`}
-                        title={`Открыть панель Сервера (${node.name}): Службы L7 HTTP / DNS / DHCP, сеть и консоль`}
+                        title={`Открыть панель Сервера (${node.name}): Службы L7 HTTP / DNS / DHCP / NVR, сеть и консоль`}
                         onClick={(e) => {
                           e.stopPropagation();
                           onSelectZone(null);
@@ -1530,12 +2521,20 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                         }}
                         className={`px-2 py-0.5 rounded-full border text-[9px] font-mono font-bold shadow-md flex items-center gap-1 cursor-pointer transition-colors ${
                           isPcMonitorOpen
-                            ? 'bg-amber-600 border-amber-300 text-white'
+                            ? isNvrServerNode(node)
+                              ? 'bg-teal-600 border-teal-300 text-white'
+                              : 'bg-amber-600 border-amber-300 text-white'
+                            : isNvrServerNode(node)
+                            ? 'bg-teal-950 border-teal-400/90 text-teal-200 hover:bg-teal-600 hover:text-white'
                             : 'bg-amber-950 border-amber-400/90 text-amber-200 hover:bg-amber-600 hover:text-white'
                         }`}
                       >
-                        <Server className="w-2.5 h-2.5" />
-                        <span>Службы L7</span>
+                        {isNvrServerNode(node) ? (
+                          <Video className="w-2.5 h-2.5" />
+                        ) : (
+                          <Server className="w-2.5 h-2.5" />
+                        )}
+                        <span>{isNvrServerNode(node) ? 'NVR Архив' : 'Службы L7'}</span>
                       </button>
 
                       <button
@@ -1632,45 +2631,342 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
                 </div>
 
                 {/* Device Chassis Box */}
-                <div
-                  className={`w-13 h-13 rounded-lg bg-slate-900 border-2 flex flex-col items-center justify-center transition-transform shadow-lg ${
-                    isSelected
-                      ? 'border-sky-400 ring-2 ring-sky-500/30 scale-105'
-                      : isPduSource
-                      ? 'border-emerald-400 ring-2 ring-emerald-500/30'
-                      : cableStart && cableStart.nodeId !== node.id
-                      ? 'border-sky-500/70 hover:border-sky-300 scale-105'
-                      : 'border-slate-700 hover:border-slate-500'
-                  }`}
-                >
-                  {renderDeviceIcon(node.type)}
-                  <span className="text-[9px] font-mono text-slate-400 mt-0.5 uppercase">
-                    {node.type}
-                  </span>
-                </div>
+                {(() => {
+                  const ontOptical = isGponOntNode(node)
+                    ? computeGponOntOpticalState(node, nodes, links)
+                    : null;
+
+                  return (
+                    <div
+                      className={`relative w-13 h-13 rounded-lg bg-slate-900 border-2 flex flex-col items-center justify-center transition-transform shadow-lg ${
+                        isSelected
+                          ? 'border-sky-400 ring-2 ring-sky-500/30 scale-105'
+                          : isPduSource
+                          ? 'border-emerald-400 ring-2 ring-emerald-500/30'
+                          : cableStart && cableStart.nodeId !== node.id
+                          ? 'border-sky-500/70 hover:border-sky-300 scale-105'
+                          : ontOptical && (ontOptical.isLos || !ontOptical.isSnAuthorized)
+                          ? 'border-red-500 ring-2 ring-red-500/35'
+                          : node.deviceModel === 'gpon_olt'
+                          ? 'border-emerald-500/75 hover:border-emerald-400'
+                          : node.deviceModel === 'gpon_ont'
+                          ? 'border-teal-500/75 hover:border-teal-400'
+                          : node.deviceModel === 'firewall'
+                          ? 'border-rose-500/70 hover:border-rose-400'
+                          : node.deviceModel === 'isp_cloud'
+                          ? 'border-orange-500/70 hover:border-orange-400'
+                          : node.deviceModel === 'wlc' ||
+                            node.deviceModel === 'wifi_ap' ||
+                            node.deviceModel === 'soho_wifi_router'
+                          ? 'border-cyan-500/60 hover:border-cyan-400'
+                          : node.deviceModel === 'laptop' || node.deviceModel === 'smartphone'
+                          ? 'border-violet-500/50 hover:border-violet-400'
+                          : node.deviceModel === 'ip_phone'
+                          ? 'border-fuchsia-500/60 hover:border-fuchsia-400'
+                          : node.deviceModel === 'ip_camera' || node.deviceModel === 'nvr'
+                          ? 'border-teal-500/60 hover:border-teal-400'
+                          : 'border-slate-700 hover:border-slate-500'
+                      }`}
+                    >
+                      {/* Red LOS Hardware LED Indicator on ONT Chassis */}
+                      {ontOptical && (
+                        <span
+                          data-testid={`ont-canvas-los-led-${node.id}`}
+                          title={
+                            ontOptical.isLos
+                              ? `LOS ALARM: Сигнал ${ontOptical.rxPowerDbm.toFixed(1)} dBm < -28.0 dBm`
+                              : `PON OK: Сигнал ${ontOptical.rxPowerDbm.toFixed(1)} dBm`
+                          }
+                          className={`absolute top-1 left-1 w-2.5 h-2.5 rounded-full border ${
+                            ontOptical.isLos
+                              ? 'bg-red-500 border-red-200 shadow-[0_0_8px_#ef4444] animate-pulse'
+                              : ontOptical.isPonUp
+                              ? 'bg-emerald-400 border-emerald-200 shadow-[0_0_6px_#10b981]'
+                              : 'bg-amber-400 border-amber-200'
+                          }`}
+                        />
+                      )}
+                      {renderDeviceIcon(node)}
+                      <span className="text-[9px] font-mono text-slate-400 mt-0.5 uppercase">
+                        {node.deviceModel === 'gpon_olt'
+                          ? 'OLT'
+                          : node.deviceModel === 'gpon_ont'
+                          ? 'ONT/ONU'
+                          : node.deviceModel === 'firewall'
+                          ? 'ASA/FW'
+                          : node.deviceModel === 'isp_cloud'
+                          ? 'ISP/WAN'
+                          : node.deviceModel === 'wlc'
+                          ? 'WLC'
+                          : node.deviceModel === 'wifi_ap'
+                          ? node.wifiConfig?.apMode === 'lightweight'
+                            ? 'LAP'
+                            : 'AP'
+                          : node.deviceModel === 'soho_wifi_router'
+                          ? 'SOHO'
+                          : node.deviceModel === 'laptop'
+                          ? 'LAPTOP'
+                          : node.deviceModel === 'smartphone'
+                          ? 'PHONE'
+                          : node.deviceModel === 'ip_phone'
+                          ? 'VOIP'
+                          : node.deviceModel === 'ip_camera'
+                          ? 'CCTV'
+                          : node.deviceModel === 'nvr'
+                          ? 'NVR'
+                          : node.type}
+                      </span>
+                    </div>
+                  );
+                })()}
 
                 {/* Compact Device Hostname + Primary IP or Switch Port Status Caption */}
-                <div className="mt-1 px-2 py-0.5 rounded bg-slate-950/90 border border-slate-800/90 text-center whitespace-nowrap">
-                  <div className="text-xs font-semibold text-slate-100 leading-tight">
-                    {node.name}
-                  </div>
-                  {node.type !== 'switch' && primaryIface?.ipAddress && (
-                    <div className="text-[10px] font-mono text-sky-300 leading-tight">
-                      {formatCidr(primaryIface.ipAddress, primaryIface.subnetMask)}
+                {(() => {
+                  const stackInfo =
+                    node.type === 'switch' || node.type === 'router'
+                      ? getNodeStackStatus(node.id, nodes, links)
+                      : null;
+                  const pdPoeState =
+                    node.deviceModel === 'ip_phone' ||
+                    node.deviceModel === 'wifi_ap' ||
+                    node.deviceModel === 'ip_camera'
+                      ? getPoweredDevicePoeState(node, nodes, links)
+                      : null;
+                  const swPoeStatus =
+                    node.type === 'switch' &&
+                    !node.wifiConfig &&
+                    node.deviceModel !== 'wlc' &&
+                    !isGponOltNode(node) &&
+                    !isGponOntNode(node)
+                      ? computeSwitchPoeStatus(node, nodes, links)
+                      : null;
+                  const ontOptical = isGponOntNode(node)
+                    ? computeGponOntOpticalState(node, nodes, links)
+                    : null;
+
+                  return (
+                    <div className="mt-1 px-2 py-0.5 rounded bg-slate-950/90 border border-slate-800/90 text-center whitespace-nowrap">
+                      <div className="text-xs font-semibold text-slate-100 leading-tight flex items-center justify-center gap-1">
+                        <span>{node.name}</span>
+                        {stackInfo && (
+                          <span
+                            data-testid={`stack-badge-${node.id}`}
+                            className={`text-[9px] font-mono px-1 py-0.2 rounded border ${
+                              stackInfo.member.role === 'master'
+                                ? 'bg-amber-500/20 border-amber-400/60 text-amber-300'
+                                : 'bg-sky-500/20 border-sky-400/50 text-sky-300'
+                            }`}
+                          >
+                            #{stackInfo.member.memberNumber}{' '}
+                            {stackInfo.member.role === 'master'
+                              ? 'MASTER'
+                              : stackInfo.member.role === 'standby'
+                              ? 'STANDBY'
+                              : 'MEMBER'}
+                          </span>
+                        )}
+                      </div>
+                      {node.type !== 'switch' && primaryIface?.ipAddress && (
+                        <div className="text-[10px] font-mono text-sky-300 leading-tight">
+                          {formatCidr(primaryIface.ipAddress, primaryIface.subnetMask)}
+                          {stackInfo?.group.virtualIp && (
+                            <span className="text-amber-300 ml-1">
+                              · VIP {stackInfo.group.virtualIp}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {node.deviceModel === 'ip_phone' && node.voipConfig && (
+                        <div className="text-[9px] font-mono text-fuchsia-300 leading-tight flex items-center justify-center gap-1">
+                          <span>
+                            Ext {node.voipConfig.extension} · Voice VLAN {node.voipConfig.voiceVlan}
+                          </span>
+                          {pdPoeState && (
+                            <span
+                              data-testid={`poe-pd-badge-${node.id}`}
+                              className={`px-1 rounded border text-[8.5px] font-bold ${
+                                pdPoeState.isPowered
+                                  ? 'bg-emerald-950/90 border-emerald-500/60 text-emerald-300'
+                                  : 'bg-red-950/90 border-red-500/70 text-red-300'
+                              }`}
+                            >
+                              {pdPoeState.isPowered
+                                ? `⚡ ${pdPoeState.watts}W PoE`
+                                : '⚡ PoE OFF'}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {node.deviceModel === 'ip_camera' && node.ipCameraConfig && (
+                        <div className="text-[9px] font-mono text-teal-300 leading-tight flex items-center justify-center gap-1">
+                          <span>
+                            {node.ipCameraConfig.streamMode === 'multicast'
+                              ? `Mcast ${node.ipCameraConfig.multicastGroupIp || '239.0.30.1'}`
+                              : `RTSP ${(node.ipCameraConfig.codec || node.ipCameraConfig.videoCodec || 'H.265').split(' ')[0]}`}{' '}
+                            · VLAN {node.ipCameraConfig.surveillanceVlan ?? 30}
+                          </span>
+                          {pdPoeState && (
+                            <span
+                              data-testid={`poe-pd-badge-${node.id}`}
+                              className={`px-1 rounded border text-[8.5px] font-bold ${
+                                pdPoeState.isPowered
+                                  ? 'bg-emerald-950/90 border-emerald-500/60 text-emerald-300'
+                                  : 'bg-red-950/90 border-red-500/70 text-red-300'
+                              }`}
+                            >
+                              {pdPoeState.isPowered
+                                ? `⚡ ${pdPoeState.watts}W PoE`
+                                : '⚡ PoE OFF'}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {node.deviceModel === 'nvr' && (
+                        <div className="text-[9px] font-mono text-teal-300 leading-tight">
+                          NVR · RAID-6 {node.services?.nvrStorageTb ?? 16}TB · TCP 554
+                        </div>
+                      )}
+                      {node.deviceModel === 'firewall' && (
+                        <div className="text-[9px] font-mono text-rose-300 leading-tight">
+                          SPI · IN:100 DMZ:50 OUT:0
+                        </div>
+                      )}
+                      {node.bgpConfig?.enabled && (
+                        <div
+                          data-testid={`bgp-asn-caption-${node.id}`}
+                          className="text-[9px] font-mono text-orange-300 leading-tight flex items-center justify-center gap-1"
+                        >
+                          <span className="font-bold">AS {node.bgpConfig.asn} · eBGP</span>
+                          {node.wanImpairment?.enabled && (
+                            <span
+                              data-testid={`wan-impairment-badge-${node.id}`}
+                              className={`px-1 rounded border text-[8.5px] font-bold ${
+                                node.wanImpairment.packetLossPercent >= 50 ||
+                                node.wanImpairment.bandwidthLimitMbps <= 0
+                                  ? 'bg-red-950/90 border-red-500/70 text-red-300'
+                                  : node.wanImpairment.packetLossPercent > 0 ||
+                                    node.wanImpairment.latencyMs >= 100
+                                  ? 'bg-amber-950/90 border-amber-500/60 text-amber-300'
+                                  : 'bg-emerald-950/90 border-emerald-500/60 text-emerald-300'
+                              }`}
+                            >
+                              ⏱ {node.wanImpairment.latencyMs}ms · Loss{' '}
+                              {node.wanImpairment.packetLossPercent}% ·{' '}
+                              {node.wanImpairment.bandwidthLimitMbps}M
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {!node.bgpConfig?.enabled && node.wanImpairment?.enabled && (
+                        <div
+                          data-testid={`wan-impairment-badge-${node.id}`}
+                          className="text-[9px] font-mono text-orange-300 leading-tight"
+                        >
+                          WAN ⏱ {node.wanImpairment.latencyMs}ms · Loss{' '}
+                          {node.wanImpairment.packetLossPercent}% ·{' '}
+                          {node.wanImpairment.bandwidthLimitMbps}Mbps
+                        </div>
+                      )}
+                      {node.deviceModel === 'wlc' && node.wlcConfig && (
+                        <div className="text-[9px] font-mono text-cyan-300 leading-tight">
+                          CAPWAP · {node.wlcConfig.managementIp}
+                        </div>
+                      )}
+                      {node.wifiConfig?.enabled && (
+                        <div className="text-[9px] font-mono text-cyan-300 leading-tight flex items-center justify-center gap-1">
+                          <span>
+                            {node.wifiConfig.apMode === 'lightweight'
+                              ? `CAPWAP · Ch ${node.wifiConfig.channel} (${node.wifiConfig.ssid})`
+                              : `SSID: ${node.wifiConfig.ssid} (${node.wifiConfig.band})`}
+                          </span>
+                          {pdPoeState && pdPoeState.switchNodeName && (
+                            <span
+                              data-testid={`poe-pd-badge-${node.id}`}
+                              className={`px-1 rounded border text-[8.5px] font-bold ${
+                                pdPoeState.isPowered
+                                  ? 'bg-emerald-950/90 border-emerald-500/60 text-emerald-300'
+                                  : 'bg-red-950/90 border-red-500/70 text-red-300'
+                              }`}
+                            >
+                              {pdPoeState.isPowered
+                                ? `⚡ ${pdPoeState.watts}W`
+                                : '⚡ PoE OFF'}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {isGponOltNode(node) && (
+                        <div
+                          data-testid={`gpon-olt-caption-${node.id}`}
+                          className="text-[9px] font-mono text-emerald-300 leading-tight"
+                        >
+                          1490/1310nm · TX +{node.gponOltConfig?.txPowerDbm ?? 3.5}dBm · Сплиттер{' '}
+                          {node.gponOltConfig?.splitterRatio || '1:16'}
+                        </div>
+                      )}
+                      {isGponOntNode(node) && ontOptical && (
+                        <div
+                          data-testid={`gpon-ont-caption-${node.id}`}
+                          className="text-[9px] font-mono leading-tight flex flex-col items-center gap-0.5"
+                        >
+                          <div className="flex items-center justify-center gap-1">
+                            <span className="text-teal-300">{ontOptical.serialNumber}</span>
+                            <span
+                              data-testid={`gpon-ont-dbm-badge-${node.id}`}
+                              className={`px-1 rounded border text-[8.5px] font-bold ${
+                                ontOptical.isLos
+                                  ? 'bg-red-950/95 border-red-500 text-red-200 animate-pulse'
+                                  : !ontOptical.isSnAuthorized
+                                  ? 'bg-amber-950/95 border-amber-500 text-amber-200'
+                                  : 'bg-emerald-950/90 border-emerald-500/60 text-emerald-300'
+                              }`}
+                            >
+                              {ontOptical.isLos
+                                ? `LOS ${ontOptical.rxPowerDbm.toFixed(1)} dBm`
+                                : !ontOptical.isSnAuthorized
+                                ? 'SN UNAUTH'
+                                : `RX ${ontOptical.rxPowerDbm.toFixed(1)} dBm`}
+                            </span>
+                          </div>
+                          <div className="text-[8.5px] text-slate-400">
+                            P1:Inet(100) · P2:IPTV(200) · P3:VoIP(300)
+                          </div>
+                        </div>
+                      )}
+                      {node.type === 'switch' &&
+                        !node.wifiConfig &&
+                        node.deviceModel !== 'wlc' &&
+                        !isGponOltNode(node) &&
+                        !isGponOntNode(node) && (
+                        <div className="text-[9px] font-mono text-indigo-300 leading-tight">
+                          {stackInfo && (
+                            <span className="text-amber-300 font-bold mr-1">
+                              {stackInfo.group.protocol} ·
+                            </span>
+                          )}
+                          {node.ipRoutingEnabled && (
+                            <span className="text-emerald-300 font-bold mr-1">L3 SVI ·</span>
+                          )}
+                          {swPoeStatus && swPoeStatus.usedWatts > 0 && (
+                            <span
+                              data-testid={`switch-poe-caption-${node.id}`}
+                              className="text-amber-300 font-bold mr-1"
+                            >
+                              ⚡ PoE {swPoeStatus.usedWatts}W/{swPoeStatus.totalBudgetWatts}W ·
+                            </span>
+                          )}
+                          {
+                            node.interfaces.filter((iface) =>
+                              isPortUsed(node.id, iface.id)
+                            ).length
+                          }
+                          /{node.interfaces.length} RJ-45 ·{' '}
+                          {nodeStp?.isRootBridge ? 'STP ROOT' : '1U'}
+                        </div>
+                      )}
                     </div>
-                  )}
-                  {node.type === 'switch' && (
-                    <div className="text-[9px] font-mono text-indigo-300 leading-tight">
-                      {
-                        node.interfaces.filter((iface) =>
-                          isPortUsed(node.id, iface.id)
-                        ).length
-                      }
-                      /{node.interfaces.length} RJ-45 ·{' '}
-                      {nodeStp?.isRootBridge ? 'STP ROOT' : '1U'}
-                    </div>
-                  )}
-                </div>
+                  );
+                })()}
 
                 {/* Port Picker Popover when Cable Tool is active */}
                 {portPickerNodeId === node.id && (
@@ -1753,6 +3049,26 @@ export const TopologyCanvas: React.FC<TopologyCanvasProps> = ({
               </span>
             </button>
           ))}
+
+          {/* Layer 5: Crosshair & Ghost Device/Zone Placement Preview */}
+          {pendingPlacement && hoverCanvasPos && (
+            <div
+              data-testid="canvas-placement-ghost"
+              style={{
+                left: `${hoverCanvasPos.x}px`,
+                top: `${hoverCanvasPos.y}px`,
+                transform: 'translate(-50%, -50%)',
+              }}
+              className="absolute z-40 pointer-events-none flex flex-col items-center gap-1"
+            >
+              <div className="relative w-12 h-12 rounded-xl border-2 border-dashed border-sky-400 bg-sky-500/20 shadow-[0_0_20px_rgba(56,189,248,0.35)] flex items-center justify-center">
+                <Plus className="w-6 h-6 text-sky-300" />
+              </div>
+              <span className="px-2 py-0.5 rounded bg-slate-950/95 border border-sky-400/60 text-[10px] font-mono font-semibold text-sky-200 whitespace-nowrap shadow-md">
+                + {pendingPlacement.label} ({hoverCanvasPos.x}, {hoverCanvasPos.y})
+              </span>
+            </div>
+          )}
         </div>
       </div>
     </div>

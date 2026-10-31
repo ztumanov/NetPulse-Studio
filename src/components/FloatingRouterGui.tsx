@@ -2,11 +2,38 @@ import React, { useState, useEffect } from 'react';
 import {
   AclAction,
   AclProtocol,
+  BgpConfig,
+  BgpNeighborConfig,
+  CableType,
+  FirewallConfig,
+  FirewallPortForwardRule,
+  FirewallZoneName,
+  IpsecTunnelConfig,
   NetworkInterface,
   NetworkLink,
   NetworkNode,
   SimulationStep,
+  StackConfig,
+  WanImpairmentConfig,
 } from '../network/types';
+import {
+  computeBgpRoutesForRouter,
+  discoverBgpPeersForRouter,
+  getDefaultBgpConfig,
+  getDefaultWanImpairmentConfig,
+  resolveBgpRouterId,
+} from '../network/bgpAndWanEngine';
+import {
+  getDefaultStackVirtualMac,
+  getNodeStackStatus,
+} from '../network/stackEngine';
+import {
+  getDefaultFirewallConfig,
+  getDefaultSecurityLevelForZone,
+  getInterfaceSecurityZoneAndLevel,
+  isFirewallNode,
+  synthesizeIpsecVpnSteps,
+} from '../network/firewallEngine';
 import {
   addHardwarePortToNode,
   getDeviceChassisPorts,
@@ -39,12 +66,15 @@ import {
 } from '../network/ospfEngine';
 import {
   getRouterLogicalInterfaces,
+  runBgpPeeringSimulation,
   syncAllRoutersRoutingTables,
   syncConnectedRoutes,
 } from '../network/simulator';
+import { computeWifiSignalMetrics } from '../network/wifiEngine';
 import {
   Activity,
   ArrowRightLeft,
+  Cloud,
   Cpu,
   Globe,
   GripHorizontal,
@@ -62,6 +92,7 @@ import {
   Sparkles,
   Terminal,
   Trash2,
+  Wifi,
   X,
 } from 'lucide-react';
 
@@ -73,6 +104,13 @@ interface FloatingRouterGuiProps {
   onSelectNode: (nodeId: string) => void;
   onUpdateNode: (updatedNode: NetworkNode) => void;
   onUpdateAllNodes?: (updatedNodes: NetworkNode[]) => void;
+  onCreateLink?: (
+    sourceNodeId: string,
+    sourceIfaceId: string,
+    targetNodeId: string,
+    targetIfaceId: string,
+    cableType?: CableType
+  ) => void;
   onLoadSimulationSteps?: (steps: SimulationStep[], summaryMessage: string) => void;
   onOpenChassis: (nodeId: string) => void;
   onOpenFloatingCli: (nodeId: string) => void;
@@ -87,14 +125,32 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
   onSelectNode,
   onUpdateNode,
   onUpdateAllNodes,
+  onCreateLink,
   onLoadSimulationSteps,
   onOpenChassis,
   onOpenFloatingCli,
   onClose,
 }) => {
   const [activeTab, setActiveTab] = useState<
-    'interfaces' | 'routes' | 'ospf' | 'nat' | 'acl' | 'dhcp_arp'
-  >('interfaces');
+    | 'interfaces'
+    | 'routes'
+    | 'ospf'
+    | 'bgp_wan'
+    | 'nat'
+    | 'acl'
+    | 'dhcp_arp'
+    | 'wifi'
+    | 'firewall'
+    | 'stack'
+  >(
+    node.deviceModel === 'firewall'
+      ? 'firewall'
+      : node.deviceModel === 'isp_cloud'
+      ? 'bgp_wan'
+      : node.deviceModel === 'soho_wifi_router'
+      ? 'wifi'
+      : 'interfaces'
+  );
   const [position, setPosition] = useState<{ x: number; y: number }>({
     x: 240,
     y: 184,
@@ -106,6 +162,14 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
   });
   const [isMinimized, setIsMinimized] = useState(false);
   const [statusToast, setStatusToast] = useState<string | null>(null);
+
+  // eBGP Neighbor creation state
+  const [bgpNbrIp, setBgpNbrIp] = useState<string>('203.0.113.1');
+  const [bgpNbrAs, setBgpNbrAs] = useState<string>('65101');
+  const [bgpNbrDesc, setBgpNbrDesc] = useState<string>('ISP-1 Primary Uplink');
+  const [bgpNbrWeight, setBgpNbrWeight] = useState<string>('200');
+  const [bgpNbrLocalPref, setBgpNbrLocalPref] = useState<string>('150');
+  const [bgpNbrPrepend, setBgpNbrPrepend] = useState<string>('0');
 
   // 802.1Q Subinterface creation form state
   const [targetParentIfaceId, setTargetParentIfaceId] = useState<string>(
@@ -144,6 +208,28 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
   const [newPoolDns, setNewPoolDns] = useState<string>('192.168.2.100');
   const [newPoolStart, setNewPoolStart] = useState<string>('192.168.1.50');
   const [newPoolEnd, setNewPoolEnd] = useState<string>('192.168.1.150');
+
+  // Firewall Port Forwarding (DNAT) & IPsec VPN creation state
+  const [pfName, setPfName] = useState<string>('DMZ-Server-Publish');
+  const [pfExtIp, setPfExtIp] = useState<string>('203.0.113.2');
+  const [pfExtPort, setPfExtPort] = useState<string>('80');
+  const [pfIntIp, setPfIntIp] = useState<string>('172.16.50.100');
+  const [pfIntPort, setPfIntPort] = useState<string>('80');
+  const [pfProto, setPfProto] = useState<'TCP' | 'UDP' | 'HTTP' | 'ICMP' | 'ANY'>('ANY');
+
+  const [vpnName, setVpnName] = useState<string>('VPN-Site-to-Site');
+  const [vpnPeerIp, setVpnPeerIp] = useState<string>('198.51.100.2');
+  const [vpnLocalSub, setVpnLocalSub] = useState<string>('192.168.100.0/24');
+  const [vpnRemoteSub, setVpnRemoteSub] = useState<string>('10.200.1.0/24');
+  const [vpnPsk, setVpnPsk] = useState<string>('NetPulse-IPsec-2026');
+
+  useEffect(() => {
+    if (node.deviceModel === 'firewall') {
+      setActiveTab('firewall');
+    } else if (node.deviceModel === 'isp_cloud') {
+      setActiveTab('bgp_wan');
+    }
+  }, [node.id, node.deviceModel]);
 
   useEffect(() => {
     if (!node.interfaces.some((i) => i.id === targetParentIfaceId)) {
@@ -209,6 +295,12 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
   const ospfConfig = node.ospfConfig || getDefaultOspfConfig(node);
   const ospfRouterId = electOspfRouterId(node);
   const ospfNeighbors = computeOspfNeighborsForRouter(node, allNodes, allLinks);
+  const bgpConfig: BgpConfig = node.bgpConfig || getDefaultBgpConfig(node, 1);
+  const wanImpairment: WanImpairmentConfig =
+    node.wanImpairment || getDefaultWanImpairmentConfig();
+  const bgpRouterId = resolveBgpRouterId(node);
+  const bgpPeers = discoverBgpPeersForRouter(node, allNodes, allLinks);
+  const bgpComputation = computeBgpRoutesForRouter(node, allNodes, allLinks);
   const totalSubinterfaces = node.interfaces.reduce(
     (sum, i) => sum + (i.subinterfaces?.length || 0),
     0
@@ -216,6 +308,7 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
   const aclRules = node.aclRules || [];
   const natTranslations = node.natTranslations || [];
   const suggestedRoutes = getSuggestedStaticRoutes(node, allNodes);
+  const nodeStackStatus = getNodeStackStatus(node, allNodes, allLinks);
 
   const switchableNodes = [...allNodes]
     .filter((n) => n.type !== 'pc')
@@ -498,9 +591,29 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
       >
         <div className="flex items-center gap-2 min-w-0">
           <GripHorizontal className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-          <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-sky-950/90 border border-sky-500/50 text-[10px] font-mono font-bold text-sky-200 shrink-0">
-            <Globe className="w-3 h-3 text-sky-400" />
-            <span>Cisco ISR GUI</span>
+          <div
+            className={`flex items-center gap-1.5 px-2 py-0.5 rounded border text-[10px] font-mono font-bold shrink-0 ${
+              node.deviceModel === 'firewall'
+                ? 'bg-rose-950/90 border-rose-500/60 text-rose-200'
+                : node.deviceModel === 'isp_cloud'
+                ? 'bg-orange-950/90 border-orange-500/60 text-orange-200'
+                : 'bg-sky-950/90 border-sky-500/50 text-sky-200'
+            }`}
+          >
+            {node.deviceModel === 'firewall' ? (
+              <Shield className="w-3 h-3 text-rose-400" />
+            ) : node.deviceModel === 'isp_cloud' ? (
+              <Cloud className="w-3 h-3 text-orange-400" />
+            ) : (
+              <Globe className="w-3 h-3 text-sky-400" />
+            )}
+            <span>
+              {node.deviceModel === 'firewall'
+                ? 'Cisco ASA / NGFW'
+                : node.deviceModel === 'isp_cloud'
+                ? `ISP Cloud · AS ${bgpConfig.asn}`
+                : 'Cisco ISR GUI'}
+            </span>
           </div>
 
           <select
@@ -569,110 +682,310 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
       </div>
 
       {!isMinimized && (
-        <>
-          {/* Navigation Tabs: Interfaces & 802.1Q | Static Routes | OSPF/RIP | NAT/PAT | ACL | DHCP/ARP */}
-          <div className="flex flex-wrap items-center justify-between gap-1.5 px-3 py-1.5 bg-slate-900/80 border-b border-slate-800">
-            <div className="flex flex-wrap items-center gap-1">
-              <button
-                type="button"
-                data-testid="router-tab-interfaces"
-                onClick={() => setActiveTab('interfaces')}
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                  activeTab === 'interfaces'
-                    ? 'bg-sky-600 text-white shadow-xs'
-                    : 'text-slate-300 hover:text-white hover:bg-slate-800'
-                }`}
-              >
-                <SlidersHorizontal className="w-3 h-3" />
-                <span>
-                  Порты и 802.1Q ({node.interfaces.length}
-                  {totalSubinterfaces > 0 ? `+${totalSubinterfaces}` : ''})
-                </span>
-              </button>
+        <div className="flex min-h-[470px] max-h-[520px] overflow-hidden">
+          {/* Left Grouped Sidebar Menu (like Server L7 Services Sidebar) */}
+          <aside
+            aria-label="Разделы конфигурации маршрутизатора"
+            className="w-56 shrink-0 bg-slate-900/95 border-r border-slate-800 p-2.5 flex flex-col justify-between overflow-y-auto gap-3 select-none"
+          >
+            <div className="space-y-3">
+              {/* Group 1: Интерфейсы и Стек */}
+              <div className="space-y-1">
+                <div className="px-2 text-[9px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                  Интерфейсы и Стек
+                </div>
+                <button
+                  type="button"
+                  data-testid="router-tab-interfaces"
+                  onClick={() => setActiveTab('interfaces')}
+                  className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                    activeTab === 'interfaces'
+                      ? 'bg-sky-600 text-white shadow-xs font-semibold'
+                      : 'text-slate-300 hover:text-white hover:bg-slate-800/90'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Порты и 802.1Q</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono shrink-0 ${
+                      activeTab === 'interfaces'
+                        ? 'bg-sky-800/80 text-sky-100'
+                        : 'bg-slate-800 text-slate-300'
+                    }`}
+                  >
+                    {node.interfaces.length}
+                    {totalSubinterfaces > 0 ? `+${totalSubinterfaces}` : ''}
+                  </span>
+                </button>
 
-              <button
-                type="button"
-                data-testid="router-tab-routes"
-                onClick={() => setActiveTab('routes')}
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                  activeTab === 'routes'
-                    ? 'bg-sky-600 text-white shadow-xs'
-                    : 'text-slate-300 hover:text-white hover:bg-slate-800'
-                }`}
-              >
-                <Route className="w-3 h-3" />
-                <span>Static ({staticRoutesCount})</span>
-              </button>
+                <button
+                  type="button"
+                  data-testid="router-tab-stack"
+                  onClick={() => setActiveTab('stack')}
+                  className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                    activeTab === 'stack'
+                      ? 'bg-amber-500 text-slate-950 font-semibold shadow-xs'
+                      : 'text-amber-300 hover:text-white hover:bg-slate-800/90'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    <Layers className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Стек / HA (HSRP)</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono shrink-0 ${
+                      activeTab === 'stack'
+                        ? 'bg-amber-950/40 text-slate-950 font-bold'
+                        : nodeStackStatus
+                        ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {nodeStackStatus
+                      ? `#${nodeStackStatus.memberNumber} ${
+                          nodeStackStatus.role === 'master'
+                            ? 'ACT'
+                            : nodeStackStatus.role === 'standby'
+                            ? 'STBY'
+                            : 'MBR'
+                        }`
+                      : 'OFF'}
+                  </span>
+                </button>
+              </div>
 
-              <button
-                type="button"
-                data-testid="router-tab-ospf"
-                onClick={() => setActiveTab('ospf')}
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                  activeTab === 'ospf'
-                    ? 'bg-lime-600 text-slate-950 font-semibold shadow-xs'
-                    : 'text-lime-300 hover:text-white hover:bg-slate-800'
-                }`}
-              >
-                <Share2 className="w-3 h-3" />
-                <span>
-                  OSPF / RIP ({ospfConfig.enabled ? `ON·${ospfNeighbors.length}` : dynamicRoutesCount > 0 ? `${dynamicRoutesCount}` : 'OFF'})
-                </span>
-              </button>
+              {/* Group 2: Маршрутизация L3 */}
+              <div className="space-y-1">
+                <div className="px-2 text-[9px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                  Маршрутизация L3
+                </div>
+                <button
+                  type="button"
+                  data-testid="router-tab-routes"
+                  onClick={() => setActiveTab('routes')}
+                  className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                    activeTab === 'routes'
+                      ? 'bg-sky-600 text-white shadow-xs font-semibold'
+                      : 'text-slate-300 hover:text-white hover:bg-slate-800/90'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    <Route className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Статическая (Static)</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono shrink-0 ${
+                      activeTab === 'routes'
+                        ? 'bg-sky-800/80 text-sky-100'
+                        : 'bg-slate-800 text-slate-300'
+                    }`}
+                  >
+                    {staticRoutesCount}
+                  </span>
+                </button>
 
-              <button
-                type="button"
-                data-testid="router-tab-nat"
-                onClick={() => setActiveTab('nat')}
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                  activeTab === 'nat'
-                    ? 'bg-sky-600 text-white shadow-xs'
-                    : 'text-slate-300 hover:text-white hover:bg-slate-800'
-                }`}
-              >
-                <ArrowRightLeft className="w-3 h-3" />
-                <span>NAT ({node.natEnabled ? 'ON' : 'OFF'})</span>
-              </button>
+                <button
+                  type="button"
+                  data-testid="router-tab-ospf"
+                  onClick={() => setActiveTab('ospf')}
+                  className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                    activeTab === 'ospf'
+                      ? 'bg-lime-600 text-slate-950 font-semibold shadow-xs'
+                      : 'text-lime-300 hover:text-white hover:bg-slate-800/90'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    <Share2 className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">OSPF / RIP</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono shrink-0 ${
+                      activeTab === 'ospf'
+                        ? 'bg-lime-950/35 text-slate-950 font-bold'
+                        : ospfConfig.enabled
+                        ? 'bg-lime-500/20 text-lime-300 border border-lime-500/40'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {ospfConfig.enabled
+                      ? `ON·${ospfNeighbors.length}`
+                      : dynamicRoutesCount > 0
+                      ? `${dynamicRoutesCount}`
+                      : 'OFF'}
+                  </span>
+                </button>
 
-              <button
-                type="button"
-                data-testid="router-tab-acl"
-                onClick={() => setActiveTab('acl')}
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                  activeTab === 'acl'
-                    ? 'bg-sky-600 text-white shadow-xs'
-                    : 'text-slate-300 hover:text-white hover:bg-slate-800'
-                }`}
-              >
-                <Shield className="w-3 h-3" />
-                <span>ACL ({aclRules.length})</span>
-              </button>
+                <button
+                  type="button"
+                  data-testid="router-tab-bgp-wan"
+                  onClick={() => setActiveTab('bgp_wan')}
+                  className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                    activeTab === 'bgp_wan'
+                      ? 'bg-orange-500 text-slate-950 font-semibold shadow-xs'
+                      : 'text-orange-300 hover:text-white hover:bg-slate-800/90'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    <Cloud className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">eBGP / WAN</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono shrink-0 ${
+                      activeTab === 'bgp_wan'
+                        ? 'bg-orange-950/35 text-slate-950 font-bold'
+                        : bgpConfig.enabled
+                        ? 'bg-orange-500/20 text-orange-300 border border-orange-500/40'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {bgpConfig.enabled ? `AS${bgpConfig.asn}·${bgpPeers.length}` : 'OFF'}
+                  </span>
+                </button>
+              </div>
 
-              <button
-                type="button"
-                data-testid="router-tab-dhcp-arp"
-                onClick={() => setActiveTab('dhcp_arp')}
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                  activeTab === 'dhcp_arp'
-                    ? 'bg-amber-600 text-white shadow-xs'
-                    : 'text-amber-300 hover:text-white hover:bg-slate-800'
-                }`}
-              >
-                <Activity className="w-3 h-3" />
-                <span>
-                  DHCP / ARP ({node.services?.dhcpPools?.length || 0}·{node.arpTable.length})
-                </span>
-              </button>
+              {/* Group 3: Безопасность и NAT */}
+              <div className="space-y-1">
+                <div className="px-2 text-[9px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                  Безопасность и NAT
+                </div>
+                <button
+                  type="button"
+                  data-testid="router-tab-nat"
+                  onClick={() => setActiveTab('nat')}
+                  className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                    activeTab === 'nat'
+                      ? 'bg-sky-600 text-white shadow-xs font-semibold'
+                      : 'text-slate-300 hover:text-white hover:bg-slate-800/90'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    <ArrowRightLeft className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">NAT / PAT</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono shrink-0 ${
+                      activeTab === 'nat'
+                        ? 'bg-sky-800/80 text-sky-100'
+                        : node.natEnabled
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {node.natEnabled ? 'ON' : 'OFF'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="router-tab-acl"
+                  onClick={() => setActiveTab('acl')}
+                  className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                    activeTab === 'acl'
+                      ? 'bg-sky-600 text-white shadow-xs font-semibold'
+                      : 'text-slate-300 hover:text-white hover:bg-slate-800/90'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    <Shield className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Списки ACL</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono shrink-0 ${
+                      activeTab === 'acl'
+                        ? 'bg-sky-800/80 text-sky-100'
+                        : aclRules.length > 0
+                        ? 'bg-rose-500/20 text-rose-300'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {aclRules.length}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="router-tab-firewall"
+                  onClick={() => setActiveTab('firewall')}
+                  className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                    activeTab === 'firewall'
+                      ? 'bg-rose-600 text-white font-semibold shadow-xs'
+                      : 'text-rose-300 hover:text-white hover:bg-slate-800/90'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    <Shield className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">ASA Firewall</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono shrink-0 ${
+                      activeTab === 'firewall'
+                        ? 'bg-rose-900/80 text-rose-100'
+                        : 'bg-slate-800 text-rose-300'
+                    }`}
+                  >
+                    {node.firewallConfig?.statefulSessions?.length || 0}·
+                    {node.firewallConfig?.ipsecTunnels?.length || 0}
+                  </span>
+                </button>
+              </div>
+
+              {/* Group 4: Службы и Сеть */}
+              <div className="space-y-1">
+                <div className="px-2 text-[9px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                  Службы и Радиосеть
+                </div>
+                <button
+                  type="button"
+                  data-testid="router-tab-dhcp-arp"
+                  onClick={() => setActiveTab('dhcp_arp')}
+                  className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                    activeTab === 'dhcp_arp'
+                      ? 'bg-amber-600 text-white shadow-xs font-semibold'
+                      : 'text-amber-300 hover:text-white hover:bg-slate-800/90'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    <Activity className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">DHCP и ARP</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[10px] font-mono shrink-0 ${
+                      activeTab === 'dhcp_arp'
+                        ? 'bg-amber-900/80 text-amber-100'
+                        : 'bg-slate-800 text-amber-300'
+                    }`}
+                  >
+                    {node.services?.dhcpPools?.length || 0}·{node.arpTable.length}
+                  </span>
+                </button>
+
+                {(node.deviceModel === 'soho_wifi_router' || Boolean(node.wifiConfig)) && (
+                  <button
+                    type="button"
+                    data-testid="router-tab-wifi"
+                    onClick={() => setActiveTab('wifi')}
+                    className={`w-full flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                      activeTab === 'wifi'
+                        ? 'bg-cyan-600 text-white shadow-xs font-semibold'
+                        : 'text-cyan-300 hover:text-white hover:bg-slate-800/90'
+                    }`}
+                  >
+                    <span className="flex items-center gap-1.5 truncate">
+                      <Wifi className="w-3.5 h-3.5 shrink-0" />
+                      <span className="truncate">Wi-Fi WLAN</span>
+                    </span>
+                    <span className="px-1.5 py-0.2 rounded text-[10px] font-mono bg-slate-800 text-cyan-300 truncate max-w-[68px]">
+                      {node.wifiConfig?.ssid || 'WiFi'}
+                    </span>
+                  </button>
+                )}
+              </div>
             </div>
 
-            <div className="flex items-center gap-1.5">
-              {statusToast && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-950/90 border border-emerald-500/50 text-[10px] font-mono text-emerald-300">
-                  <ShieldCheck className="w-3 h-3 shrink-0" />
-                  <span className="truncate max-w-[200px]">{statusToast}</span>
-                </span>
-              )}
-
+            {/* Bottom action inside sidebar: Add HWIC Port */}
+            <div className="pt-2 border-t border-slate-800">
               <button
                 type="button"
                 onClick={() => {
@@ -684,16 +997,45 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                     }`
                   );
                 }}
-                className="flex items-center gap-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] font-mono text-sky-300 transition-colors cursor-pointer"
+                className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] font-mono text-sky-300 transition-colors cursor-pointer"
               >
-                <Plus className="w-3 h-3" />
-                <span>Порт HWIC</span>
+                <Plus className="w-3.5 h-3.5" />
+                <span>Добавить порт HWIC</span>
               </button>
             </div>
-          </div>
+          </aside>
 
-          {/* Scrollable Body */}
-          <div className="max-h-[470px] overflow-y-auto p-3.5 space-y-3.5">
+          {/* Right Scrollable Content Area */}
+          <div className="flex-1 min-w-0 max-h-[520px] overflow-y-auto p-3.5 space-y-3.5 bg-slate-950/60">
+            {/* Active Section Compact Header & Status Toast */}
+            <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-800/90">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-xs font-bold text-slate-100 truncate">
+                  {activeTab === 'interfaces' &&
+                    `Физические интерфейсы L3, DHCP Relay и подинтерфейсы 802.1Q (${node.interfaces.length})`}
+                  {activeTab === 'stack' && 'Отказоустойчивый кластер маршрутизаторов (HSRP / VSS HA)'}
+                  {activeTab === 'routes' &&
+                    `Таблица маршрутизации RIB и статические маршруты (${staticRoutesCount})`}
+                  {activeTab === 'ospf' && 'Динамическая маршрутизация OSPFv2 (SPF) и RIPv2'}
+                  {activeTab === 'bgp_wan' &&
+                    'Внешняя маршрутизация eBGP (TCP 179) и эмулятор канала WAN (Latency / Loss)'}
+                  {activeTab === 'nat' && 'Трансляция сетевых адресов NAT / PAT (IPv4 Masquerade)'}
+                  {activeTab === 'acl' &&
+                    `Списки контроля доступа Extended IPv4 ACL (${aclRules.length})`}
+                  {activeTab === 'firewall' &&
+                    'Межсетевой экран Cisco ASA (Zone Security Levels, SPI и IPsec VPN)'}
+                  {activeTab === 'dhcp_arp' && 'Серверные пулы DHCPv4 и аппаратная таблица ARP'}
+                  {activeTab === 'wifi' && 'Точка доступа Беспроводной сети Wi-Fi (802.11ax)'}
+                </span>
+              </div>
+              {statusToast && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-950/90 border border-emerald-500/50 text-[10px] font-mono text-emerald-300 shrink-0">
+                  <ShieldCheck className="w-3 h-3 shrink-0" />
+                  <span className="truncate max-w-[260px]">{statusToast}</span>
+                </span>
+              )}
+            </div>
+
             {/* TAB 1: ROUTED INTERFACES, DHCP RELAY & 802.1Q SUBINTERFACES (ROUTER-ON-A-STICK) */}
             {activeTab === 'interfaces' && (
               <div className="space-y-3.5">
@@ -1155,9 +1497,9 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                         </span>
                       </div>
                       <div className="flex flex-wrap gap-1.5">
-                        {suggestedRoutes.map((s) => (
+                        {suggestedRoutes.map((s, idx) => (
                           <button
-                            key={`${s.network}-${s.nextHop}`}
+                            key={`${s.network}-${s.mask}-${s.nextHop}-${idx}`}
                             type="button"
                             onClick={() =>
                               handleQuickAddSuggestedRoute(
@@ -1183,7 +1525,7 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                       Таблица маршрутизации L3 (show ip route)
                     </span>
                     <span className="text-[11px] text-slate-400">
-                      Всего: {routes.length} (C: {routes.filter((r) => r.type === 'C').length}, S: {staticRoutesCount}, O: {routes.filter((r) => r.type === 'O').length}, R: {routes.filter((r) => r.type === 'R').length})
+                      Всего: {routes.length} (C: {routes.filter((r) => r.type === 'C').length}, S: {staticRoutesCount}, B: {routes.filter((r) => r.type === 'B').length}, O: {routes.filter((r) => r.type === 'O').length}, R: {routes.filter((r) => r.type === 'R').length})
                     </span>
                   </div>
                   <table className="w-full text-left border-collapse text-xs font-mono">
@@ -1197,14 +1539,19 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800/70">
-                      {routes.map((rt) => (
-                        <tr key={rt.id} className="hover:bg-slate-900/50">
+                      {routes.map((rt, idx) => (
+                        <tr
+                          key={rt.id || `rt-${rt.type}-${rt.network}-${rt.nextHop}-${idx}`}
+                          className="hover:bg-slate-900/50"
+                        >
                           <td className="py-1.5 px-2.5">
                             <div className="flex items-center gap-1">
                               <span
                                 className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
                                   rt.type === 'C'
                                     ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
+                                    : rt.type === 'B'
+                                    ? 'bg-orange-950/80 border-orange-500/50 text-orange-300'
                                     : rt.type === 'O'
                                     ? 'bg-lime-950/80 border-lime-500/50 text-lime-300'
                                     : rt.type === 'R'
@@ -1216,7 +1563,7 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                               </span>
                               {rt.type !== 'C' && (
                                 <span className="text-[9.5px] text-slate-400">
-                                  [{rt.administrativeDistance ?? (rt.type === 'S' ? 1 : rt.type === 'O' ? 110 : 120)}/{rt.metric ?? 0}]
+                                  [{rt.administrativeDistance ?? (rt.type === 'S' ? 1 : rt.type === 'B' ? 20 : rt.type === 'O' ? 110 : 120)}/{rt.metric ?? 0}]
                                 </span>
                               )}
                             </div>
@@ -1231,6 +1578,11 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                             <div>
                               {rt.type === 'C' ? 'Directly connected' : `via ${rt.nextHop}`}
                             </div>
+                            {rt.type === 'B' && rt.bgpAsPath && rt.bgpAsPath.length > 0 && (
+                              <div className="text-[9.5px] text-orange-300/90 truncate">
+                                AS_PATH: {rt.bgpAsPath.join(' → ')} · Weight {rt.bgpWeight ?? 100} · LP {rt.bgpLocalPref ?? 100}
+                              </div>
+                            )}
                             {rt.spfPath && rt.spfPath.length > 0 && (
                               <div className="text-[9.5px] text-lime-300/90 truncate">
                                 SPF: {rt.spfPath.join(' → ')}
@@ -1252,7 +1604,7 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                               </button>
                             ) : (
                               <span className="text-[10px] text-slate-500">
-                                {rt.type === 'O' ? 'OSPF' : rt.type === 'R' ? 'RIPv2' : 'авто'}
+                                {rt.type === 'B' ? 'eBGP' : rt.type === 'O' ? 'OSPF' : rt.type === 'R' ? 'RIPv2' : 'авто'}
                               </span>
                             )}
                           </td>
@@ -1477,9 +1829,9 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                   {/* Active OSPF Network Statements */}
                   {ospfConfig.networks.length > 0 && (
                     <div className="pt-2 border-t border-slate-800/80 flex flex-wrap gap-1.5">
-                      {ospfConfig.networks.map((net) => (
+                      {ospfConfig.networks.map((net, idx) => (
                         <div
-                          key={net.id}
+                          key={net.id || `ospf-net-${net.network}-${net.area}-${idx}`}
                           className="inline-flex items-center gap-2 px-2.5 py-1 rounded bg-slate-950 border border-lime-500/40 text-xs font-mono text-lime-200"
                         >
                           <span>
@@ -1829,8 +2181,8 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/70">
-                        {natTranslations.map((tr) => (
-                          <tr key={tr.id}>
+                        {natTranslations.map((tr, idx) => (
+                          <tr key={`${tr.id || 'nat'}-${idx}`}>
                             <td className="py-1.5 px-2.5 uppercase text-amber-300 font-bold">
                               {tr.protocol}
                             </td>
@@ -2044,9 +2396,9 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/70">
-                        {aclRules.map((rule) => (
+                        {aclRules.map((rule, idx) => (
                           <tr
-                            key={rule.id}
+                            key={`${rule.id || 'acl'}-${rule.seq}-${idx}`}
                             className={
                               rule.enabled === false ? 'opacity-50 bg-slate-950' : ''
                             }
@@ -2316,9 +2668,9 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                             </div>
                             {poolLeases.length > 0 && (
                               <div className="pt-1 border-t border-slate-900 flex flex-wrap gap-1.5">
-                                {poolLeases.map((lease) => (
+                                {poolLeases.map((lease, idx) => (
                                   <span
-                                    key={lease.ipAddress}
+                                    key={`${lease.ipAddress}-${lease.macAddress}-${idx}`}
                                     className="px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-[10px] text-emerald-300"
                                   >
                                     {lease.hostname}: {lease.ipAddress} ({lease.macAddress})
@@ -2385,8 +2737,1842 @@ export const FloatingRouterGui: React.FC<FloatingRouterGuiProps> = ({
                 </div>
               </div>
             )}
+
+            {/* TAB 7: SOHO WI-FI ROUTER 802.11 RADIO & COVERAGE SETTINGS */}
+            {activeTab === 'wifi' && (() => {
+              const wifiCfg = node.wifiConfig || {
+                enabled: true,
+                ssid: 'Corp-WiFi',
+                security: 'wpa2' as const,
+                password: 'cisco123',
+                channel: 36 as const,
+                band: '5GHz' as const,
+                coverageRadius: 270,
+              };
+
+              const updateWifiCfg = (patch: Partial<typeof wifiCfg>) => {
+                onUpdateNode({
+                  ...node,
+                  wifiConfig: {
+                    ...wifiCfg,
+                    ...patch,
+                  },
+                });
+              };
+
+              const wirelessLinks = allLinks.filter(
+                (l) =>
+                  l.cableType === 'wireless' &&
+                  (l.sourceNodeId === node.id || l.targetNodeId === node.id)
+              );
+
+              return (
+                <div className="space-y-3" data-testid="router-wifi-config-panel">
+                  <div className="p-3 rounded-lg bg-slate-900/95 border border-cyan-500/40 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-bold text-cyan-200 flex items-center gap-2">
+                          <Wifi className="w-4 h-4 text-cyan-400" />
+                          <span>Встроенный радиомодуль SOHO Wi-Fi 802.11 (Wlan0) — {node.name}</span>
+                        </div>
+                        <div className="text-[11px] text-slate-400">
+                          Настройте SSID, шифрование WPA2-PSK и радиус зоны радиопокрытия маршрутизатора.
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        data-testid="router-wifi-toggle-btn"
+                        onClick={() => {
+                          updateWifiCfg({ enabled: !wifiCfg.enabled });
+                          setStatusToast(
+                            !wifiCfg.enabled
+                              ? `Радиомодуль Wlan0 на ${node.name} включён`
+                              : `Радиомодуль Wlan0 на ${node.name} выключен`
+                          );
+                        }}
+                        className={`px-3 py-1 rounded text-xs font-mono font-bold border cursor-pointer ${
+                          wifiCfg.enabled
+                            ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300'
+                            : 'bg-red-500/20 border-red-500/50 text-red-300'
+                        }`}
+                      >
+                        {wifiCfg.enabled ? 'WLAN0 ON (В ЭФИРЕ)' : 'WLAN0 OFF'}
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
+                      <div>
+                        <label className="block text-[10px] font-mono text-slate-400 mb-1">
+                          Имя сети (SSID)
+                        </label>
+                        <input
+                          type="text"
+                          data-testid="router-wifi-ssid-input"
+                          value={wifiCfg.ssid}
+                          onChange={(e) => updateWifiCfg({ ssid: e.target.value })}
+                          className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100 focus:outline-none focus:border-cyan-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] font-mono text-slate-400 mb-1">
+                          Диапазон / Канал
+                        </label>
+                        <div className="flex items-center gap-1.5">
+                          <select
+                            value={wifiCfg.band}
+                            onChange={(e) =>
+                              updateWifiCfg({
+                                band: e.target.value as '2.4GHz' | '5GHz',
+                                channel: e.target.value === '2.4GHz' ? 6 : 36,
+                              })
+                            }
+                            className="flex-1 px-2 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                          >
+                            <option value="2.4GHz">2.4 GHz</option>
+                            <option value="5GHz">5 GHz</option>
+                          </select>
+                          <select
+                            value={wifiCfg.channel}
+                            onChange={(e) =>
+                              updateWifiCfg({
+                                channel: Number(e.target.value) as 1 | 6 | 11 | 36 | 44 | 149,
+                              })
+                            }
+                            className="w-24 px-2 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono text-cyan-300"
+                          >
+                            <option value={1}>Ch 1</option>
+                            <option value={6}>Ch 6</option>
+                            <option value={11}>Ch 11</option>
+                            <option value={36}>Ch 36</option>
+                            <option value={44}>Ch 44</option>
+                            <option value={149}>Ch 149</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] font-mono text-slate-400 mb-1">
+                          Безопасность (WPA2 / Open)
+                        </label>
+                        <div className="flex items-center gap-1.5">
+                          <select
+                            data-testid="router-wifi-security-select"
+                            value={wifiCfg.security}
+                            onChange={(e) =>
+                              updateWifiCfg({ security: e.target.value as 'open' | 'wpa2' })
+                            }
+                            className="w-28 px-2 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono text-slate-100"
+                          >
+                            <option value="wpa2">WPA2-PSK</option>
+                            <option value="open">Open</option>
+                          </select>
+                          {wifiCfg.security === 'wpa2' && (
+                            <input
+                              type="text"
+                              data-testid="router-wifi-password-input"
+                              value={wifiCfg.password}
+                              onChange={(e) => updateWifiCfg({ password: e.target.value })}
+                              placeholder="Пароль WPA2..."
+                              className="flex-1 px-2 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono text-amber-300 focus:outline-none focus:border-cyan-500"
+                            />
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="pt-1 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3">
+                      <div className="text-xs font-mono text-slate-300">
+                        Радиус зоны покрытия SOHO-роутера:{' '}
+                        <strong className="text-cyan-300">{wifiCfg.coverageRadius} px</strong>
+                      </div>
+                      <input
+                        type="range"
+                        data-testid="router-wifi-radius-slider"
+                        min={120}
+                        max={420}
+                        step={10}
+                        value={wifiCfg.coverageRadius}
+                        onChange={(e) =>
+                          updateWifiCfg({ coverageRadius: Number(e.target.value) })
+                        }
+                        className="w-60 accent-cyan-400 cursor-pointer"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Associated Wireless Clients on Wlan0 */}
+                  <div className="rounded-md border border-slate-800 overflow-hidden bg-slate-950">
+                    <div className="px-3 py-2 bg-slate-900 border-b border-slate-800 text-xs font-mono font-semibold text-slate-200">
+                      Беспроводные клиенты на интерфейсе Wlan0 ({wirelessLinks.length})
+                    </div>
+                    <table className="w-full text-left border-collapse text-xs font-mono">
+                      <thead>
+                        <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                          <th className="py-1.5 px-3">Клиент</th>
+                          <th className="py-1.5 px-3">IPv4 / MAC</th>
+                          <th className="py-1.5 px-3">Дистанция</th>
+                          <th className="py-1.5 px-3">Сигнал (RSSI)</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70">
+                        {wirelessLinks.length === 0 ? (
+                          <tr>
+                            <td colSpan={4} className="py-4 text-center text-slate-500 font-sans">
+                              Нет подключённых Wi-Fi клиентов на порту Wlan0.
+                            </td>
+                          </tr>
+                        ) : (
+                          wirelessLinks.map((link) => {
+                            const peerId =
+                              link.sourceNodeId === node.id
+                                ? link.targetNodeId
+                                : link.sourceNodeId;
+                            const peer = allNodes.find((n) => n.id === peerId);
+                            if (!peer) return null;
+                            const metrics = computeWifiSignalMetrics(peer, node);
+                            const peerIface = peer.interfaces[0];
+                            return (
+                              <tr key={link.id}>
+                                <td className="py-1.5 px-3 font-bold text-cyan-300">
+                                  {peer.name}
+                                </td>
+                                <td className="py-1.5 px-3 text-slate-200">
+                                  {peerIface?.ipAddress || '0.0.0.0'} · {peerIface?.macAddress}
+                                </td>
+                                <td className="py-1.5 px-3 text-slate-300">
+                                  {metrics.distancePx} / {wifiCfg.coverageRadius} px
+                                </td>
+                                <td className="py-1.5 px-3 text-emerald-300 font-semibold">
+                                  {metrics.rssiDbm} dBm ({metrics.signalQualityPercent}%)
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* TAB 8: Cisco ASA / FortiGate Next-Gen Firewall (Zones, SPI, Port Forwarding, IPsec VPN) */}
+            {activeTab === 'firewall' && (() => {
+              const fwCfg: FirewallConfig =
+                node.firewallConfig || getDefaultFirewallConfig(node.id);
+
+              const updateFirewallCfg = (patch: Partial<FirewallConfig>) => {
+                onUpdateNode({
+                  ...node,
+                  deviceModel: node.deviceModel || 'firewall',
+                  natEnabled: true,
+                  firewallConfig: {
+                    ...fwCfg,
+                    ...patch,
+                  },
+                });
+              };
+
+              const handleInterfaceZoneChange = (
+                ifaceId: string,
+                newZone: FirewallZoneName,
+                customLevel?: number
+              ) => {
+                const nextLevel =
+                  customLevel !== undefined
+                    ? Math.max(0, Math.min(100, customLevel))
+                    : getDefaultSecurityLevelForZone(newZone);
+                const nextInterfaces = node.interfaces.map((iface) =>
+                  iface.id === ifaceId
+                    ? {
+                        ...iface,
+                        securityZone: newZone,
+                        securityLevel: nextLevel,
+                        natRole: (newZone === 'outside' ? 'outside' : 'inside') as
+                          | 'inside'
+                          | 'outside',
+                      }
+                    : iface
+                );
+                onUpdateNode({
+                  ...node,
+                  deviceModel: node.deviceModel || 'firewall',
+                  natEnabled: true,
+                  firewallConfig: fwCfg,
+                  interfaces: nextInterfaces,
+                });
+                setStatusToast(
+                  `Интерфейс переведён в зону ${newZone.toUpperCase()} (Security Level ${nextLevel})`
+                );
+              };
+
+              return (
+                <div className="space-y-4">
+                  {/* Top Banner: Stateful Packet Inspection (SPI) & Protocol Inspection */}
+                  <div className="p-3 rounded-md bg-rose-950/25 border border-rose-500/40 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-semibold text-rose-200 flex items-center gap-1.5">
+                          <Shield className="w-3.5 h-3.5 text-rose-400" />
+                          <span>
+                            Межсетевой экран {fwCfg.vendorModel} — Зоны безопасности (Inside 100 / DMZ 50 / Outside 0) и SPI
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-300 mt-0.5">
+                          Трафик из более защищённой зоны в менее защищённую (<strong>100 → 50 → 0</strong>) разрешается автоматически и записывается в таблицу состояний <strong>SPI</strong>. Прямой вход из <strong>Outside (0)</strong> в <strong>Inside (100)</strong> блокируется по умолчанию.
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        data-testid="firewall-spi-toggle-btn"
+                        onClick={() => {
+                          updateFirewallCfg({ spiEnabled: !fwCfg.spiEnabled });
+                          setStatusToast(
+                            !fwCfg.spiEnabled
+                              ? 'Stateful Packet Inspection (SPI) включён'
+                              : 'Stateful Packet Inspection (SPI) выключен'
+                          );
+                        }}
+                        className={`px-3 py-1 rounded text-xs font-mono font-bold border cursor-pointer ${
+                          fwCfg.spiEnabled
+                            ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300'
+                            : 'bg-red-500/20 border-red-500/50 text-red-300'
+                        }`}
+                      >
+                        {fwCfg.spiEnabled ? 'SPI INSP: АКТИВЕН' : 'SPI INSP: ВЫКЛ'}
+                      </button>
+                    </div>
+
+                    {/* Protocol Inspection Checkboxes */}
+                    <div className="pt-2 border-t border-rose-500/25 flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span className="text-slate-400">Policy-map global_policy (inspect):</span>
+                        {(
+                          [
+                            { key: 'inspectTcp', label: 'TCP (SYN/ACK)' },
+                            { key: 'inspectUdp', label: 'UDP (DNS 53)' },
+                            { key: 'inspectIcmp', label: 'ICMP (Echo/Reply)' },
+                            { key: 'inspectHttp', label: 'HTTP (L7 DPI)' },
+                          ] as const
+                        ).map((item) => (
+                          <label
+                            key={item.key}
+                            className="inline-flex items-center gap-1.5 text-slate-200 cursor-pointer"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={fwCfg[item.key]}
+                              onChange={(e) =>
+                                updateFirewallCfg({ [item.key]: e.target.checked })
+                              }
+                              className="accent-rose-500"
+                            />
+                            <span>{item.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Section 1: Interface Security Zones (`nameif` & `security-level`) */}
+                  <div className="rounded-md border border-slate-800 overflow-hidden bg-slate-950">
+                    <div className="px-3 py-2 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
+                      <span className="text-xs font-mono font-semibold text-slate-200">
+                        1. Зоны безопасности интерфейсов (Cisco ASA nameif / security-level)
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">
+                        Inside (100) · DMZ (50) · Outside (0)
+                      </span>
+                    </div>
+                    <table className="w-full text-left border-collapse text-xs font-mono">
+                      <thead>
+                        <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                          <th className="py-1.5 px-3">Интерфейс</th>
+                          <th className="py-1.5 px-3">IPv4 / Маска</th>
+                          <th className="py-1.5 px-3">Зона безопасности (nameif)</th>
+                          <th className="py-1.5 px-3">Уровень (0–100)</th>
+                          <th className="py-1.5 px-3">Роль NAT</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70">
+                        {node.interfaces.map((iface) => {
+                          const zInfo = getInterfaceSecurityZoneAndLevel(iface);
+                          return (
+                            <tr key={iface.id}>
+                              <td className="py-1.5 px-3 font-bold text-sky-300">
+                                {iface.shortName}
+                              </td>
+                              <td className="py-1.5 px-3 text-slate-200">
+                                {iface.ipAddress
+                                  ? `${iface.ipAddress}/${maskToCidr(iface.subnetMask)}`
+                                  : 'unassigned'}
+                              </td>
+                              <td className="py-1.5 px-3">
+                                <select
+                                  data-testid={`fw-zone-select-${iface.shortName}`}
+                                  value={zInfo.zone}
+                                  onChange={(e) =>
+                                    handleInterfaceZoneChange(
+                                      iface.id,
+                                      e.target.value as FirewallZoneName
+                                    )
+                                  }
+                                  className={`px-2 py-1 rounded border text-xs font-mono font-semibold cursor-pointer ${
+                                    zInfo.zone === 'inside'
+                                      ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
+                                      : zInfo.zone === 'dmz'
+                                      ? 'bg-amber-950/80 border-amber-500/50 text-amber-300'
+                                      : 'bg-rose-950/80 border-rose-500/50 text-rose-300'
+                                  }`}
+                                >
+                                  <option value="inside">inside (Доверенная LAN · 100)</option>
+                                  <option value="dmz">dmz (Демилитаризованная · 50)</option>
+                                  <option value="outside">outside (Внешний WAN · 0)</option>
+                                </select>
+                              </td>
+                              <td className="py-1.5 px-3">
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={100}
+                                  value={zInfo.level}
+                                  onChange={(e) =>
+                                    handleInterfaceZoneChange(
+                                      iface.id,
+                                      zInfo.zone,
+                                      Number(e.target.value)
+                                    )
+                                  }
+                                  className="w-16 px-2 py-1 rounded bg-slate-900 border border-slate-700 text-xs font-mono text-slate-100"
+                                />
+                              </td>
+                              <td className="py-1.5 px-3 text-slate-300">
+                                {iface.natRole || (zInfo.zone === 'outside' ? 'outside' : 'inside')}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Section 2: Port Forwarding (DNAT: Publish DMZ Server to Outside) */}
+                  <div className="p-3 rounded-md bg-slate-900/90 border border-slate-800 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono font-semibold text-amber-300">
+                        2. Port Forwarding / Static DNAT (Публикация веб-сервера из DMZ наружу)
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-400">
+                        Outside IP:Port → DMZ IP:Port
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-12 gap-2 items-end text-xs font-mono">
+                      <div className="col-span-3">
+                        <label className="block text-[10px] text-slate-400 mb-0.5">
+                          Имя правила
+                        </label>
+                        <input
+                          type="text"
+                          value={pfName}
+                          onChange={(e) => setPfName(e.target.value)}
+                          className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-slate-100"
+                        />
+                      </div>
+                      <div className="col-span-3">
+                        <label className="block text-[10px] text-slate-400 mb-0.5">
+                          Внешний IP (Outside):Порт
+                        </label>
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="text"
+                            value={pfExtIp}
+                            onChange={(e) => setPfExtIp(formatIpv4Input(e.target.value))}
+                            className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-rose-300"
+                          />
+                          <input
+                            type="number"
+                            value={pfExtPort}
+                            onChange={(e) => setPfExtPort(e.target.value)}
+                            className="w-14 px-1.5 py-1 rounded bg-slate-950 border border-slate-700 text-slate-100"
+                          />
+                        </div>
+                      </div>
+                      <div className="col-span-3">
+                        <label className="block text-[10px] text-slate-400 mb-0.5">
+                          Внутренний IP (DMZ):Порт
+                        </label>
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="text"
+                            value={pfIntIp}
+                            onChange={(e) => setPfIntIp(formatIpv4Input(e.target.value))}
+                            className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-amber-300"
+                          />
+                          <input
+                            type="number"
+                            value={pfIntPort}
+                            onChange={(e) => setPfIntPort(e.target.value)}
+                            className="w-14 px-1.5 py-1 rounded bg-slate-950 border border-slate-700 text-slate-100"
+                          />
+                        </div>
+                      </div>
+                      <div className="col-span-3 flex items-center gap-1.5">
+                        <select
+                          value={pfProto}
+                          onChange={(e) =>
+                            setPfProto(
+                              e.target.value as 'TCP' | 'UDP' | 'HTTP' | 'ICMP' | 'ANY'
+                            )
+                          }
+                          className="w-20 px-1.5 py-1 rounded bg-slate-950 border border-slate-700 text-slate-100"
+                        >
+                          <option value="ANY">ANY</option>
+                          <option value="HTTP">HTTP</option>
+                          <option value="TCP">TCP</option>
+                          <option value="UDP">UDP</option>
+                        </select>
+                        <button
+                          type="button"
+                          data-testid="fw-add-port-forward-btn"
+                          onClick={() => {
+                            if (!isValidIpv4(pfExtIp) || !isValidIpv4(pfIntIp)) {
+                              setStatusToast('Проверьте корректность IP-адресов DNAT');
+                              return;
+                            }
+                            const newRule: FirewallPortForwardRule = {
+                              id: `pf-${Date.now()}`,
+                              name: pfName.trim() || 'DMZ-PortForward',
+                              enabled: true,
+                              externalInterface: 'Gi0/2',
+                              externalIp: pfExtIp,
+                              externalPort: Number(pfExtPort) || 80,
+                              protocol: pfProto,
+                              internalIp: pfIntIp,
+                              internalPort: Number(pfIntPort) || 80,
+                              targetZone: 'dmz',
+                              hitCount: 0,
+                            };
+                            updateFirewallCfg({
+                              portForwards: [...fwCfg.portForwards, newRule],
+                            });
+                            setStatusToast(
+                              `Добавлен проброс порта DNAT: ${pfExtIp}:${pfExtPort} → ${pfIntIp}:${pfIntPort}`
+                            );
+                          }}
+                          className="px-2.5 py-1 rounded bg-amber-600 hover:bg-amber-500 text-slate-950 font-semibold cursor-pointer shrink-0"
+                        >
+                          + DNAT
+                        </button>
+                      </div>
+                    </div>
+
+                    {fwCfg.portForwards.length > 0 && (
+                      <div className="space-y-1 pt-1">
+                        {fwCfg.portForwards.map((pf, idx) => (
+                          <div
+                            key={`${pf.id || 'pf'}-${idx}`}
+                            className="flex items-center justify-between px-2.5 py-1.5 rounded bg-slate-950 border border-amber-500/35 text-xs font-mono"
+                          >
+                            <div className="flex items-center gap-2">
+                              <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold text-[10px]">
+                                DNAT {pf.protocol}
+                              </span>
+                              <span className="text-slate-200 font-semibold">{pf.name}:</span>
+                              <span className="text-rose-300">
+                                {pf.externalIp}:{pf.externalPort}
+                              </span>
+                              <span className="text-slate-500">→</span>
+                              <span className="text-amber-300">
+                                {pf.internalIp}:{pf.internalPort} ({pf.targetZone.toUpperCase()})
+                              </span>
+                              <span className="text-[10px] text-slate-400">
+                                (hits: {pf.hitCount})
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateFirewallCfg({
+                                  portForwards: fwCfg.portForwards.filter(
+                                    (r) => r.id !== pf.id
+                                  ),
+                                })
+                              }
+                              className="text-slate-400 hover:text-red-400 cursor-pointer"
+                              title="Удалить правило Port Forwarding"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Section 3: Site-to-Site IPsec VPN Tunnels (IKEv2 / ESP) */}
+                  <div className="p-3 rounded-md bg-slate-900/90 border border-emerald-500/35 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="text-xs font-mono font-semibold text-emerald-300">
+                          3. Криптотуннели Site-to-Site IPsec VPN (IKEv2 / ESP AES-256-GCM)
+                        </span>
+                        <div className="text-[11px] text-slate-400">
+                          Шифрует трафик между локальной подсетью Inside и удалённым филиалом через публичную сеть Outside WAN
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        data-testid="firewall-test-ipsec-btn"
+                        onClick={() => {
+                          const steps = synthesizeIpsecVpnSteps(allNodes, allLinks, 1, 0);
+                          if (onLoadSimulationSteps && steps.length > 0) {
+                            onLoadSimulationSteps(
+                              steps,
+                              `IPsec VPN Site-to-Site: согласована фаза IKEv2 SA (UDP 500) и передан шифрованный пакет ESP (AES-256-GCM).`
+                            );
+                            setStatusToast('Запущена демонстрация туннеля IKEv2 + IPsec ESP');
+                          } else {
+                            setStatusToast('Нет активных IPsec-туннелей с доступным пиром');
+                          }
+                        }}
+                        className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-xs font-mono font-semibold text-slate-950 cursor-pointer"
+                      >
+                        Проверить IKEv2 + ESP
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-12 gap-2 items-end text-xs font-mono">
+                      <div className="col-span-3">
+                        <label className="block text-[10px] text-slate-400 mb-0.5">
+                          Peer Public IP
+                        </label>
+                        <input
+                          type="text"
+                          value={vpnPeerIp}
+                          onChange={(e) => setVpnPeerIp(formatIpv4Input(e.target.value))}
+                          className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-emerald-300"
+                        />
+                      </div>
+                      <div className="col-span-3">
+                        <label className="block text-[10px] text-slate-400 mb-0.5">
+                          Local Subnet (HQ)
+                        </label>
+                        <input
+                          type="text"
+                          value={vpnLocalSub}
+                          onChange={(e) => setVpnLocalSub(e.target.value)}
+                          className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-slate-100"
+                        />
+                      </div>
+                      <div className="col-span-3">
+                        <label className="block text-[10px] text-slate-400 mb-0.5">
+                          Remote Subnet (Branch)
+                        </label>
+                        <input
+                          type="text"
+                          value={vpnRemoteSub}
+                          onChange={(e) => setVpnRemoteSub(e.target.value)}
+                          className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-slate-100"
+                        />
+                      </div>
+                      <div className="col-span-3 flex items-center gap-1.5">
+                        <input
+                          type="text"
+                          value={vpnPsk}
+                          onChange={(e) => setVpnPsk(e.target.value)}
+                          placeholder="PSK..."
+                          className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-amber-300"
+                        />
+                        <button
+                          type="button"
+                          data-testid="fw-add-vpn-btn"
+                          onClick={() => {
+                            const outIface =
+                              node.interfaces.find((i) => i.securityZone === 'outside') ||
+                              node.interfaces[node.interfaces.length - 1];
+                            const newTun: IpsecTunnelConfig = {
+                              id: `vpn-${Date.now()}`,
+                              tunnelName: vpnName || 'VPN-Site2Site',
+                              enabled: true,
+                              localInterface: outIface?.shortName || 'Gi0/2',
+                              localPublicIp: outIface?.ipAddress || '203.0.113.2',
+                              peerPublicIp: vpnPeerIp,
+                              localSubnet: vpnLocalSub,
+                              remoteSubnet: vpnRemoteSub,
+                              preSharedKey: vpnPsk || 'cisco123',
+                              ikeVersion: 'IKEv2',
+                              cryptoSuite: 'AES-256-GCM / SHA-256 / DH14',
+                              status: 'UP',
+                              packetsEncrypted: 0,
+                              packetsDecrypted: 0,
+                            };
+                            updateFirewallCfg({
+                              ipsecTunnels: [...fwCfg.ipsecTunnels, newTun],
+                            });
+                            setStatusToast(`Добавлен туннель IPsec VPN к ${vpnPeerIp}`);
+                          }}
+                          className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-semibold cursor-pointer shrink-0"
+                        >
+                          + VPN
+                        </button>
+                      </div>
+                    </div>
+
+                    {fwCfg.ipsecTunnels.length > 0 && (
+                      <div className="space-y-1 pt-1">
+                        {fwCfg.ipsecTunnels.map((tun, idx) => (
+                          <div
+                            key={`${tun.id || 'tun'}-${idx}`}
+                            className="flex items-center justify-between px-2.5 py-1.5 rounded bg-slate-950 border border-emerald-500/40 text-xs font-mono"
+                          >
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[10px]">
+                                {tun.ikeVersion} · {tun.status}
+                              </span>
+                              <span className="text-slate-100 font-semibold">
+                                {tun.tunnelName}:
+                              </span>
+                              <span className="text-sky-300">
+                                {tun.localPublicIp} ⇄ {tun.peerPublicIp}
+                              </span>
+                              <span className="text-emerald-300">
+                                ({tun.localSubnet} ↔ {tun.remoteSubnet})
+                              </span>
+                              <span className="text-[10px] text-slate-400">
+                                ESP Enc: {tun.packetsEncrypted} / Dec: {tun.packetsDecrypted}
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateFirewallCfg({
+                                  ipsecTunnels: fwCfg.ipsecTunnels.filter(
+                                    (t) => t.id !== tun.id
+                                  ),
+                                })
+                              }
+                              className="text-slate-400 hover:text-red-400 cursor-pointer"
+                              title="Удалить IPsec туннель"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Section 4: Live Stateful Packet Inspection (SPI) Session Table (`show conn`) */}
+                  <div className="rounded-md border border-slate-800 overflow-hidden bg-slate-950">
+                    <div className="px-3 py-2 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
+                      <span className="text-xs font-mono font-semibold text-slate-200">
+                        4. Таблица активных сессий Stateful Packet Inspection — show conn ({fwCfg.statefulSessions.length})
+                      </span>
+                      {fwCfg.statefulSessions.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            updateFirewallCfg({ statefulSessions: [] });
+                            setStatusToast('Таблица сессий SPI (show conn) очищена');
+                          }}
+                          className="text-[10px] font-mono text-rose-300 hover:text-rose-200 cursor-pointer"
+                        >
+                          Очистить (clear conn)
+                        </button>
+                      )}
+                    </div>
+                    <table className="w-full text-left border-collapse text-xs font-mono">
+                      <thead>
+                        <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                          <th className="py-1.5 px-3">Протокол</th>
+                          <th className="py-1.5 px-3">Инициатор (Inside/High)</th>
+                          <th className="py-1.5 px-3">Получатель (Outside/DMZ)</th>
+                          <th className="py-1.5 px-3">Маршрут зон</th>
+                          <th className="py-1.5 px-3">Статус SPI</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70">
+                        {fwCfg.statefulSessions.length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="py-4 text-center text-slate-500 font-sans">
+                              Нет активных сессий SPI. Запустите Ping или HTTP из зоны Inside (100) наружу, чтобы увидеть динамическую запись соединения.
+                            </td>
+                          </tr>
+                        ) : (
+                          fwCfg.statefulSessions.map((s, idx) => (
+                            <tr key={`${s.id || 'spi'}-${idx}`}>
+                              <td className="py-1.5 px-3 font-bold text-sky-300">
+                                {s.protocol}
+                              </td>
+                              <td className="py-1.5 px-3 text-emerald-300">
+                                {s.initiatorIp}:{s.initiatorPort}
+                              </td>
+                              <td className="py-1.5 px-3 text-amber-300">
+                                {s.responderIp}:{s.responderPort}
+                              </td>
+                              <td className="py-1.5 px-3 text-slate-300">
+                                {s.initiatorZone.toUpperCase()}({s.initiatorLevel}) →{' '}
+                                {s.responderZone.toUpperCase()}({s.responderLevel})
+                              </td>
+                              <td className="py-1.5 px-3">
+                                <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">
+                                  {s.state} (pkts: {s.packetsCount})
+                                </span>
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* TAB 9: ROUTER STACKING & HSRP / VSS HIGH-AVAILABILITY */}
+            {activeTab === 'stack' && (() => {
+              const stackCfg: StackConfig = node.stackConfig || {
+                enabled: false,
+                stackId: 'STACK-WAN-1',
+                domainId: 1,
+                protocol: 'HSRP',
+                memberNumber: 1,
+                priority: 15,
+                role: 'master',
+                virtualIp: '192.168.10.1',
+                virtualMask: '255.255.255.0',
+                virtualMac: getDefaultStackVirtualMac(1),
+                backplaneBandwidthGbps: 80,
+                preempt: true,
+              };
+
+              const updateStackCfg = (patch: Partial<StackConfig>) => {
+                const nextCfg: StackConfig = {
+                  ...stackCfg,
+                  ...patch,
+                };
+                const updatedRouter: NetworkNode = {
+                  ...node,
+                  stackConfig: nextCfg,
+                };
+                commitRouterUpdateAndSyncAll(updatedRouter, false);
+              };
+
+              const candidateRouters = allNodes.filter(
+                (n) => n.type === 'router' && n.id !== node.id
+              );
+
+              return (
+                <div className="space-y-3.5" data-testid="router-stack-config-panel">
+                  <div className="p-3.5 rounded-lg bg-slate-900/95 border border-amber-500/45 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-bold text-amber-200 flex items-center gap-2">
+                          <Layers className="w-4 h-4 text-amber-400" />
+                          <span>
+                            Стекирование маршрутизаторов и отказоустойчивый шлюз HSRP / VSS — {node.name}
+                          </span>
+                          {nodeStackStatus && (
+                            <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-400/60 text-[10px] font-mono font-bold text-amber-200">
+                              #{nodeStackStatus.memberNumber}{' '}
+                              {nodeStackStatus.role === 'master'
+                                ? 'ACTIVE / MASTER'
+                                : nodeStackStatus.role.toUpperCase()}{' '}
+                              · {stackCfg.stackId}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          Объединяет несколько роутеров в отказоустойчивый кластер с виртуальным IP-шлюзом (HSRP VIP) и синхронизацией маршрутов по межшассийной шине (Stack Backplane). При отказе Active-роутера трафик мгновенно перехватывает Standby-роутер.
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        data-testid="router-stack-toggle-btn"
+                        onClick={() => {
+                          const nextEnabled = !stackCfg.enabled;
+                          updateStackCfg({ enabled: nextEnabled });
+                          setStatusToast(
+                            nextEnabled
+                              ? `Стек маршрутизаторов (HSRP / VSS) включён на ${node.name}`
+                              : `Маршрутизатор ${node.name} выведен из стека`
+                          );
+                        }}
+                        className={`px-3 py-1 rounded text-xs font-mono font-bold border cursor-pointer ${
+                          stackCfg.enabled
+                            ? 'bg-amber-500/25 border-amber-400 text-amber-200'
+                            : 'bg-slate-800 border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        {stackCfg.enabled ? 'HA STACK ON (В СТЕКЕ)' : 'HA STACK OFF'}
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5 text-xs font-mono">
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          ID стека (Stack ID)
+                        </label>
+                        <input
+                          type="text"
+                          data-testid="router-stack-id-input"
+                          value={stackCfg.stackId}
+                          onChange={(e) =>
+                            updateStackCfg({
+                              enabled: true,
+                              stackId: e.target.value.toUpperCase(),
+                            })
+                          }
+                          className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-amber-300 focus:outline-none focus:border-amber-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Виртуальный шлюз (HSRP VIP)
+                        </label>
+                        <input
+                          type="text"
+                          data-testid="router-stack-vip-input"
+                          placeholder="192.168.10.1"
+                          value={stackCfg.virtualIp || ''}
+                          onChange={(e) => {
+                            const nextVip = formatIpv4Input(e.target.value);
+                            if (onUpdateAllNodes) {
+                              const nextAll = allNodes.map((n) => {
+                                if (n.id === node.id) {
+                                  return {
+                                    ...n,
+                                    stackConfig: {
+                                      ...stackCfg,
+                                      enabled: true,
+                                      virtualIp: nextVip,
+                                    },
+                                  };
+                                }
+                                if (
+                                  n.type === 'router' &&
+                                  n.stackConfig?.enabled &&
+                                  n.stackConfig.stackId === stackCfg.stackId
+                                ) {
+                                  return {
+                                    ...n,
+                                    stackConfig: {
+                                      ...n.stackConfig,
+                                      virtualIp: nextVip,
+                                    },
+                                  };
+                                }
+                                return n;
+                              });
+                              onUpdateAllNodes(syncAllRoutersRoutingTables(nextAll, allLinks));
+                            } else {
+                              updateStackCfg({ enabled: true, virtualIp: nextVip });
+                            }
+                          }}
+                          className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-emerald-300 font-bold focus:outline-none focus:border-emerald-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Протокол кластера
+                        </label>
+                        <select
+                          value={stackCfg.protocol}
+                          onChange={(e) =>
+                            updateStackCfg({
+                              enabled: true,
+                              protocol: e.target.value as 'HSRP' | 'VSS',
+                            })
+                          }
+                          className="w-full px-2 py-1.5 rounded bg-slate-950 border border-slate-700 text-slate-100"
+                        >
+                          <option value="HSRP">Cisco HSRP v2 + Stack</option>
+                          <option value="VSS">Cisco VSS (Virtual Chassis)</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Номер юнита (#1..4)
+                        </label>
+                        <select
+                          value={stackCfg.memberNumber}
+                          onChange={(e) =>
+                            updateStackCfg({
+                              enabled: true,
+                              memberNumber: Number(e.target.value) || 1,
+                            })
+                          }
+                          className="w-full px-2 py-1.5 rounded bg-slate-950 border border-slate-700 text-sky-300"
+                        >
+                          {[1, 2, 3, 4].map((num) => (
+                            <option key={num} value={num}>
+                              Router #{num}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Приоритет (1..15)
+                        </label>
+                        <select
+                          data-testid="router-stack-priority-select"
+                          value={stackCfg.priority}
+                          onChange={(e) => {
+                            const prio = Number(e.target.value) || 10;
+                            updateStackCfg({
+                              enabled: true,
+                              priority: prio,
+                            });
+                            setStatusToast(
+                              `Приоритет стека для ${node.name} изменён на ${prio} (перевыбор Active/Master)`
+                            );
+                          }}
+                          className="w-full px-2 py-1.5 rounded bg-slate-950 border border-slate-700 text-amber-300 font-bold"
+                        >
+                          {[15, 14, 12, 10, 8, 5, 1].map((p) => (
+                            <option key={p} value={p}>
+                              Priority {p} {p === 15 ? '(Active)' : p === 10 ? '(Standby)' : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* 1-Click Connect & Join Another Router to Stack */}
+                    {candidateRouters.length > 0 && onCreateLink && (
+                      <div className="p-2.5 rounded bg-slate-950/90 border border-slate-800 space-y-2">
+                        <div className="text-[11px] text-slate-300 font-medium">
+                          Быстрое соединение маршрутизаторов в стек (прокладывает стек-кабель HA Stack 80G и синхронизирует <code className="text-amber-300">{stackCfg.stackId}</code>):
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {candidateRouters.map((peerRtr) => {
+                            const alreadyLinked = allLinks.some(
+                              (l) =>
+                                l.cableType === 'stack' &&
+                                ((l.sourceNodeId === node.id && l.targetNodeId === peerRtr.id) ||
+                                  (l.sourceNodeId === peerRtr.id && l.targetNodeId === node.id))
+                            );
+                            return (
+                              <button
+                                key={peerRtr.id}
+                                type="button"
+                                data-testid={`join-router-stack-${peerRtr.id}`}
+                                onClick={() => {
+                                  const usedA = new Set(
+                                    allLinks.flatMap((l) =>
+                                      l.sourceNodeId === node.id
+                                        ? [l.sourceInterfaceId]
+                                        : l.targetNodeId === node.id
+                                        ? [l.targetInterfaceId]
+                                        : []
+                                    )
+                                  );
+                                  const usedB = new Set(
+                                    allLinks.flatMap((l) =>
+                                      l.sourceNodeId === peerRtr.id
+                                        ? [l.sourceInterfaceId]
+                                        : l.targetNodeId === peerRtr.id
+                                        ? [l.targetInterfaceId]
+                                        : []
+                                    )
+                                  );
+                                  const portA =
+                                    [...node.interfaces]
+                                      .reverse()
+                                      .find((i) => !usedA.has(i.id)) ||
+                                    node.interfaces[node.interfaces.length - 1];
+                                  const portB =
+                                    [...peerRtr.interfaces]
+                                      .reverse()
+                                      .find((i) => !usedB.has(i.id)) ||
+                                    peerRtr.interfaces[peerRtr.interfaces.length - 1];
+                                  if (portA && portB) {
+                                    onCreateLink(
+                                      node.id,
+                                      portA.id,
+                                      peerRtr.id,
+                                      portB.id,
+                                      'stack'
+                                    );
+                                    setStatusToast(
+                                      `Маршрутизаторы ${node.name} и ${peerRtr.name} объединены в стек (${portA.shortName} ⇄ ${portB.shortName})`
+                                    );
+                                  }
+                                }}
+                                className={`px-2.5 py-1 rounded text-xs font-mono border transition-colors cursor-pointer ${
+                                  alreadyLinked
+                                    ? 'bg-amber-950/70 border-amber-500/60 text-amber-200'
+                                    : 'bg-slate-900 hover:bg-amber-950/60 border-slate-700 hover:border-amber-400 text-slate-200'
+                                }`}
+                              >
+                                {alreadyLinked ? '⇄ В стеке с ' : '+ Объединить в стек с '}
+                                <strong>{peerRtr.name}</strong>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Live HSRP / Router Stack Table (`show standby brief` / `show stack`) */}
+                    <div className="rounded border border-slate-800 overflow-hidden bg-slate-950">
+                      <div className="px-3 py-1.5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono">
+                        <span className="text-amber-300 font-semibold">
+                          Состояние отказоустойчивого стека (show standby / show stack) — Virtual MAC: {nodeStackStatus?.stackGroup.virtualMac || stackCfg.virtualMac}
+                        </span>
+                        <span className="text-emerald-300 font-bold">
+                          VIP: {nodeStackStatus?.stackGroup.virtualIp || stackCfg.virtualIp || 'Не задан'}
+                        </span>
+                      </div>
+                      <table className="w-full text-left border-collapse text-xs font-mono">
+                        <thead>
+                          <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                            <th className="py-1.5 px-2.5">Юнит #</th>
+                            <th className="py-1.5 px-2.5">Маршрутизатор</th>
+                            <th className="py-1.5 px-2.5">Роль HSRP / Stack</th>
+                            <th className="py-1.5 px-2.5">Priority</th>
+                            <th className="py-1.5 px-2.5">Виртуальный IP (VIP)</th>
+                            <th className="py-1.5 px-2.5">Статус шасси</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70">
+                          {!nodeStackStatus ? (
+                            <tr>
+                              <td colSpan={6} className="py-4 text-center text-slate-500 font-sans">
+                                Маршрутизатор работает автономно. Включите HA Stack выше или соедините два роутера «Стек-кабелем».
+                              </td>
+                            </tr>
+                          ) : (
+                            nodeStackStatus.stackGroup.members.map((m) => (
+                              <tr key={m.node.id} className="hover:bg-slate-900/60">
+                                <td className="py-1.5 px-2.5 font-bold text-amber-300">
+                                  {m.role === 'master' ? `*${m.memberNumber}` : ` ${m.memberNumber}`}
+                                </td>
+                                <td className="py-1.5 px-2.5 text-slate-100 font-semibold">
+                                  {m.node.name}
+                                </td>
+                                <td className="py-1.5 px-2.5">
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
+                                      m.role === 'master'
+                                        ? 'bg-amber-500/25 border-amber-400 text-amber-200'
+                                        : m.role === 'standby'
+                                        ? 'bg-sky-500/20 border-sky-400/60 text-sky-200'
+                                        : 'bg-slate-800 border-slate-700 text-slate-300'
+                                    }`}
+                                  >
+                                    {m.role === 'master'
+                                      ? 'ACTIVE / MASTER'
+                                      : m.role === 'standby'
+                                      ? 'STANDBY'
+                                      : 'MEMBER'}
+                                  </span>
+                                </td>
+                                <td className="py-1.5 px-2.5 text-emerald-300">{m.priority}</td>
+                                <td className="py-1.5 px-2.5 text-sky-300">
+                                  {nodeStackStatus.stackGroup.virtualIp || '—'}
+                                </td>
+                                <td className="py-1.5 px-2.5 text-slate-300">
+                                  {m.isOperational ? 'Active (Backplane Synced)' : 'Interfaces Down'}
+                                </td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* TAB: eBGP MULTIHOMING (DUAL-ISP ASN) & WAN LINK IMPAIRMENT EMULATOR */}
+            {activeTab === 'bgp_wan' && (() => {
+              const updateBgpCfg = (patch: Partial<BgpConfig>) => {
+                const updated: NetworkNode = {
+                  ...node,
+                  bgpConfig: {
+                    ...bgpConfig,
+                    ...patch,
+                  },
+                };
+                commitRouterUpdateAndSyncAll(updated, false);
+              };
+
+              const updateWanCfg = (patch: Partial<WanImpairmentConfig>) => {
+                const updated: NetworkNode = {
+                  ...node,
+                  wanImpairment: {
+                    ...wanImpairment,
+                    ...patch,
+                  },
+                };
+                commitRouterUpdateAndSyncAll(updated, false);
+              };
+
+              const handleAddBgpNeighbor = (e: React.FormEvent) => {
+                e.preventDefault();
+                if (!isValidIpv4(bgpNbrIp)) {
+                  setStatusToast('Укажите корректный IPv4-адрес соседа eBGP');
+                  return;
+                }
+                const remoteAsNum = Math.max(1, Math.min(65535, Number(bgpNbrAs) || 65101));
+                const newNbr: BgpNeighborConfig = {
+                  id: `bgp-nbr-${Date.now()}`,
+                  neighborIp: bgpNbrIp.trim(),
+                  remoteAs: remoteAsNum,
+                  description: bgpNbrDesc.trim() || `AS ${remoteAsNum} Peer`,
+                  enabled: true,
+                  weight: Math.max(0, Number(bgpNbrWeight) || 100),
+                  localPreference: Math.max(0, Number(bgpNbrLocalPref) || 100),
+                  asPathPrependCount: Math.max(0, Math.min(5, Number(bgpNbrPrepend) || 0)),
+                };
+                updateBgpCfg({
+                  enabled: true,
+                  neighbors: [
+                    ...bgpConfig.neighbors.filter((n) => n.neighborIp !== newNbr.neighborIp),
+                    newNbr,
+                  ],
+                });
+                setStatusToast(
+                  `Добавлен сосед eBGP: neighbor ${newNbr.neighborIp} remote-as ${newNbr.remoteAs}`
+                );
+              };
+
+              return (
+                <div className="space-y-3.5" data-testid="router-bgp-wan-panel">
+                  {/* SECTION 1: eBGP Autonomous System (ASN) Header & Peering Action */}
+                  <div className="p-3 rounded-md bg-slate-900/95 border border-orange-500/40 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-bold text-orange-200 flex items-center gap-2">
+                          <Cloud className="w-4 h-4 text-orange-400" />
+                          <span>
+                            Маршрутизация eBGP (Autonomous System · TCP 179) — {node.name}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                              bgpConfig.enabled
+                                ? 'bg-orange-500/20 border-orange-400/60 text-orange-200'
+                                : 'bg-slate-800 border-slate-700 text-slate-400'
+                            }`}
+                          >
+                            {bgpConfig.enabled
+                              ? `AS ${bgpConfig.asn} · RID ${bgpRouterId}`
+                              : 'eBGP ВЫКЛЮЧЕН'}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          Внешний протокол граничного шлюза (eBGP, AD 20) для подключения к двум провайдерам (Dual-ISP Multihoming). Выбор лучшего пути (Best Path <code className="text-orange-300">*&gt;</code>): Weight → LOCAL_PREF → длина AS_PATH → задержка WAN.
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          data-testid="router-bgp-run-peering-btn"
+                          onClick={() => {
+                            const res = runBgpPeeringSimulation(allNodes, allLinks, node.id);
+                            if (onUpdateAllNodes) {
+                              onUpdateAllNodes(res.updatedNodes);
+                            }
+                            if (onLoadSimulationSteps && res.steps.length > 0) {
+                              onLoadSimulationSteps(res.steps, res.summaryMessage);
+                            }
+                            setStatusToast(res.summaryMessage);
+                          }}
+                          className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-orange-950 hover:bg-orange-800 border border-orange-500/60 text-xs font-mono font-semibold text-orange-200 transition-colors cursor-pointer"
+                        >
+                          <Activity className="w-3.5 h-3.5 text-orange-400" />
+                          <span>Запустить обмен eBGP (TCP 179)</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          data-testid="router-bgp-toggle-btn"
+                          onClick={() => {
+                            const nextEnabled = !bgpConfig.enabled;
+                            updateBgpCfg({ enabled: nextEnabled });
+                            setStatusToast(
+                              nextEnabled
+                                ? `Процесс router bgp ${bgpConfig.asn} запущен на ${node.name}`
+                                : `Процесс eBGP остановлен на ${node.name}`
+                            );
+                          }}
+                          className={`px-3 py-1.5 rounded text-xs font-mono font-bold border cursor-pointer ${
+                            bgpConfig.enabled
+                              ? 'bg-orange-500 text-slate-950 border-orange-400'
+                              : 'bg-slate-800 border-slate-700 text-slate-300'
+                          }`}
+                        >
+                          {bgpConfig.enabled ? `eBGP: ВКЛ (AS ${bgpConfig.asn})` : 'Включить eBGP'}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-2.5 text-xs font-mono">
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Номер автономной системы (ASN)
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={65535}
+                          data-testid="router-bgp-asn-input"
+                          value={bgpConfig.asn}
+                          onChange={(e) =>
+                            updateBgpCfg({
+                              enabled: true,
+                              asn: Math.max(1, Math.min(65535, Number(e.target.value) || 65000)),
+                            })
+                          }
+                          className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-orange-300 font-bold focus:outline-none focus:border-orange-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          Имя оператора / AS (ISP Name)
+                        </label>
+                        <input
+                          type="text"
+                          value={bgpConfig.providerName || ''}
+                          onChange={(e) =>
+                            updateBgpCfg({
+                              providerName: e.target.value,
+                            })
+                          }
+                          placeholder="AS65000 Enterprise / Tier-1 ISP"
+                          className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-slate-100 focus:outline-none focus:border-orange-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">
+                          BGP Router-ID
+                        </label>
+                        <input
+                          type="text"
+                          value={bgpConfig.routerId || bgpRouterId}
+                          onChange={(e) =>
+                            updateBgpCfg({
+                              routerId: formatIpv4Input(e.target.value),
+                            })
+                          }
+                          className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-sky-300 focus:outline-none focus:border-orange-500"
+                        />
+                      </div>
+
+                      <div className="flex items-end">
+                        <label className="flex items-center gap-2 px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800 w-full cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={bgpConfig.redistributeConnected}
+                            onChange={(e) =>
+                              updateBgpCfg({
+                                redistributeConnected: e.target.checked,
+                              })
+                            }
+                            className="accent-orange-500"
+                          />
+                          <span className="text-[11px] text-slate-200">
+                            Redistribute Connected
+                          </span>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* SECTION 2: WAN Link Impairment Emulator (Latency / Jitter / Packet Loss % / Bandwidth) */}
+                  <div className="p-3 rounded-md bg-slate-900/95 border border-sky-500/40 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-bold text-sky-200 flex items-center gap-2">
+                          <Activity className="w-4 h-4 text-sky-400" />
+                          <span>
+                            Эмулятор канала WAN (WAN Link Impairment: Задержка, Потери и Полоса)
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                              !wanImpairment.enabled
+                                ? 'bg-slate-800 border-slate-700 text-slate-400'
+                                : wanImpairment.packetLossPercent >= 50 ||
+                                  wanImpairment.bandwidthLimitMbps <= 0
+                                ? 'bg-red-950 border-red-500/70 text-red-200'
+                                : 'bg-emerald-950 border-emerald-500/60 text-emerald-200'
+                            }`}
+                          >
+                            {wanImpairment.enabled
+                              ? `${wanImpairment.latencyMs} мс · Loss ${wanImpairment.packetLossPercent}% · ${wanImpairment.bandwidthLimitMbps} Мбит/с`
+                              : 'ИДЕАЛЬНЫЙ КАНАЛ (0 мс / 0%)'}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          Имитирует физические характеристики канала связи оператора (ISP Cloud / WAN): задержку распространения (Latency), джиттер, потери пакетов (Packet Loss %) и шейпинг полосы. При потерях ≥ 50% пакеты сбрасываются, а eBGP автоматически переключает трафик на резервного провайдера!
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        data-testid="router-wan-impairment-toggle-btn"
+                        onClick={() => {
+                          const next = !wanImpairment.enabled;
+                          updateWanCfg({ enabled: next });
+                          setStatusToast(
+                            next
+                              ? `Эмулятор канала WAN включён на ${node.name}`
+                              : `Эмулятор канала WAN выключен на ${node.name}`
+                          );
+                        }}
+                        className={`px-3 py-1 rounded text-xs font-mono font-bold border cursor-pointer ${
+                          wanImpairment.enabled
+                            ? 'bg-sky-500/25 border-sky-400 text-sky-200'
+                            : 'bg-slate-800 border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        {wanImpairment.enabled ? 'WAN ЭМУЛЯТОР: ВКЛ' : 'WAN ЭМУЛЯТОР: ВЫКЛ'}
+                      </button>
+                    </div>
+
+                    {/* Quick WAN Channel Profiles */}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-[10px] font-mono text-slate-400 mr-1">
+                        Профили канала:
+                      </span>
+                      {[
+                        {
+                          id: 'fiber',
+                          label: 'Оптика Tier-1 (8 мс · 0% · 1 Гбит/с)',
+                          cfg: {
+                            enabled: true,
+                            profileName: 'Tier-1 Fiber 1Gbps (SLA 99.99%)',
+                            latencyMs: 8,
+                            jitterMs: 1,
+                            packetLossPercent: 0,
+                            bandwidthLimitMbps: 1000,
+                          },
+                        },
+                        {
+                          id: 'backup',
+                          label: 'Резерв Radio/LTE (45 мс · 0% · 100 Мбит/с)',
+                          cfg: {
+                            enabled: true,
+                            profileName: 'Backup Radio/LTE 100Mbps',
+                            latencyMs: 45,
+                            jitterMs: 6,
+                            packetLossPercent: 0,
+                            bandwidthLimitMbps: 100,
+                          },
+                        },
+                        {
+                          id: 'sat',
+                          label: 'Спутник GEO (600 мс · 5% · 10 Мбит/с)',
+                          cfg: {
+                            enabled: true,
+                            profileName: 'GEO Satellite Link',
+                            latencyMs: 600,
+                            jitterMs: 35,
+                            packetLossPercent: 5,
+                            bandwidthLimitMbps: 10,
+                          },
+                        },
+                        {
+                          id: 'outage',
+                          label: 'Авария WAN (200 мс · 100% Loss — обрыв)',
+                          cfg: {
+                            enabled: true,
+                            profileName: 'WAN Outage (100% Packet Loss)',
+                            latencyMs: 200,
+                            jitterMs: 50,
+                            packetLossPercent: 100,
+                            bandwidthLimitMbps: 1,
+                          },
+                        },
+                      ].map((preset) => (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          data-testid={`wan-profile-btn-${preset.id}`}
+                          onClick={() => {
+                            updateWanCfg(preset.cfg);
+                            setStatusToast(`Применён профиль WAN: ${preset.label}`);
+                          }}
+                          className={`px-2 py-1 rounded text-[10px] font-mono border transition-colors cursor-pointer ${
+                            preset.id === 'outage'
+                              ? 'bg-red-950/70 hover:bg-red-900 border-red-500/50 text-red-200'
+                              : 'bg-slate-950 hover:bg-slate-800 border-slate-700 text-slate-200'
+                          }`}
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs font-mono">
+                      <div className="p-2 rounded bg-slate-950 border border-slate-800">
+                        <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                          <span>Задержка (Latency)</span>
+                          <strong className="text-sky-300">{wanImpairment.latencyMs} мс</strong>
+                        </div>
+                        <input
+                          type="number"
+                          min={0}
+                          max={2000}
+                          data-testid="wan-latency-input"
+                          value={wanImpairment.latencyMs}
+                          onChange={(e) =>
+                            updateWanCfg({
+                              enabled: true,
+                              latencyMs: Math.max(0, Math.min(2000, Number(e.target.value) || 0)),
+                            })
+                          }
+                          className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 text-sky-300 font-bold"
+                        />
+                      </div>
+
+                      <div className="p-2 rounded bg-slate-950 border border-slate-800">
+                        <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                          <span>Джиттер (Jitter ±)</span>
+                          <strong className="text-indigo-300">±{wanImpairment.jitterMs} мс</strong>
+                        </div>
+                        <input
+                          type="number"
+                          min={0}
+                          max={500}
+                          data-testid="wan-jitter-input"
+                          value={wanImpairment.jitterMs}
+                          onChange={(e) =>
+                            updateWanCfg({
+                              enabled: true,
+                              jitterMs: Math.max(0, Math.min(500, Number(e.target.value) || 0)),
+                            })
+                          }
+                          className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 text-indigo-300 font-bold"
+                        />
+                      </div>
+
+                      <div className="p-2 rounded bg-slate-950 border border-slate-800">
+                        <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                          <span>Потери (Packet Loss)</span>
+                          <strong
+                            className={
+                              wanImpairment.packetLossPercent >= 50
+                                ? 'text-red-400'
+                                : 'text-amber-300'
+                            }
+                          >
+                            {wanImpairment.packetLossPercent}%
+                          </strong>
+                        </div>
+                        <input
+                          type="number"
+                          min={0}
+                          max={100}
+                          data-testid="wan-loss-input"
+                          value={wanImpairment.packetLossPercent}
+                          onChange={(e) =>
+                            updateWanCfg({
+                              enabled: true,
+                              packetLossPercent: Math.max(
+                                0,
+                                Math.min(100, Number(e.target.value) || 0)
+                              ),
+                            })
+                          }
+                          className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 text-amber-300 font-bold"
+                        />
+                      </div>
+
+                      <div className="p-2 rounded bg-slate-950 border border-slate-800">
+                        <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                          <span>Полоса (Bandwidth)</span>
+                          <strong className="text-emerald-300">
+                            {wanImpairment.bandwidthLimitMbps} Мбит/с
+                          </strong>
+                        </div>
+                        <input
+                          type="number"
+                          min={0}
+                          max={10000}
+                          data-testid="wan-bandwidth-input"
+                          value={wanImpairment.bandwidthLimitMbps}
+                          onChange={(e) =>
+                            updateWanCfg({
+                              enabled: true,
+                              bandwidthLimitMbps: Math.max(
+                                0,
+                                Math.min(10000, Number(e.target.value) || 0)
+                              ),
+                            })
+                          }
+                          className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 text-emerald-300 font-bold"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* SECTION 3: eBGP Neighbors Table (`show ip bgp summary`) & Add Neighbor Form */}
+                  <div className="p-3 rounded-md bg-slate-900/95 border border-slate-800 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                      <span className="font-semibold text-orange-300">
+                        Соседи eBGP (show ip bgp summary) — {bgpPeers.length} пиров
+                      </span>
+                      <span className="text-[10px] text-slate-400">
+                        TCP Port 179 · Keepalive 60s / Holdtime 180s
+                      </span>
+                    </div>
+
+                    <form
+                      onSubmit={handleAddBgpNeighbor}
+                      className="grid grid-cols-12 gap-2 items-end pt-1"
+                    >
+                      <div className="col-span-3">
+                        <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                          Neighbor IP
+                        </label>
+                        <input
+                          type="text"
+                          data-testid="bgp-nbr-ip-input"
+                          value={bgpNbrIp}
+                          onChange={(e) => setBgpNbrIp(formatIpv4Input(e.target.value))}
+                          placeholder="203.0.113.1"
+                          className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-sky-300"
+                        />
+                      </div>
+
+                      <div className="col-span-2">
+                        <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                          Remote ASN
+                        </label>
+                        <input
+                          type="number"
+                          data-testid="bgp-nbr-asn-input"
+                          value={bgpNbrAs}
+                          onChange={(e) => setBgpNbrAs(e.target.value)}
+                          placeholder="65101"
+                          className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-orange-300"
+                        />
+                      </div>
+
+                      <div className="col-span-2">
+                        <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                          Weight
+                        </label>
+                        <input
+                          type="number"
+                          value={bgpNbrWeight}
+                          onChange={(e) => setBgpNbrWeight(e.target.value)}
+                          className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-emerald-300"
+                        />
+                      </div>
+
+                      <div className="col-span-2">
+                        <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                          LOCAL_PREF
+                        </label>
+                        <input
+                          type="number"
+                          value={bgpNbrLocalPref}
+                          onChange={(e) => setBgpNbrLocalPref(e.target.value)}
+                          className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-amber-300"
+                        />
+                      </div>
+
+                      <div className="col-span-3 flex items-center gap-1.5">
+                        <div className="flex-1">
+                          <label className="block text-[10px] font-mono text-slate-400 mb-0.5">
+                            Prepend
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            max={5}
+                            value={bgpNbrPrepend}
+                            onChange={(e) => setBgpNbrPrepend(e.target.value)}
+                            className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-slate-200"
+                          />
+                        </div>
+                        <button
+                          type="submit"
+                          data-testid="add-bgp-neighbor-btn"
+                          className="px-2.5 py-1 rounded bg-orange-500 hover:bg-orange-400 text-xs font-mono font-bold text-slate-950 shrink-0 cursor-pointer"
+                        >
+                          + Сосед
+                        </button>
+                      </div>
+                    </form>
+
+                    {bgpPeers.length > 0 ? (
+                      <table
+                        data-testid="bgp-neighbors-table"
+                        className="w-full text-left border-collapse text-xs font-mono"
+                      >
+                        <thead>
+                          <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                            <th className="py-1.5 px-2">Neighbor IP</th>
+                            <th className="py-1.5 px-2">Узел / Провайдер</th>
+                            <th className="py-1.5 px-2">Remote AS</th>
+                            <th className="py-1.5 px-2">Статус / Pfx</th>
+                            <th className="py-1.5 px-2">Weight / LP / Prepend</th>
+                            <th className="py-1.5 px-2">Канал WAN</th>
+                            <th className="py-1.5 px-2 text-right">Действие</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70">
+                          {bgpPeers.map((peer, idx) => (
+                            <tr key={`${peer.neighborIp}-${idx}`} className="hover:bg-slate-900/50">
+                              <td className="py-1.5 px-2 font-bold text-sky-300">
+                                {peer.neighborIp}
+                              </td>
+                              <td className="py-1.5 px-2 text-slate-200">
+                                {peer.neighborNodeName}
+                              </td>
+                              <td className="py-1.5 px-2 font-bold text-orange-300">
+                                AS {peer.remoteAs}
+                              </td>
+                              <td className="py-1.5 px-2">
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
+                                    peer.state === 'Established'
+                                      ? 'bg-emerald-950 border-emerald-500/60 text-emerald-300'
+                                      : 'bg-red-950 border-red-500/60 text-red-300'
+                                  }`}
+                                >
+                                  {peer.state === 'Established'
+                                    ? `Estab (${peer.prefixesReceived} pfx)`
+                                    : peer.state}
+                                </span>
+                              </td>
+                              <td className="py-1.5 px-2 text-slate-300">
+                                W:{peer.weight} · LP:{peer.localPreference} · Prep:+
+                                {peer.asPathPrependCount}
+                              </td>
+                              <td className="py-1.5 px-2 text-[10px] text-slate-400">
+                                {peer.wanImpairment?.enabled
+                                  ? `${peer.wanImpairment.latencyMs}ms · Loss ${peer.wanImpairment.packetLossPercent}%`
+                                  : '0ms · Ideal'}
+                              </td>
+                              <td className="py-1.5 px-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    updateBgpCfg({
+                                      neighbors: bgpConfig.neighbors.filter(
+                                        (n) => n.neighborIp !== peer.neighborIp
+                                      ),
+                                    });
+                                    setStatusToast(`Сосед eBGP ${peer.neighborIp} удалён`);
+                                  }}
+                                  className="p-1 rounded text-slate-400 hover:text-red-400 cursor-pointer"
+                                  title="Удалить соседа eBGP"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <div className="p-3 text-center text-xs font-mono text-slate-400">
+                        Соседи eBGP не настроены. Добавьте IP-адрес и номер AS соседнего маршрутизатора или провайдера ISP выше.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* SECTION 4: BGP Routing Table (`show ip bgp` — Best Path *> vs Backup *) */}
+                  <div className="rounded-md border border-slate-800 overflow-hidden bg-slate-950">
+                    <div className="px-3 py-2 bg-slate-900/95 border-b border-slate-800 flex items-center justify-between text-xs font-mono">
+                      <span className="font-semibold text-orange-300">
+                        Таблица BGP (show ip bgp) — все маршруты ({bgpComputation.allCandidateBgpRoutes.length})
+                      </span>
+                      <span className="text-[10px] text-slate-400">
+                        *&gt; Best Path (устанавливается в FIB с AD 20) · * Backup Path
+                      </span>
+                    </div>
+
+                    {bgpComputation.allCandidateBgpRoutes.length > 0 ? (
+                      <table
+                        data-testid="bgp-routes-table"
+                        className="w-full text-left border-collapse text-xs font-mono"
+                      >
+                        <thead>
+                          <tr className="bg-slate-900/60 border-b border-slate-800 text-[10px] uppercase text-slate-400">
+                            <th className="py-1.5 px-2.5">Статус</th>
+                            <th className="py-1.5 px-2">Сеть (Network)</th>
+                            <th className="py-1.5 px-2">Next Hop</th>
+                            <th className="py-1.5 px-2">Weight</th>
+                            <th className="py-1.5 px-2">LocPrf</th>
+                            <th className="py-1.5 px-2">WAN Задержка</th>
+                            <th className="py-1.5 px-2.5">AS_PATH</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70">
+                          {bgpComputation.allCandidateBgpRoutes.map((r) => (
+                            <tr
+                              key={r.id}
+                              className={
+                                r.bgpBestPath
+                                  ? 'bg-orange-950/20 hover:bg-orange-950/35'
+                                  : 'hover:bg-slate-900/50'
+                              }
+                            >
+                              <td className="py-1.5 px-2.5">
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
+                                    r.bgpBestPath
+                                      ? 'bg-orange-500/25 border-orange-400 text-orange-200'
+                                      : 'bg-slate-800 border-slate-700 text-slate-400'
+                                  }`}
+                                >
+                                  {r.bgpBestPath ? '*> BEST' : '* BACKUP'}
+                                </span>
+                              </td>
+                              <td className="py-1.5 px-2 font-bold text-slate-100">
+                                {r.network}/{maskToCidr(r.mask)}
+                              </td>
+                              <td className="py-1.5 px-2 text-sky-300">
+                                {r.nextHop} ({r.interfaceName})
+                              </td>
+                              <td className="py-1.5 px-2 text-emerald-300 font-semibold">
+                                {r.bgpWeight ?? 100}
+                              </td>
+                              <td className="py-1.5 px-2 text-amber-300 font-semibold">
+                                {r.bgpLocalPref ?? 100}
+                              </td>
+                              <td className="py-1.5 px-2 text-slate-300">
+                                {r.wanLatencyMs ?? 1} мс
+                              </td>
+                              <td className="py-1.5 px-2.5 font-bold text-orange-300">
+                                {(r.bgpAsPath || []).join(' → ')} {r.bgpOrigin || 'i'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <div className="p-3.5 text-center text-xs font-mono text-slate-400">
+                        Таблица маршрутов BGP пуста. Убедитесь, что eBGP включён и хотя бы один сосед находится в состоянии Established.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
-        </>
+        </div>
       )}
     </div>
   );

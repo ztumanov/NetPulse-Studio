@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { CableType, DeviceType, PresetTestScenario } from '../network/types';
+import { CableType, DeviceModel, DeviceType, PresetTestScenario } from '../network/types';
 import { TOPOLOGY_PRESETS } from '../network/presets';
-import { WorkspaceTool } from './TopologyCanvas';
+import { PendingCanvasPlacement, WorkspaceTool } from './TopologyCanvas';
 import {
   MousePointer,
   Cable,
@@ -20,8 +20,17 @@ import {
   ChevronDown,
   ChevronRight,
   CheckCircle2,
-  Play,
-  ShieldAlert,
+  Wifi,
+  Radio,
+  Laptop,
+  Smartphone,
+  Shield,
+  PhoneCall,
+  Camera,
+  Video,
+  Cloud,
+  Zap,
+  Cpu,
 } from 'lucide-react';
 
 interface DeviceToolbarProps {
@@ -29,10 +38,15 @@ interface DeviceToolbarProps {
   selectedCableType: CableType;
   activePresetId: string;
   isCollapsed: boolean;
+  pendingPlacement?: PendingCanvasPlacement | null;
   onToggleCollapse: () => void;
   onSelectTool: (tool: WorkspaceTool) => void;
   onSelectCableType: (type: CableType) => void;
-  onAddDevice: (type: DeviceType, switchPortCount?: number) => void;
+  onAddDevice: (
+    type: DeviceType,
+    switchPortCount?: number,
+    deviceModel?: DeviceModel
+  ) => void;
   onAddZone: () => void;
   onLoadPreset: (presetId: string) => void;
   onRunPresetTest?: (scenario: PresetTestScenario) => void;
@@ -47,6 +61,7 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
   selectedCableType,
   activePresetId,
   isCollapsed,
+  pendingPlacement,
   onToggleCollapse,
   onSelectTool,
   onSelectCableType,
@@ -59,7 +74,56 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
   onExportJson,
   onImportJson,
 }) => {
+  const isDeviceArmed = (
+    type: DeviceType,
+    switchPortCount: number = 6,
+    deviceModel?: DeviceModel
+  ) => {
+    if (!pendingPlacement || pendingPlacement.kind !== 'device') return false;
+    return (
+      pendingPlacement.type === type &&
+      (pendingPlacement.switchPortCount ?? 6) === switchPortCount &&
+      pendingPlacement.deviceModel === deviceModel
+    );
+  };
+
+  const armedBtnClass = (armed: boolean, defaultBorder = 'border-slate-800 hover:border-slate-700') =>
+    armed
+      ? 'bg-sky-500/20 border-sky-400 text-sky-100 ring-1 ring-sky-400 shadow-xs'
+      : `bg-slate-950/90 hover:bg-slate-800 ${defaultBorder} text-slate-200`;
   const [presetsOpen, setPresetsOpen] = useState(true);
+  const [openCategories, setOpenCategories] = useState<{
+    routing: boolean;
+    switching: boolean;
+    wireless: boolean;
+    endpoints: boolean;
+  }>({
+    routing: true,
+    switching: true,
+    wireless: true,
+    endpoints: true,
+  });
+
+  const toggleCategory = (key: keyof typeof openCategories) => {
+    setOpenCategories((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const allCategoriesOpen =
+    openCategories.routing &&
+    openCategories.switching &&
+    openCategories.wireless &&
+    openCategories.endpoints;
+
+  const toggleAllCategories = () => {
+    const next = !allCategoriesOpen;
+    setOpenCategories({
+      routing: next,
+      switching: next,
+      wireless: next,
+      endpoints: next,
+    });
+  };
+
   const activePreset = TOPOLOGY_PRESETS.find((p) => p.id === activePresetId) || TOPOLOGY_PRESETS[0];
 
   // Compact 56px Icon Rail Mode when collapsed
@@ -146,6 +210,22 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
             <Router className="w-4 h-4" />
           </button>
           <button
+            onClick={() => onAddDevice('router', 3, 'firewall')}
+            title="Добавить Межсетевой экран Firewall (Cisco ASA / FortiGate)"
+            aria-label="Добавить Firewall"
+            className="p-2 rounded-md text-rose-400 hover:bg-slate-800 transition-colors"
+          >
+            <Shield className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onAddDevice('router', 4, 'isp_cloud')}
+            title="Добавить Узел Провайдера / WAN-облако (ISP Cloud · eBGP · Эмулятор канала)"
+            aria-label="Добавить WAN / ISP Cloud"
+            className="p-2 rounded-md text-orange-400 hover:bg-slate-800 transition-colors"
+          >
+            <Cloud className="w-4 h-4" />
+          </button>
+          <button
             onClick={() => onAddDevice('switch', 6)}
             title="Добавить Switch 6 портов (Catalyst L2)"
             aria-label="Добавить Switch 6 портов"
@@ -162,6 +242,22 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
             24P
           </button>
           <button
+            onClick={() => onAddDevice('switch', 6, 'gpon_olt')}
+            title="Добавить Оптический терминал провайдера GPON OLT (1490/1310 нм · Сплиттер 1:N)"
+            aria-label="Добавить GPON OLT"
+            className="p-2 rounded-md text-emerald-400 hover:bg-slate-800 transition-colors"
+          >
+            <Zap className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onAddDevice('switch', 4, 'gpon_ont')}
+            title="Добавить Абонентский оптический модем ONT / ONU (FTTH · Контроль dBm / LOS)"
+            aria-label="Добавить ONT / ONU"
+            className="p-2 rounded-md text-teal-400 hover:bg-slate-800 transition-colors"
+          >
+            <Cpu className="w-4 h-4" />
+          </button>
+          <button
             onClick={() => onAddDevice('pc')}
             title="Добавить Рабочую станцию (PC)"
             aria-label="Добавить PC"
@@ -176,6 +272,46 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
             className="p-2 rounded-md text-emerald-400 hover:bg-slate-800 transition-colors"
           >
             <Server className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onAddDevice('switch', 6, 'wifi_ap')}
+            title="Добавить Точку доступа Wi-Fi (802.11 AP)"
+            aria-label="Добавить Wi-Fi AP"
+            className="p-2 rounded-md text-cyan-400 hover:bg-slate-800 transition-colors"
+          >
+            <Wifi className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onAddDevice('pc', 6, 'laptop')}
+            title="Добавить Ноутбук (Wi-Fi Client)"
+            aria-label="Добавить Ноутбук"
+            className="p-2 rounded-md text-violet-300 hover:bg-slate-800 transition-colors"
+          >
+            <Laptop className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onAddDevice('pc', 2, 'ip_phone')}
+            title="Добавить IP-Телефон (Cisco IP Phone 7960 · VoIP SIP / PoE)"
+            aria-label="Добавить IP-Телефон"
+            className="p-2 rounded-md text-fuchsia-400 hover:bg-slate-800 transition-colors"
+          >
+            <PhoneCall className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onAddDevice('pc', 1, 'ip_camera')}
+            title="Добавить PoE IP-Камеру (RTSP / Multicast · VLAN 30)"
+            aria-label="Добавить IP-Камеру"
+            className="p-2 rounded-md text-teal-400 hover:bg-slate-800 transition-colors"
+          >
+            <Camera className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onAddDevice('server', 1, 'nvr')}
+            title="Добавить Видеорегистратор NVR (RTSP Server · RAID-6)"
+            aria-label="Добавить NVR"
+            className="p-2 rounded-md text-teal-300 hover:bg-slate-800 transition-colors"
+          >
+            <Video className="w-4 h-4" />
           </button>
           <button
             onClick={onAddZone}
@@ -282,14 +418,18 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
                   { id: 'straight', label: 'Медный прямой (Straight)' },
                   { id: 'crossover', label: 'Медный кросс (Crossover)' },
                   { id: 'fiber', label: 'Оптоволокно (Fiber SFP)' },
+                  { id: 'stack', label: 'Стек-кабель (StackWise / HA)' },
                 ] as const
               ).map((c) => (
                 <button
                   key={c.id}
+                  data-testid={`cable-type-${c.id}`}
                   onClick={() => onSelectCableType(c.id)}
-                  className={`w-full text-left px-2 py-1 text-xs rounded transition-colors ${
+                  className={`w-full text-left px-2 py-1 text-xs rounded transition-colors cursor-pointer ${
                     selectedCableType === c.id
-                      ? 'bg-sky-500/20 text-sky-300 font-medium'
+                      ? c.id === 'stack'
+                        ? 'bg-amber-500/20 text-amber-300 font-medium border border-amber-500/40'
+                        : 'bg-sky-500/20 text-sky-300 font-medium'
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
@@ -300,81 +440,442 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
           )}
         </div>
 
-        {/* Section 2: Add Network Hardware & Subnet Zones */}
-        <div className="pt-3 border-t border-slate-800">
-          <div className="text-xs font-semibold text-slate-300 mb-2">
-            Добавить на холст
+        {/* Section 2: Categorized & Collapsible Network Hardware Palette */}
+        <div className="pt-3 border-t border-slate-800 space-y-2">
+          <div className="flex items-center justify-between gap-1">
+            <span className="text-xs font-semibold text-slate-300 whitespace-nowrap">
+              Добавить на холст
+            </span>
+            <button
+              type="button"
+              data-testid="toggle-all-device-categories-btn"
+              onClick={toggleAllCategories}
+              className="text-[10px] font-mono text-slate-400 hover:text-slate-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              {allCategoriesOpen ? 'Свернуть все' : 'Развернуть'}
+            </button>
           </div>
+
           <div className="space-y-1.5">
-            <button
-              onClick={() => onAddDevice('router')}
-              className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md bg-slate-950/90 hover:bg-slate-800 border border-slate-800 text-xs text-slate-200 transition-colors"
-            >
-              <span className="flex items-center gap-2 font-medium">
-                <Router className="w-3.5 h-3.5 text-sky-400" />
-                <span>Router (L3)</span>
-              </span>
-              <span className="text-[10px] font-mono text-slate-400">3 порта</span>
-            </button>
+            {/* Category 1: Routing & Security (L3 / NGFW) */}
+            <div className="rounded-md border border-slate-800/90 bg-slate-950/40 overflow-hidden">
+              <button
+                type="button"
+                data-testid="device-cat-toggle-routing"
+                onClick={() => toggleCategory('routing')}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 bg-slate-900/80 hover:bg-slate-800/80 text-[11px] font-semibold text-slate-200 transition-colors cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5 truncate">
+                  <Router className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                  <span className="truncate">Маршрутизация L3</span>
+                </span>
+                <span className="flex items-center gap-1 shrink-0">
+                  <span className="text-[10px] font-mono text-slate-400">3</span>
+                  {openCategories.routing ? (
+                    <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                  ) : (
+                    <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                </span>
+              </button>
+
+              {openCategories.routing && (
+                <div className="p-1.5 space-y-1 border-t border-slate-800/70">
+                  <button
+                    type="button"
+                    data-testid="add-router-btn"
+                    onClick={() => onAddDevice('router')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('router', 6, undefined)
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Router className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                      <span className="truncate">Router (L3)</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('router', 6, undefined) ? '+ Клик' : '3 порта'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-firewall-btn"
+                    onClick={() => onAddDevice('router', 3, 'firewall')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('router', 3, 'firewall')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Shield className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                      <span className="truncate">Firewall (ASA)</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('router', 3, 'firewall') ? '+ Клик' : 'SPI · VPN'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-isp-cloud-btn"
+                    onClick={() => onAddDevice('router', 4, 'isp_cloud')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('router', 4, 'isp_cloud')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Cloud className="w-3.5 h-3.5 text-orange-400 shrink-0" />
+                      <span className="truncate">WAN / Облако ISP</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('router', 4, 'isp_cloud') ? '+ Клик' : 'eBGP · WAN'}
+                    </span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Category 2: Switching & GPON Optical (L2 / L3 SVI / FTTH) */}
+            <div className="rounded-md border border-slate-800/90 bg-slate-950/40 overflow-hidden">
+              <button
+                type="button"
+                data-testid="device-cat-toggle-switching"
+                onClick={() => toggleCategory('switching')}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 bg-slate-900/80 hover:bg-slate-800/80 text-[11px] font-semibold text-slate-200 transition-colors cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5 truncate">
+                  <Network className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                  <span className="truncate">Коммутация и GPON</span>
+                </span>
+                <span className="flex items-center gap-1 shrink-0">
+                  <span className="text-[10px] font-mono text-slate-400">4</span>
+                  {openCategories.switching ? (
+                    <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                  ) : (
+                    <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                </span>
+              </button>
+
+              {openCategories.switching && (
+                <div className="p-1.5 space-y-1 border-t border-slate-800/70">
+                  <button
+                    type="button"
+                    data-testid="add-switch-6-btn"
+                    onClick={() => onAddDevice('switch', 6)}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('switch', 6, undefined)
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Network className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                      <span className="truncate">Switch 6p</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('switch', 6, undefined) ? '+ Клик' : '6 портов'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-switch-24-btn"
+                    onClick={() => onAddDevice('switch', 24)}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('switch', 24, undefined)
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Network className="w-3.5 h-3.5 text-indigo-300 shrink-0" />
+                      <span className="truncate">Switch 24p</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('switch', 24, undefined) ? '+ Клик' : '24 порта'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-gpon-olt-btn"
+                    onClick={() => onAddDevice('switch', 6, 'gpon_olt')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('switch', 6, 'gpon_olt'),
+                      'border-emerald-500/30 hover:border-emerald-500/60'
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Zap className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <span className="truncate">GPON OLT</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-emerald-300 shrink-0 ml-1.5">
+                      {isDeviceArmed('switch', 6, 'gpon_olt') ? '+ Клик' : '1490/1310нм'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-gpon-ont-btn"
+                    onClick={() => onAddDevice('switch', 4, 'gpon_ont')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('switch', 4, 'gpon_ont'),
+                      'border-teal-500/30 hover:border-teal-500/60'
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Cpu className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                      <span className="truncate">ONT / ONU</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-teal-300 shrink-0 ml-1.5">
+                      {isDeviceArmed('switch', 4, 'gpon_ont') ? '+ Клик' : 'FTTH · dBm'}
+                    </span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Category 3: Wireless Wi-Fi 802.11 & WLC */}
+            <div className="rounded-md border border-slate-800/90 bg-slate-950/40 overflow-hidden">
+              <button
+                type="button"
+                data-testid="device-cat-toggle-wireless"
+                onClick={() => toggleCategory('wireless')}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 bg-slate-900/80 hover:bg-slate-800/80 text-[11px] font-semibold text-slate-200 transition-colors cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5 truncate">
+                  <Wifi className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                  <span className="truncate">Беспроводные Wi-Fi</span>
+                </span>
+                <span className="flex items-center gap-1 shrink-0">
+                  <span className="text-[10px] font-mono text-slate-400">3</span>
+                  {openCategories.wireless ? (
+                    <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                  ) : (
+                    <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                </span>
+              </button>
+
+              {openCategories.wireless && (
+                <div className="p-1.5 space-y-1 border-t border-slate-800/70">
+                  <button
+                    type="button"
+                    data-testid="add-wlc-btn"
+                    onClick={() => onAddDevice('switch', 4, 'wlc')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('switch', 4, 'wlc')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Server className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                      <span className="truncate">WLC 5520</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('switch', 4, 'wlc') ? '+ Клик' : 'CAPWAP'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-wifi-ap-btn"
+                    onClick={() => onAddDevice('switch', 6, 'wifi_ap')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('switch', 6, 'wifi_ap')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Wifi className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                      <span className="truncate">Wi-Fi AP</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('switch', 6, 'wifi_ap') ? '+ Клик' : '802.11 AP'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-soho-router-btn"
+                    onClick={() => onAddDevice('router', 6, 'soho_wifi_router')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('router', 6, 'soho_wifi_router')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Radio className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                      <span className="truncate">Wi-Fi Роутер</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('router', 6, 'soho_wifi_router') ? '+ Клик' : 'NAT+Wlan0'}
+                    </span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Category 4: Endpoints (PC, Server, Laptop, Smartphone) */}
+            <div className="rounded-md border border-slate-800/90 bg-slate-950/40 overflow-hidden">
+              <button
+                type="button"
+                data-testid="device-cat-toggle-endpoints"
+                onClick={() => toggleCategory('endpoints')}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 bg-slate-900/80 hover:bg-slate-800/80 text-[11px] font-semibold text-slate-200 transition-colors cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5 truncate">
+                  <Monitor className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span className="truncate">Конечные устройства</span>
+                </span>
+                <span className="flex items-center gap-1 shrink-0">
+                  <span className="text-[10px] font-mono text-slate-400">7</span>
+                  {openCategories.endpoints ? (
+                    <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                  ) : (
+                    <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                </span>
+              </button>
+
+              {openCategories.endpoints && (
+                <div className="p-1.5 space-y-1 border-t border-slate-800/70">
+                  <button
+                    type="button"
+                    data-testid="add-pc-btn"
+                    onClick={() => onAddDevice('pc')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('pc', 6, undefined)
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Monitor className="w-3.5 h-3.5 text-slate-200 shrink-0" />
+                      <span className="truncate">Хост (PC)</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('pc', 6, undefined) ? '+ Клик' : 'Eth0'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-ip-phone-btn"
+                    onClick={() => onAddDevice('pc', 2, 'ip_phone')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('pc', 2, 'ip_phone')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <PhoneCall className="w-3.5 h-3.5 text-fuchsia-400 shrink-0" />
+                      <span className="truncate">IP-Телефон</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('pc', 2, 'ip_phone') ? '+ Клик' : 'PoE · SIP'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-ip-camera-btn"
+                    onClick={() => onAddDevice('pc', 1, 'ip_camera')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('pc', 1, 'ip_camera')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Camera className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                      <span className="truncate">IP-Камера (PoE)</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('pc', 1, 'ip_camera') ? '+ Клик' : 'RTSP · 9.5W'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-nvr-btn"
+                    onClick={() => onAddDevice('server', 1, 'nvr')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('server', 1, 'nvr')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Video className="w-3.5 h-3.5 text-teal-300 shrink-0" />
+                      <span className="truncate">Видеорегистратор NVR</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('server', 1, 'nvr') ? '+ Клик' : 'NVR · 16TB'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-server-btn"
+                    onClick={() => onAddDevice('server')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('server', 6, undefined)
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Server className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <span className="truncate">Сервер (L7)</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('server', 6, undefined) ? '+ Клик' : 'HTTP/SIP'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-laptop-btn"
+                    onClick={() => onAddDevice('pc', 6, 'laptop')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('pc', 6, 'laptop')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Laptop className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                      <span className="truncate">Ноутбук</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('pc', 6, 'laptop') ? '+ Клик' : 'Wlan0'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="add-smartphone-btn"
+                    onClick={() => onAddDevice('pc', 6, 'smartphone')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                      isDeviceArmed('pc', 6, 'smartphone')
+                    )}`}
+                  >
+                    <span className="flex items-center gap-2 font-medium min-w-0">
+                      <Smartphone className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                      <span className="truncate">Смартфон</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 shrink-0 ml-1.5">
+                      {isDeviceArmed('pc', 6, 'smartphone') ? '+ Клик' : 'Wlan0'}
+                    </span>
+                  </button>
+                </div>
+              )}
+            </div>
 
             <button
-              onClick={() => onAddDevice('switch', 6)}
-              className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md bg-slate-950/90 hover:bg-slate-800 border border-slate-800 text-xs text-slate-200 transition-colors"
-            >
-              <span className="flex items-center gap-2 font-medium">
-                <Network className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Switch 6p (L2)</span>
-              </span>
-              <span className="text-[10px] font-mono text-slate-400">6 портов</span>
-            </button>
-
-            <button
-              onClick={() => onAddDevice('switch', 24)}
-              className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md bg-slate-950/90 hover:bg-slate-800 border border-indigo-500/30 text-xs text-slate-200 transition-colors"
-            >
-              <span className="flex items-center gap-2 font-medium">
-                <Network className="w-3.5 h-3.5 text-indigo-300" />
-                <span>Switch 24p (L2)</span>
-              </span>
-              <span className="text-[10px] font-mono text-indigo-300">24 порта</span>
-            </button>
-
-            <button
-              onClick={() => onAddDevice('pc')}
-              className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md bg-slate-950/90 hover:bg-slate-800 border border-slate-800 text-xs text-slate-200 transition-colors"
-            >
-              <span className="flex items-center gap-2 font-medium">
-                <Monitor className="w-3.5 h-3.5 text-slate-200" />
-                <span>Хост (PC)</span>
-              </span>
-              <span className="text-[10px] font-mono text-slate-400">Eth0</span>
-            </button>
-
-            <button
-              onClick={() => onAddDevice('server')}
-              className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md bg-slate-950/90 hover:bg-slate-800 border border-slate-800 text-xs text-slate-200 transition-colors"
-            >
-              <span className="flex items-center gap-2 font-medium">
-                <Server className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Сервер (L7)</span>
-              </span>
-              <span className="text-[10px] font-mono text-slate-400">HTTP/DNS</span>
-            </button>
-
-            <button
+              type="button"
+              data-testid="add-zone-btn"
               onClick={onAddZone}
-              className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md bg-sky-950/40 hover:bg-sky-900/50 border border-sky-500/30 text-xs text-sky-200 transition-colors"
+              className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md border text-xs transition-colors cursor-pointer ${armedBtnClass(
+                pendingPlacement?.kind === 'zone'
+              )}`}
             >
               <span className="flex items-center gap-2 font-medium">
-                <Layers className="w-3.5 h-3.5 text-sky-400" />
+                <Layers className="w-3.5 h-3.5 text-sky-400 shrink-0" />
                 <span>Зона подсети</span>
               </span>
-              <span className="text-[10px] font-mono text-sky-300">+VLAN</span>
+              <span className="text-[10px] font-mono text-slate-400">
+                {pendingPlacement?.kind === 'zone' ? '+ Клик' : '+VLAN'}
+              </span>
             </button>
           </div>
         </div>
 
-        {/* Section 3: Collapsible Lab Scenarios Accordion (All 7 Presets) */}
+        {/* Section 3: Collapsible Lab Scenarios Accordion (All 10 Presets) */}
         <div className="pt-2.5 border-t border-slate-800 space-y-2">
           {onOpenCoreDiagnostics && (
             <button
@@ -388,7 +889,7 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
                 <span>Автотест ядра (L1–L7)</span>
               </span>
               <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-900/90 text-emerald-300">
-                9 тестов
+                17 тестов
               </span>
             </button>
           )}
@@ -408,7 +909,7 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
                     data-testid={`preset-test-btn-${sc.id}`}
                     onClick={() => onRunPresetTest(sc)}
                     className={`w-full text-left p-1.5 rounded border text-[11px] transition-colors cursor-pointer ${
-                      sc.expectedOutcome === 'blocked'
+                      sc.expectedOutcome === 'blocked' || sc.expectedOutcome === 'drop'
                         ? 'bg-red-950/35 hover:bg-red-900/50 border-red-500/40 text-red-200'
                         : 'bg-slate-900/90 hover:bg-slate-800 border-slate-800 text-slate-200'
                     }`}
@@ -417,12 +918,28 @@ export const DeviceToolbar: React.FC<DeviceToolbarProps> = ({
                       <span className="truncate">{sc.title}</span>
                       <span
                         className={`px-1 py-0.2 rounded text-[9px] font-mono font-bold shrink-0 ${
-                          sc.expectedOutcome === 'blocked'
+                          sc.expectedOutcome === 'blocked' || sc.expectedOutcome === 'drop'
                             ? 'bg-red-900/80 text-red-200'
                             : sc.protocolBadge === 'OSPF'
                             ? 'bg-lime-900/80 text-lime-300'
                             : sc.protocolBadge === 'RIP'
                             ? 'bg-amber-900/80 text-amber-300'
+                            : sc.protocolBadge === 'CAPWAP'
+                            ? 'bg-cyan-900/90 text-cyan-200'
+                            : sc.protocolBadge === 'FIREWALL'
+                            ? 'bg-rose-900/90 text-rose-200'
+                            : sc.protocolBadge === 'IPSEC'
+                            ? 'bg-emerald-900/90 text-emerald-200'
+                            : sc.protocolBadge === 'STACK'
+                            ? 'bg-amber-900/90 text-amber-200'
+                            : sc.protocolBadge === 'VOIP' || sc.protocolBadge === 'POE'
+                            ? 'bg-fuchsia-900/90 text-fuchsia-200'
+                            : sc.protocolBadge === 'RTSP'
+                            ? 'bg-teal-900/90 text-teal-200'
+                            : sc.protocolBadge === 'BGP' || sc.protocolBadge === 'WAN'
+                            ? 'bg-orange-900/90 text-orange-200'
+                            : sc.protocolBadge === 'GPON'
+                            ? 'bg-emerald-900/90 text-emerald-200'
                             : 'bg-sky-900/80 text-sky-300'
                         }`}
                       >
